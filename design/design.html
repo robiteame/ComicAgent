@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>AI漫剧生成 Agent</title>
+<style>
+/* 全局Mac风格重置 */
+*{margin:0;padding:0;box-sizing:border-box;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;}
+body{background:#f5f5f7;color:#1d1d1f;height:100vh;display:flex;flex-direction:column;overflow:hidden;font-size:13px;line-height:1.5;-webkit-font-smoothing:antialiased;}
+
+/* 顶部导航（Mac原生窗口风格） */
+.top-bar{height:44px;background:#f5f5f7;border-bottom:1px solid #e0e0e0;display:flex;align-items:center;padding:0 20px;justify-content:space-between;}
+.logo{font-weight:500;font-size:14px;color:#1d1d1f;display:flex;align-items:center;gap:8px;}
+.nav-left{display:flex;gap:12px;}
+.nav-btn{padding:6px 12px;border-radius:6px;border:none;background:transparent;color:#1d1d1f;font-size:12px;cursor:pointer;transition:0.15s;}
+.nav-btn:hover{background:#e8e8ed;}
+.nav-btn.primary{background:#0071e3;color:#fff;}
+.nav-btn.primary:hover{background:#0077ed;}
+.nav-right{display:flex;gap:14px;color:#6e6e73;}
+
+/* 主体三栏布局（Mac通透感） */
+.container{display:flex;flex:1;overflow:hidden;}
+
+/* 左侧项目&Agent流（浅灰卡片风） */
+.sidebar-left{width:240px;background:#f5f5f7;border-right:1px solid #e0e0e0;padding:16px;overflow-y:auto;}
+.section-title{font-size:11px;color:#6e6e73;margin-bottom:10px;font-weight:500;letter-spacing:0.4px;}
+.project-item{padding:8px 10px;background:#ffffff;border-radius:6px;margin-bottom:6px;color:#1d1d1f;box-shadow:0 1px 2px rgba(0,0,0,0.03);}
+.agent-step{display:flex;justify-content:space-between;align-items:center;padding:9px 10px;background:#ffffff;border-radius:6px;margin-bottom:6px;box-shadow:0 1px 2px rgba(0,0,0,0.03);}
+.status{width:8px;height:8px;border-radius:50%;}
+.status-done{background:#34c759;}
+.status-run{background:#ff9500;}
+.status-wait{background:#c7c7cc;}
+
+/* 中间主工作区（核心通透，无多余阴影） */
+.main-work{flex:1;display:flex;flex-direction:column;padding:16px;gap:16px;}
+.script-panel{height:32%;background:#ffffff;border:1px solid #e0e0e0;border-radius:8px;padding:14px;box-shadow:0 1px 2px rgba(0,0,0,0.03);}
+.preview-panel{flex:1;background:#ffffff;border:1px solid #e0e0e0;border-radius:8px;display:flex;flex-direction:column;align-items:center;justify-content:center;position:relative;}
+.preview-canvas{width:86%;height:84%;background:#f9f9fb;border-radius:6px;display:flex;align-items:center;justify-content:center;color:#6e6e73;border:1px solid #e0e0e0;}
+.shot-strip{position:absolute;bottom:12px;display:flex;gap:8px;}
+.shot-thumb{width:58px;height:34px;background:#f9f9fb;border-radius:4px;border:1px solid #e0e0e0;}
+
+/* 右侧参数面板（Mac偏好设置风格） */
+.sidebar-right{width:300px;background:#f5f5f7;border-left:1px solid #e0e0e0;padding:16px;overflow-y:auto;}
+.form-item{margin-bottom:18px;}
+.form-label{display:block;font-size:12px;color:#1d1d1f;margin-bottom:6px;}
+.form-select,.form-input{width:100%;padding:8px 10px;background:#ffffff;border:1px solid #e0e0e0;border-radius:6px;color:#1d1d1f;font-size:12px;outline:none;}
+.form-select:focus,.form-input:focus{border-color:#0071e3;}
+.mode-group{display:flex;gap:8px;margin-top:6px;}
+.mode-tag{padding:5px 10px;background:#f0f0f0;border-radius:4px;font-size:12px;color:#1d1d1f;cursor:pointer;}
+.mode-tag.active{background:#0071e3;color:#fff;}
+.log-box{padding:8px;background:#f9f9fb;border-radius:6px;font-size:12px;color:#6e6e73;border:1px solid #e0e0e0;}
+
+/* 底部状态栏（Mac底部栏极简风） */
+.bottom-bar{height:32px;background:#f5f5f7;border-top:1px solid #e0e0e0;display:flex;align-items:center;padding:0 20px;color:#6e6e73;gap:16px;}
+.progress{flex:1;height:4px;background:#e0e0e0;border-radius:2px;overflow:hidden;}
+.progress-inner{width:42%;height:100%;background:#0071e3;}
+</style>
+</head>
+<body>
+<!-- 顶部Mac风格导航 -->
+<div class="top-bar">
+  <div class="logo">AI漫剧生成 Agent</div>
+  <div class="nav-left">
+    <button class="nav-btn">新建项目</button>
+    <button class="nav-btn">导入剧本</button>
+    <button class="nav-btn primary">一键生成</button>
+    <button class="nav-btn">导出成片</button>
+  </div>
+  <div class="nav-right">
+    <span>设置</span>
+    <span>帮助</span>
+  </div>
+</div>
+
+<!-- 主体三栏布局 -->
+<div class="container">
+  <!-- 左侧项目&Agent流 -->
+  <div class="sidebar-left">
+    <div class="section-title">我的项目</div>
+    <div class="project-item">都市夜谈 · 草稿</div>
+    <div class="project-item">古风江湖 · 生成中</div>
+
+    <div class="section-title" style="margin-top:24px;">Agent 执行流程</div>
+    <div class="agent-step">
+      <span>剧本解析</span>
+      <div class="status status-done"></div>
+    </div>
+    <div class="agent-step">
+      <span>分镜拆解</span>
+      <div class="status status-run"></div>
+    </div>
+    <div class="agent-step">
+      <span>角色生成</span>
+      <div class="status status-wait"></div>
+    </div>
+    <div class="agent-step">
+      <span>画面渲染</span>
+      <div class="status status-wait"></div>
+    </div>
+    <div class="agent-step">
+      <span>配音字幕</span>
+      <div class="status status-wait"></div>
+    </div>
+  </div>
+
+  <!-- 中间主工作区 -->
+  <div class="main-work">
+    <div class="script-panel">
+      <div class="section-title">剧本 / 分镜编辑</div>
+      <div style="margin-top:8px;color:#424245;line-height:1.6;">
+场景：雨夜小巷<br>
+人物：男主 · 情绪低沉<br>
+镜头：中景，缓慢推进，男主抬头望向远处霓虹
+      </div>
+    </div>
+    <div class="preview-panel">
+      <div class="preview-canvas">漫剧画面预览</div>
+      <div class="shot-strip">
+        <div class="shot-thumb"></div>
+        <div class="shot-thumb"></div>
+        <div class="shot-thumb"></div>
+        <div class="shot-thumb"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 右侧参数面板 -->
+  <div class="sidebar-right">
+    <div class="section-title">风格设置</div>
+    <div class="form-item">
+      <label class="form-label">画风</label>
+      <select class="form-select">
+        <option>日系写实漫</option>
+        <option>国漫厚涂</option>
+        <option>简约条漫</option>
+      </select>
+    </div>
+    <div class="form-item">
+      <label class="form-label">分辨率</label>
+      <select class="form-select">
+        <option>1080P</option>
+        <option>2K</option>
+      </select>
+    </div>
+
+    <div class="section-title" style="margin-top:22px;">Agent 运行模式</div>
+    <div class="mode-group">
+      <div class="mode-tag">全自动</div>
+      <div class="mode-tag active">半自动干预</div>
+      <div class="mode-tag">手动</div>
+    </div>
+
+    <div class="section-title" style="margin-top:22px;">镜头控制</div>
+    <div class="form-item">
+      <label class="form-label">运镜方式</label>
+      <select class="form-select">
+        <option>固定镜头</option>
+        <option>缓慢推拉</option>
+      </select>
+    </div>
+
+    <div class="form-item">
+      <label class="form-label">运行日志</label>
+      <div class="log-box">剧本解析完成 → 正在生成分镜脚本</div>
+    </div>
+  </div>
+</div>
+
+<!-- 底部状态栏 -->
+<div class="bottom-bar">
+  <span>任务进度</span>
+  <div class="progress"><div class="progress-inner"></div></div>
+  <span>剩余 02:04</span>
+  <span>GPU 41%</span>
+</div>
+</body>
+</html>

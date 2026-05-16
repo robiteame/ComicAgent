@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx electron *)",
+      "Bash(node -e \"console.log\\(require\\('electron'\\)\\)\")",
+      "Bash(node -e \"const p = require\\('electron'\\); console.log\\('Electron path:', typeof p === 'string' ? p : 'not found'\\)\")",
+      "Bash(npm ls *)",
+      "Bash(rm -rf node_modules/electron node_modules/.pnpm/electron*)",
+      "Bash(npm install *)",
+      "Bash(dir \"D:\\\\WorkSpace\\\\ComicAgent\\\\client\\\\\")",
+      "Bash(powershell -Command \"Get-ChildItem 'D:\\\\WorkSpace\\\\ComicAgent\\\\client' | Select-Object Name\")",
+      "Skill(impeccable)",
+      "Skill(impeccable:*)",
+      "Bash(node \"C:/Users/zhang/.claude/skills/impeccable/scripts/load-context.mjs\")",
+      "Bash(node \"C:/Users/zhang/.claude/plugins/cache/claude-plugins-official/superpowers/5.1.0/skills/writing-skills/../../scripts/render-graphs.js\")",
+      "Bash(del /f \"D:\\\\WorkSpace\\\\ComicAgent\\\\client\\\\src\\\\renderer\\\\pages\\\\ScriptInput.tsx\" \"D:\\\\WorkSpace\\\\ComicAgent\\\\client\\\\src\\\\renderer\\\\pages\\\\Storyboard.tsx\" \"D:\\\\WorkSpace\\\\ComicAgent\\\\client\\\\src\\\\renderer\\\\pages\\\\ShotEditor.tsx\" \"D:\\\\WorkSpace\\\\ComicAgent\\\\client\\\\src\\\\renderer\\\\pages\\\\Timeline.tsx\" \"D:\\\\WorkSpace\\\\ComicAgent\\\\client\\\\src\\\\renderer\\\\pages\\\\Export.tsx\" \"D:\\\\WorkSpace\\\\ComicAgent\\\\client\\\\src\\\\renderer\\\\components\\\\Sidebar.tsx\")",
+      "Bash(gh auth *)",
+      "Bash(where git *)",
+      "Bash(where gh *)"
+    ]
+  }
+}
