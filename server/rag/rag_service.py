@@ -1,7 +1,11 @@
 import re
-import chromadb
 from pathlib import Path
 from config import settings
+
+try:
+    import chromadb
+except ImportError:
+    chromadb = None
 
 try:
     from sentence_transformers import SentenceTransformer
@@ -14,7 +18,7 @@ class RAGService:
 
     def __init__(self):
         self.chroma_path = settings.CHROMADB_PATH
-        self.chroma_client = chromadb.PersistentClient(path=self.chroma_path)
+        self.chroma_client = chromadb.PersistentClient(path=self.chroma_path) if chromadb else None
         self._embed_model = None
 
     @property

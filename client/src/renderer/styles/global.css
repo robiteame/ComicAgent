@@ -199,4 +199,52 @@ body {
   100% { transform: translateX(300%); }
 }
 
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.5; transform: scale(0.7); }
+}
+
 .animate-in { animation: fadeIn 200ms var(--ease) both; }
+
+/* ---- React Flow 覆盖 ---- */
+
+.react-flow__node {
+  font-family: var(--font) !important;
+}
+
+.react-flow__node:hover {
+  z-index: 1 !important;
+}
+
+.react-flow__edge-path {
+  stroke-width: 1.2 !important;
+}
+
+.react-flow__background {
+  background: var(--bg-canvas) !important;
+}
+
+.react-flow__controls {
+  box-shadow: var(--shadow-sm) !important;
+  border-radius: var(--radius) !important;
+  border: 1px solid var(--border-light) !important;
+}
+
+.react-flow__controls-button {
+  background: var(--bg-white) !important;
+  border-color: var(--border-light) !important;
+  color: var(--text-secondary) !important;
+  fill: var(--text-secondary) !important;
+}
+
+.react-flow__controls-button:hover {
+  background: var(--bg) !important;
+  color: var(--text) !important;
+  fill: var(--text) !important;
+}
+
+.react-flow__minimap {
+  border-radius: var(--radius) !important;
+  border: 1px solid var(--border-light) !important;
+  box-shadow: var(--shadow-sm) !important;
+}

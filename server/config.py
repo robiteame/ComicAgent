@@ -13,12 +13,20 @@ class Settings(BaseSettings):
     PROMPTS_DIR: Path = Path(__file__).parent / "prompts"
 
     # LLM 配置
-    LLM_PROVIDER: str = "openai"  # openai / anthropic
+    LLM_PROVIDER: str = "openai"  # openai / mimo / seeddance
     OPENAI_API_KEY: str = ""
     OPENAI_BASE_URL: str = ""
     OPENAI_MODEL: str = "gpt-4o"
-    ANTHROPIC_API_KEY: str = ""
-    ANTHROPIC_MODEL: str = "claude-sonnet-4-20250514"
+
+    # Mimo (小米 MiMo, 通过硅基流动 SiliconFlow 调用)
+    MIMO_API_KEY: str = ""
+    MIMO_BASE_URL: str = "https://api.siliconflow.cn/v1"
+    MIMO_MODEL: str = "XiaomiMiMo/MiMo-7B-RL"
+
+    # SeedDance (字节跳动, 通过火山引擎方舟平台调用)
+    SEEDDANCE_API_KEY: str = ""
+    SEEDDANCE_BASE_URL: str = "https://ark.cn-beijing.volces.com/api/v3"
+    SEEDDANCE_MODEL: str = "doubao-1.5-pro-32k"
 
     # 图像生成配置
     IMAGE_PROVIDER: str = "stability"  # stability / dalle / sd_local

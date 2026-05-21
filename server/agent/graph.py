@@ -8,7 +8,7 @@ def build_graph() -> StateGraph:
     """构建 LangGraph Agent 流水线"""
     graph = StateGraph(AgentState)
 
-    # 注册节点
+    # 注册节点c
     graph.add_node("parse_script", script_parser.run)
     graph.add_node("generate_storyboard", storyboard_gen.run)
     graph.add_node("generate_images", image_gen.run)

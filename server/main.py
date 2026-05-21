@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 from db import init_db
-from api.routes import project, script, shot, render, chat
+from api.routes import project, script, shot, render, chat, graph
 from api.websocket import ws_manager
 
 
@@ -44,6 +44,7 @@ app.include_router(script.router)
 app.include_router(shot.router)
 app.include_router(render.router)
 app.include_router(chat.router)
+app.include_router(graph.router)
 
 # 静态文件服务（输出目录）
 output_dir = Path(__file__).parent.parent / "output"

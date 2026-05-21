@@ -1,23 +1,23 @@
-fastapi==0.115.0
-uvicorn[standard]==0.32.0
-langgraph==0.2.0
-langchain==0.3.0
-langchain-openai==0.2.0
-langchain-community==0.3.0
-openai==1.50.0
-ffmpeg-python==0.2.0
-edge-tts==6.1.0
-Pillow==10.4.0
-aiohttp==3.10.0
-aiofiles==24.1.0
-pydantic==2.9.0
-pydantic-settings==2.5.0
-sqlalchemy==2.0.0
-python-dotenv==1.0.0
-websockets==13.0
-httpx==0.27.0
-chromadb==0.5.0
-sentence-transformers==3.0.0
-python-docx==1.1.0
-python-multipart==0.0.9
-stability-sdk==0.8.0
+fastapi
+uvicorn[standard]
+langgraph
+langchain
+langchain-openai
+langchain-community
+openai
+ffmpeg-python
+edge-tts
+Pillow
+aiohttp
+aiofiles
+pydantic
+pydantic-settings
+sqlalchemy
+python-dotenv
+websockets
+httpx
+# chromadb              # RAG 功能，暂不需要，跳过 grpcio 编译
+# sentence-transformers
+python-docx
+python-multipart
+# stability-sdk         # 图像生成，暂不需要，跳过 grpcio 编译
