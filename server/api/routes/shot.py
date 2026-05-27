@@ -137,6 +137,8 @@ async def _run_phase2_pipeline(project_id: str):
             ("quality_check", 100, quality_check.run, "正在校验最终结果"),
         ]:
             await _progress(project_id, step, progress, message)
+            if step == "generate_images":
+                state["on_shot_done"] = lambda shot: _persist_shot_update(project_id, shot)
             state.update(await node(state))
             if step == "compose_video":
                 video_path = state.get("video_path", "")
@@ -262,6 +264,32 @@ def _persist_phase2(db, project_id: str, state: dict) -> None:
     if project:
         project.status = "completed"
     db.commit()
+
+
+async def _persist_shot_update(project_id: str, shot: dict) -> None:
+    db = SessionLocal()
+    try:
+        shot_id = shot.get("shot_id") or shot.get("id")
+        db_shot = db.query(Shot).filter(Shot.id == shot_id, Shot.project_id == project_id).first()
+        if db_shot:
+            db_shot.image_path = shot.get("image_path", db_shot.image_path)
+            db_shot.audio_path = shot.get("audio_path", db_shot.audio_path)
+            db_shot.status = shot.get("status", db_shot.status)
+            db_shot.version = shot.get("version", db_shot.version)
+            db_shot.visual_notes = shot.get("visual_notes", db_shot.visual_notes)
+            db.commit()
+        await ws_manager.send_to_project(
+            project_id,
+            {
+                "type": "shot_update",
+                "shot_id": shot_id,
+                "status": shot.get("status", "done"),
+                "image_path": shot.get("image_path", ""),
+                "audio_path": shot.get("audio_path", ""),
+            },
+        )
+    finally:
+        db.close()
 
 
 def _serialize_shot(s: Shot) -> dict:

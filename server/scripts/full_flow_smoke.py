@@ -14,9 +14,12 @@ Usage:
 from __future__ import annotations
 
 import os
+import json
+import subprocess
 import time
 from pathlib import Path
 
+from PIL import Image
 import requests
 
 
@@ -52,6 +55,46 @@ def wait_for(predicate, timeout: int, label: str):
             return last_value
         time.sleep(1)
     raise TimeoutError(f"{label} timed out; last value: {last_value!r}")
+
+
+def output_file(url_or_path: str) -> Path:
+    if not url_or_path:
+        raise AssertionError("empty output path")
+    normalized = url_or_path.replace("\\", "/")
+    if "/output/" in normalized:
+        return PROJECT_ROOT / "output" / normalized.split("/output/", 1)[1]
+    return Path(url_or_path)
+
+
+def assert_real_image(path: Path) -> None:
+    assert path.exists() and path.stat().st_size > 4096, f"missing or tiny image: {path}"
+    with Image.open(path) as image:
+        image.verify()
+
+
+def assert_media_streams(video_path: Path) -> None:
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,duration",
+            "-of",
+            "json",
+            str(video_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    streams = json.loads(result.stdout).get("streams", [])
+    stream_types = {stream.get("codec_type") for stream in streams}
+    assert "video" in stream_types, f"video stream missing: {stream_types}"
+    assert "audio" in stream_types, f"audio stream missing: {stream_types}"
+    video_duration = max(float(stream.get("duration") or 0) for stream in streams if stream.get("codec_type") == "video")
+    audio_duration = max(float(stream.get("duration") or 0) for stream in streams if stream.get("codec_type") == "audio")
+    assert audio_duration >= video_duration - 0.5, f"audio is shorter than video: audio={audio_duration}, video={video_duration}"
 
 
 def main() -> None:
@@ -101,13 +144,18 @@ def main() -> None:
     assert parse_result["status"] == "started", parse_result
 
     def storyboard_ready():
+        status = get(f"/api/project/{project_id}").get("status")
+        if status == "error":
+            raise RuntimeError("project entered error state during storyboard generation")
         shots = get(f"/api/shot/{project_id}/shots")
         if shots and all(shot.get("image_path") for shot in shots):
             return shots
         return None
 
-    shots = wait_for(storyboard_ready, timeout=90, label="storyboard generation")
+    shots = wait_for(storyboard_ready, timeout=300, label="storyboard generation")
     assert len(shots) >= 1, "no shots generated"
+    for shot in shots:
+        assert_real_image(output_file(shot["image_path"]))
     print(f"STORYBOARD {len(shots)} shots")
 
     first_shot = shots[0]
@@ -131,11 +179,20 @@ def main() -> None:
         status = get(f"/api/project/{project_id}").get("status")
         if status == "error":
             raise RuntimeError("project entered error state")
-        if final_video.exists() and final_video.stat().st_size > 0 and status == "completed":
+        shots_with_audio = get(f"/api/shot/{project_id}/shots")
+        has_audio = any(shot.get("audio_path") for shot in shots_with_audio)
+        if final_video.exists() and final_video.stat().st_size > 0 and status == "completed" and has_audio:
             return {"status": status, "size": final_video.stat().st_size}
         return None
 
-    video_state = wait_for(video_ready, timeout=150, label="final video generation")
+    video_state = wait_for(video_ready, timeout=240, label="final video generation")
+    final_shots = get(f"/api/shot/{project_id}/shots")
+    assert any(shot.get("audio_path") for shot in final_shots), "no audio files generated"
+    for shot in final_shots:
+        if shot.get("audio_path"):
+            audio_path = output_file(shot["audio_path"])
+            assert audio_path.exists() and audio_path.stat().st_size > 1024, f"missing or tiny audio: {audio_path}"
+    assert_media_streams(final_video)
     print(f"VIDEO {final_video} {video_state['size']} bytes")
     print("FULL_FLOW_OK")
 

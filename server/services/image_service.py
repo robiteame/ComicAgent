@@ -1,20 +1,22 @@
-import hashlib
-import textwrap
+import base64
+from io import BytesIO
 
 import httpx
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 
 from config import settings
 
 
 class ImageService:
-    """Image generation service with a deterministic local placeholder fallback."""
+    """Image generation service backed by real remote image APIs."""
 
     def __init__(self):
-        self.api_key = settings.STABILITY_API_KEY
+        self.api_key = settings.ARK_API_KEY or settings.SEEDDANCE_API_KEY or settings.STABILITY_API_KEY
         self.api_url = settings.STABILITY_API_URL
-        self.provider = (settings.IMAGE_PROVIDER or "local").lower()
+        self.provider = (settings.IMAGE_PROVIDER or "").lower()
         self.output_dir = settings.OUTPUT_DIR / "projects"
+        self.seedream_base_url = settings.SEEDDANCE_BASE_URL.rstrip("/")
+        self.seedream_model = settings.SEEDREAM_MODEL or settings.IMAGE_PROVIDER
 
     async def generate_shot_image(
         self,
@@ -30,19 +32,123 @@ class ImageService:
         shot_dir.mkdir(parents=True, exist_ok=True)
         image_path = shot_dir / f"{shot['shot_id']}_v{shot.get('version', 1)}.png"
 
-        image_data: bytes | None = None
-        if self.provider == "stability" and self.api_key:
-            try:
-                image_data = await self._call_stability(prompt, negative_prompt, seed)
-            except Exception:
-                image_data = None
-
-        if image_data:
-            image_path.write_bytes(image_data)
+        if self.provider == "stability":
+            if not self.api_key:
+                raise RuntimeError("未配置 Stability API Key，无法生成真实画面")
+            image_data = await self._call_stability(prompt, negative_prompt, seed)
+        elif self._is_seedream_provider():
+            if not self.api_key:
+                raise RuntimeError("未配置火山方舟 API Key，无法调用 Seedream 生成真实画面")
+            image_data = await self._call_seedream(prompt, negative_prompt, seed)
         else:
-            self._write_placeholder(image_path, shot, seed)
+            raise RuntimeError(f"未支持的图像生成 provider: {settings.IMAGE_PROVIDER}")
 
+        if not image_data:
+            raise RuntimeError("图像生成接口未返回图片数据")
+
+        self._validate_image(image_data)
+        image_path.write_bytes(image_data)
         return str(image_path)
+
+    def _is_seedream_provider(self) -> bool:
+        provider = self.provider.replace("_", "-")
+        return provider.startswith("doubao-seedream") or provider in {"seedream", "volcengine", "ark"}
+
+    async def _call_seedream(self, prompt: str, negative_prompt: str, seed: int) -> bytes:
+        errors: list[str] = []
+        models = self._seedream_model_candidates()
+        sizes = [settings.SEEDREAM_IMAGE_SIZE, "1440x2560", "2K"]
+
+        async with httpx.AsyncClient(timeout=180) as client:
+            for model in models:
+                for size in list(dict.fromkeys(size for size in sizes if size)):
+                    payload = {
+                        "model": model,
+                        "prompt": f"{prompt}\nNegative prompt: {negative_prompt}",
+                        "response_format": "b64_json",
+                        "size": size,
+                        "n": 1,
+                        "seed": seed,
+                        "watermark": False,
+                        "output_format": "png",
+                        "sequential_image_generation": "disabled",
+                    }
+                    try:
+                        response = await client.post(
+                            f"{self.seedream_base_url}/images/generations",
+                            headers={
+                                "Authorization": f"Bearer {self.api_key}",
+                                "Content-Type": "application/json",
+                            },
+                            json=payload,
+                        )
+                        if response.status_code in {401, 403}:
+                            raise PermissionError(response.text[:600])
+                        if response.status_code >= 400:
+                            errors.append(f"{model} {size}: {response.status_code} {response.text[:400]}")
+                            continue
+                        return await self._extract_image_bytes(client, response)
+                    except PermissionError as exc:
+                        raise RuntimeError(f"火山方舟鉴权失败，请确认 API Key 和模型权限: {exc}") from exc
+                    except Exception as exc:
+                        errors.append(f"{model} {size}: {exc}")
+
+        raise RuntimeError("Seedream 图像生成失败: " + " | ".join(errors[-4:]))
+
+    def _seedream_model_candidates(self) -> list[str]:
+        raw = [self.seedream_model, settings.IMAGE_PROVIDER]
+        candidates: list[str] = []
+        for value in raw:
+            if not value:
+                continue
+            candidates.extend(
+                [
+                    value,
+                    value.replace(".", "-"),
+                    value.replace(".0", "-0"),
+                ]
+            )
+        candidates.extend(
+            [
+                "doubao-seedream-5-0-lite",
+                "doubao-seedream-5-0-lite-260128",
+            ]
+        )
+        return list(dict.fromkeys(candidates))
+
+    async def _extract_image_bytes(self, client: httpx.AsyncClient, response: httpx.Response) -> bytes:
+        content_type = response.headers.get("content-type", "")
+        if content_type.startswith("image/"):
+            return response.content
+
+        data = response.json()
+        items = data.get("data") if isinstance(data, dict) else None
+        if not items:
+            raise RuntimeError(f"图像接口返回缺少 data: {data}")
+
+        item = items[0]
+        b64_data = item.get("b64_json") or item.get("image") or item.get("base64")
+        if b64_data:
+            if "," in b64_data and b64_data.startswith("data:"):
+                b64_data = b64_data.split(",", 1)[1]
+            return base64.b64decode(b64_data)
+
+        image_url = item.get("url") or item.get("image_url")
+        if isinstance(image_url, dict):
+            image_url = image_url.get("url")
+        if image_url:
+            image_response = await client.get(image_url)
+            image_response.raise_for_status()
+            return image_response.content
+
+        raise RuntimeError(f"无法解析图像接口返回: {data}")
+
+    def _validate_image(self, image_data: bytes) -> None:
+        try:
+            with Image.open(BytesIO(image_data)) as image:
+                image.verify()
+        except Exception as exc:
+            raise RuntimeError(f"图像数据无法打开: {exc}") from exc
 
     def _build_prompt(self, shot: dict, characters: list, style_params: dict) -> tuple[str, str]:
         prompt_parts: list[str] = []
@@ -66,9 +172,11 @@ class ImageService:
         prompt_parts.extend(
             [
                 shot.get("scene_description", ""),
+                shot.get("character_action", ""),
+                shot.get("visual_notes", ""),
                 self._camera_prompt(shot.get("shot_type", "medium")),
                 self._angle_prompt(shot.get("camera_angle", "正面")),
-                "clean comic frame, soft daylight, high detail",
+                "vertical cinematic comic frame, expressive characters, clean composition, high detail",
             ]
         )
         negative_parts.extend(["low quality", "blurry", "watermark", "text artifacts", "bad anatomy"])
@@ -91,52 +199,6 @@ class ImageService:
             )
             response.raise_for_status()
             return response.content
-
-    def _write_placeholder(self, image_path, shot: dict, seed: int) -> None:
-        width, height = 1080, 1920
-        digest = hashlib.sha256(f"{shot.get('shot_id')}:{seed}".encode("utf-8")).digest()
-        accent = (80 + digest[0] % 80, 120 + digest[1] % 80, 180 + digest[2] % 55)
-        bg_top = (245, 249, 253)
-        bg_bottom = (228, 238, 248)
-
-        image = Image.new("RGB", (width, height), bg_top)
-        draw = ImageDraw.Draw(image)
-        for y in range(height):
-            t = y / height
-            color = tuple(int(bg_top[i] * (1 - t) + bg_bottom[i] * t) for i in range(3))
-            draw.line((0, y, width, y), fill=color)
-
-        draw.rounded_rectangle((90, 180, 990, 1390), radius=44, fill=(255, 255, 255), outline=(214, 226, 238), width=3)
-        draw.rounded_rectangle((150, 260, 930, 1120), radius=36, fill=(240, 246, 252), outline=accent, width=5)
-        draw.ellipse((345, 410, 735, 800), fill=(255, 255, 255), outline=accent, width=7)
-        draw.rounded_rectangle((275, 800, 805, 1090), radius=48, fill=(255, 255, 255), outline=(207, 220, 233), width=4)
-        draw.line((160, 1180, 920, 1180), fill=(214, 226, 238), width=4)
-
-        font_title = self._font(46)
-        font_body = self._font(34)
-        font_meta = self._font(26)
-        title = f"镜头 {shot.get('shot_id', '')[-4:]}"
-        draw.text((150, 1225), title, fill=(32, 45, 58), font=font_title)
-        scene = shot.get("scene_description") or "本地占位画面"
-        wrapped = "\n".join(textwrap.wrap(scene, width=22))[:180]
-        draw.multiline_text((150, 1310), wrapped, fill=(70, 86, 102), font=font_body, spacing=12)
-        meta = f"{shot.get('shot_type', 'medium')} / {shot.get('emotion', 'neutral')} / {shot.get('camera_angle', '正面')}"
-        draw.text((150, 1720), meta, fill=(105, 122, 140), font=font_meta)
-
-        image.save(image_path, "PNG")
-
-    def _font(self, size: int):
-        candidates = [
-            "C:/Windows/Fonts/msyh.ttc",
-            "C:/Windows/Fonts/simhei.ttf",
-            "C:/Windows/Fonts/arial.ttf",
-        ]
-        for path in candidates:
-            try:
-                return ImageFont.truetype(path, size=size)
-            except Exception:
-                continue
-        return ImageFont.load_default()
 
     def _camera_prompt(self, shot_type: str) -> str:
         return {

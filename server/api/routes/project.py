@@ -1,10 +1,12 @@
 import uuid
 from datetime import datetime
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from config import settings
 from db import get_db
 from models import Project
 
@@ -45,6 +47,7 @@ async def get_project(project_id: str, db: Session = Depends(get_db)):
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="项目不存在")
+    _sync_completed_status(db, [project])
     return _serialize_project(project)
 
 
@@ -63,16 +66,19 @@ async def update_project(project_id: str, data: ProjectUpdate, db: Session = Dep
 @router.get("")
 async def list_projects(db: Session = Depends(get_db)):
     projects = db.query(Project).order_by(Project.updated_at.desc()).all()
+    _sync_completed_status(db, projects)
     return [_serialize_project(project) for project in projects]
 
 
 def _serialize_project(project: Project) -> dict:
+    video_path = _final_video_path(project.id)
     return {
         "id": project.id,
         "title": project.title,
         "genre": project.genre,
         "style": project.style,
         "status": project.status,
+        "video_path": f"/output/projects/{project.id}/output/final.mp4" if _has_file(video_path) else "",
         "input_text": project.input_text,
         "output_format": project.output_format,
         "resolution": project.resolution,
@@ -80,3 +86,23 @@ def _serialize_project(project: Project) -> dict:
         "created_at": project.created_at.isoformat(),
         "updated_at": project.updated_at.isoformat(),
     }
+
+
+def _final_video_path(project_id: str) -> Path:
+    return settings.OUTPUT_DIR / "projects" / project_id / "output" / "final.mp4"
+
+
+def _has_file(path: Path) -> bool:
+    return path.exists() and path.is_file() and path.stat().st_size > 0
+
+
+def _sync_completed_status(db: Session, projects: list[Project]) -> None:
+    changed = False
+    active_statuses = {"generating_images", "storyboard_ready", "rendering"}
+    for project in projects:
+        if project.status not in active_statuses and project.status != "completed" and _has_file(_final_video_path(project.id)):
+            project.status = "completed"
+            project.updated_at = datetime.utcnow()
+            changed = True
+    if changed:
+        db.commit()

@@ -58,6 +58,17 @@ FULL_FLOW_OK
 
 更详细的测试说明见 [docs/FULL_FLOW_TEST.md](docs/FULL_FLOW_TEST.md)。
 
+## 外部服务诊断
+
+不启动前端也可以先检查真实模型/API 是否可用：
+
+```bash
+cd server
+python scripts/api_diagnostics.py
+```
+
+该脚本会分别验证 Mimo、TTS、Seedream 是否真实返回结果，且不会打印 API Key。
+
 ## 常用检查
 
 前端：

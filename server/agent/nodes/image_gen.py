@@ -1,3 +1,5 @@
+import inspect
+
 from agent.state import AgentState
 from services.image_service import ImageService
 
@@ -11,11 +13,17 @@ async def run(state: AgentState) -> dict:
     characters = state.get("characters", [])
     style_params = state.get("style_params", {})
     project_id = state["project_id"]
+    on_shot_done = state.get("on_shot_done")
 
     updated_shots = []
+    failures: list[str] = []
     for shot in shots:
         if shot.get("status") == "done" and shot.get("image_path"):
             updated_shots.append(shot)
+            if callable(on_shot_done):
+                result = on_shot_done(shot)
+                if inspect.isawaitable(result):
+                    await result
             continue
 
         try:
@@ -35,8 +43,16 @@ async def run(state: AgentState) -> dict:
         except Exception as e:
             shot["status"] = "failed"
             shot["visual_notes"] = f"生成失败: {str(e)}"
+            failures.append(f"{shot.get('shot_id')}: {e}")
 
         updated_shots.append(shot)
+        if callable(on_shot_done):
+            result = on_shot_done(shot)
+            if inspect.isawaitable(result):
+                await result
+
+    if failures:
+        raise RuntimeError("分镜画面生成失败: " + " | ".join(failures))
 
     return {
         "shots": updated_shots,
@@ -52,6 +68,7 @@ async def regenerate_failed_shots(state: AgentState) -> dict:
     project_id = state["project_id"]
 
     updated_shots = []
+    failures: list[str] = []
     for shot in shots:
         if shot.get("status") != "failed":
             updated_shots.append(shot)
@@ -73,8 +90,12 @@ async def regenerate_failed_shots(state: AgentState) -> dict:
         except Exception as e:
             shot["status"] = "failed"
             shot["visual_notes"] = f"重新生成失败: {str(e)}"
+            failures.append(f"{shot.get('shot_id')}: {e}")
 
         updated_shots.append(shot)
+
+    if failures:
+        raise RuntimeError("失败镜头重新生成仍失败: " + " | ".join(failures))
 
     return {
         "shots": updated_shots,

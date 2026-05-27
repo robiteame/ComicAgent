@@ -109,11 +109,13 @@ async def upload_script(
 
 
 async def _generate_script_text(data: ScriptGenerateRequest) -> str:
-    if llm_service.available:
-        try:
-            return await llm_service.call(
-                "你是漫剧编剧。请输出完整中文漫剧剧本，包含标题、人物、场景、动作、对白和情绪，不要输出解释。",
-                f"""
+    if not llm_service.available:
+        raise RuntimeError("未配置可用的 Mimo/LLM API Key，无法生成真实剧本")
+
+    try:
+        script = await llm_service.call(
+            "你是漫剧编剧。请输出完整中文漫剧剧本，包含标题、人物、场景、动作、对白和情绪，不要输出解释。",
+            f"""
 创作方向：{data.prompt}
 类型：{data.genre}
 画风：{data.style}
@@ -122,32 +124,14 @@ async def _generate_script_text(data: ScriptGenerateRequest) -> str:
 
 请用清晰结构输出：标题、人物、场景一、动作、对白、情绪、场景二……
 """,
-                temperature=0.75,
-            )
-        except Exception:
-            pass
+            temperature=0.75,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Mimo 剧本生成失败: {exc}") from exc
 
-    lead = data.characters_hint.strip() or "林夏，敏感但行动力很强的年轻创作者"
-    return f"""标题：{data.prompt}的一天
-人物：
-{lead}
-阿澈，冷静可靠，擅长把混乱想法整理成计划
-
-场景一：清晨的共享办公室
-动作：林夏把一叠手稿摊开，屏幕上停着未完成的分镜草稿。阳光从百叶窗落在桌面，她深吸一口气。
-对白：林夏：“今天一定要把它做成真正的漫剧。”
-情绪：期待、紧张
-
-场景二：窗边白板前
-动作：阿澈走近白板，把故事拆成几个镜头。林夏一边听一边补充角色表情，两人的节奏逐渐合拍。
-对白：阿澈：“先让观众看见她的目标，再让冲突出现在第二个镜头。”
-对白：林夏：“那第二个镜头给她一个迟疑的特写。”
-情绪：专注、协作
-
-场景三：傍晚的屏幕前
-动作：第一版视频终于合成完成。林夏点下播放键，画面、对白和节奏连在一起，她露出释然的笑。
-对白：林夏：“原来故事真的可以这样长出来。”
-情绪：释然、惊喜"""
+    if not script.strip():
+        raise RuntimeError("Mimo 剧本生成返回为空")
+    return script
 
 
 def _initial_state(data: dict) -> dict:
@@ -191,11 +175,13 @@ async def _run_storyboard_phase(project_id: str, state: dict):
 
         await _progress(project_id, "generate_storyboard", 32, "正在生成分镜列表")
         state.update(await storyboard_gen.run(state))
+        _persist_phase1(db, project_id, state, status="generating_images")
 
         await _progress(project_id, "generate_reference_images", 46, "正在生成分镜参考画面")
+        state["on_shot_done"] = lambda shot: _persist_shot_update(project_id, shot)
         state.update(await image_gen.run(state))
 
-        _persist_phase1(db, project_id, state)
+        _persist_phase1(db, project_id, state, status="storyboard_ready")
         await _progress(project_id, "wait_storyboard_confirm", 55, "分镜和参考画面已生成")
         await ws_manager.send_to_project(
             project_id,
@@ -217,7 +203,7 @@ async def _run_storyboard_phase(project_id: str, state: dict):
         db.close()
 
 
-def _persist_phase1(db, project_id: str, state: dict) -> None:
+def _persist_phase1(db, project_id: str, state: dict, status: str = "storyboard_ready") -> None:
     project = db.query(Project).filter(Project.id == project_id).first()
     if project:
         project.title = state.get("script_title") or _script_title(state.get("user_input", "")) or project.title
@@ -228,7 +214,7 @@ def _persist_phase1(db, project_id: str, state: dict) -> None:
         project.output_format = state.get("output_format", project.output_format)
         project.resolution = state.get("resolution", project.resolution)
         project.platform = state.get("platform", project.platform)
-        project.status = "storyboard_ready"
+        project.status = status
 
     db.query(CharacterModel).filter(CharacterModel.project_id == project_id).delete()
     for index, char in enumerate(state.get("characters", [])):
@@ -278,6 +264,32 @@ def _shot_model(project_id: str, shot: dict, sequence: int) -> ShotModel:
         characters_in_scene=json.dumps(shot.get("characters_in_scene", []), ensure_ascii=False),
         visual_notes=shot.get("visual_notes", ""),
     )
+
+
+async def _persist_shot_update(project_id: str, shot: dict) -> None:
+    db = SessionLocal()
+    try:
+        shot_id = shot.get("shot_id") or shot.get("id")
+        db_shot = db.query(ShotModel).filter(ShotModel.id == shot_id, ShotModel.project_id == project_id).first()
+        if db_shot:
+            db_shot.image_path = shot.get("image_path", db_shot.image_path)
+            db_shot.audio_path = shot.get("audio_path", db_shot.audio_path)
+            db_shot.status = shot.get("status", db_shot.status)
+            db_shot.version = shot.get("version", db_shot.version)
+            db_shot.visual_notes = shot.get("visual_notes", db_shot.visual_notes)
+            db.commit()
+        await ws_manager.send_to_project(
+            project_id,
+            {
+                "type": "shot_update",
+                "shot_id": shot_id,
+                "status": shot.get("status", "done"),
+                "image_path": shot.get("image_path", ""),
+                "audio_path": shot.get("audio_path", ""),
+            },
+        )
+    finally:
+        db.close()
 
 
 async def _progress(project_id: str, step: str, progress: int, message: str) -> None:

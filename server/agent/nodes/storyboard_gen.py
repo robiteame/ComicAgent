@@ -11,24 +11,27 @@ async def run(state: AgentState) -> dict:
     if state.get("storyboard_confirmed") and state.get("shots"):
         return {"current_step": "generate_storyboard"}
 
-    result = None
-    if llm_service.available:
-        try:
-            result = await llm_service.call_json(
-                _load_system_prompt(),
-                _build_task_prompt(
-                    script_scenes=state.get("script_scenes", []),
-                    characters=state.get("characters", []),
-                    style=state.get("style", "anime"),
-                    platform=state.get("platform", "douyin"),
-                    target_duration=state.get("target_duration", 30),
-                ),
-                temperature=0.35,
-            )
-        except Exception:
-            result = None
+    if not llm_service.available:
+        raise RuntimeError("未配置可用的 Mimo/LLM API Key，无法生成真实分镜")
+
+    try:
+        result = await llm_service.call_json(
+            _load_system_prompt(),
+            _build_task_prompt(
+                script_scenes=state.get("script_scenes", []),
+                characters=state.get("characters", []),
+                style=state.get("style", "anime"),
+                platform=state.get("platform", "douyin"),
+                target_duration=state.get("target_duration", 30),
+            ),
+            temperature=0.35,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Mimo 分镜生成失败: {exc}") from exc
 
     raw_shots = result if isinstance(result, list) else (result or {}).get("shots", [])
+    if not raw_shots:
+        raise RuntimeError("Mimo 分镜生成结果缺少 shots")
     shots = _normalize_shots(raw_shots, state)
 
     return {

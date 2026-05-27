@@ -1,5 +1,4 @@
 import asyncio
-import shutil
 from pathlib import Path
 
 from config import settings
@@ -32,8 +31,7 @@ class FFmpegService:
         if not clip_paths:
             raise ValueError("没有可渲染的镜头图片")
 
-        concat_path = await self._concat_clips(clip_paths, video_dir)
-        final_path = await self._mix_audio(concat_path, shots, video_dir)
+        final_path = await self._concat_clips(clip_paths, video_dir)
         return str(final_path)
 
     async def _render_shot_clip(self, shot: dict, width: int, height: int, index: int, output_dir: Path) -> Path:
@@ -43,6 +41,14 @@ class FFmpegService:
         image_path = str(shot["image_path"])
         zoom = self._zoom_filter(shot.get("shot_type", "medium"), width, height, frames)
 
+        audio_path = Path(shot["audio_path"]) if shot.get("audio_path") else None
+        if audio_path and audio_path.exists():
+            audio_input = ["-i", str(audio_path)]
+            audio_filter = ["-af", f"apad=pad_dur={duration}"]
+        else:
+            audio_input = ["-f", "lavfi", "-t", str(duration), "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"]
+            audio_filter = []
+
         await self._run(
             [
                 "ffmpeg",
@@ -51,59 +57,66 @@ class FFmpegService:
                 "1",
                 "-i",
                 image_path,
+                *audio_input,
                 "-vf",
                 zoom,
                 "-t",
                 str(duration),
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
                 "-c:v",
                 "libx264",
                 "-pix_fmt",
                 "yuv420p",
+                "-c:a",
+                "aac",
+                *audio_filter,
+                "-shortest",
                 str(clip_path),
             ]
         )
         return clip_path
 
     async def _concat_clips(self, clip_paths: list[Path], output_dir: Path) -> Path:
-        concat_path = output_dir / "concat.mp4"
-        list_path = output_dir / "concat_list.txt"
-        with open(list_path, "w", encoding="utf-8") as f:
-            for path in clip_paths:
-                f.write(f"file '{path.as_posix()}'\n")
-        await self._run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_path), "-c", "copy", str(concat_path)])
-        return concat_path
+        concat_path = output_dir / "final.mp4"
+        inputs: list[str] = []
+        for path in clip_paths:
+            inputs.extend(["-i", str(path)])
 
-    async def _mix_audio(self, video_path: Path, shots: list[dict], output_dir: Path) -> Path:
-        output_path = output_dir / "final.mp4"
-        audio_clips = [Path(s["audio_path"]) for s in shots if s.get("audio_path") and Path(s["audio_path"]).exists()]
-        if not audio_clips:
-            shutil.copy2(video_path, output_path)
-            return output_path
+        audio_filters = []
+        concat_inputs = []
+        for index in range(len(clip_paths)):
+            audio_filters.append(f"[{index}:a:0]aresample=44100,aformat=channel_layouts=stereo[a{index}]")
+            concat_inputs.append(f"[{index}:v:0][a{index}]")
 
-        list_path = output_dir / "audio_list.txt"
-        audio_full = output_dir / "audio_full.m4a"
-        with open(list_path, "w", encoding="utf-8") as f:
-            for path in audio_clips:
-                f.write(f"file '{path.as_posix()}'\n")
-
-        await self._run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_path), "-c:a", "aac", str(audio_full)])
+        filter_complex = ";".join(audio_filters)
+        filter_complex += ";" + "".join(concat_inputs)
+        filter_complex += f"concat=n={len(clip_paths)}:v=1:a=1[v][a]"
         await self._run(
             [
                 "ffmpeg",
                 "-y",
-                "-i",
-                str(video_path),
-                "-i",
-                str(audio_full),
+                *inputs,
+                "-filter_complex",
+                filter_complex,
+                "-map",
+                "[v]",
+                "-map",
+                "[a]",
                 "-c:v",
-                "copy",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
                 "-c:a",
                 "aac",
-                "-shortest",
-                str(output_path),
+                "-movflags",
+                "+faststart",
+                str(concat_path),
             ]
         )
-        return output_path
+        return concat_path
 
     def _zoom_filter(self, shot_type: str, width: int, height: int, frames: int) -> str:
         if shot_type == "wide":

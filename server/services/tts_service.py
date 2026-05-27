@@ -1,4 +1,5 @@
-import wave
+import asyncio
+import base64
 
 import edge_tts
 
@@ -25,7 +26,7 @@ EMOTION_PARAMS = {
 
 
 class TTSService:
-    """Edge-TTS service with a silent WAV fallback."""
+    """Edge-TTS service. Real synthesis failures are surfaced to the pipeline."""
 
     def __init__(self):
         self.output_dir = settings.OUTPUT_DIR / "projects"
@@ -43,20 +44,44 @@ class TTSService:
         audio_dir.mkdir(parents=True, exist_ok=True)
         mp3_path = audio_dir / f"{shot_id}.mp3"
 
+        params = EMOTION_PARAMS.get(emotion, EMOTION_PARAMS["neutral"])
+        errors: list[str] = []
+        for voice in self._voice_candidates(voice_id):
+            try:
+                communicate = edge_tts.Communicate(
+                    text=text,
+                    voice=voice,
+                    rate=params["rate"],
+                    pitch=params["pitch"],
+                )
+                await communicate.save(str(mp3_path))
+                if mp3_path.exists() and mp3_path.stat().st_size > 0:
+                    return str(mp3_path)
+                errors.append(f"{voice}: 输出文件为空")
+            except Exception as exc:
+                errors.append(f"{voice}: {exc}")
+
+        wav_path = audio_dir / f"{shot_id}.wav"
         try:
-            params = EMOTION_PARAMS.get(emotion, EMOTION_PARAMS["neutral"])
-            communicate = edge_tts.Communicate(
-                text=text,
-                voice=self._resolve_voice(voice_id),
-                rate=params["rate"],
-                pitch=params["pitch"],
-            )
-            await communicate.save(str(mp3_path))
-            return str(mp3_path)
-        except Exception:
-            wav_path = audio_dir / f"{shot_id}.wav"
-            self._write_silence(wav_path, max(1.2, min(6.0, len(text) / 8)))
-            return str(wav_path)
+            await self._generate_windows_sapi(text, wav_path)
+            if wav_path.exists() and wav_path.stat().st_size > 2048:
+                return str(wav_path)
+            errors.append("Windows SAPI: 生成文件为空")
+        except Exception as exc:
+            errors.append(f"Windows SAPI: {exc}")
+
+        raise RuntimeError("配音生成失败: " + " | ".join(errors[-3:]))
+
+    def _voice_candidates(self, voice_id: str) -> list[str]:
+        resolved = self._resolve_voice(voice_id)
+        candidates = [
+            resolved,
+            self.default_voice,
+            "zh-CN-XiaoxiaoNeural",
+            "zh-CN-YunxiNeural",
+            "zh-CN-YunjianNeural",
+        ]
+        return list(dict.fromkeys(v for v in candidates if v))
 
     def _resolve_voice(self, voice_id: str) -> str:
         if not voice_id:
@@ -67,14 +92,40 @@ class TTSService:
             return voice_id
         return self.default_voice
 
-    def _write_silence(self, path, duration: float) -> None:
-        sample_rate = 16000
-        frames = int(sample_rate * duration)
-        with wave.open(str(path), "wb") as wav:
-            wav.setnchannels(1)
-            wav.setsampwidth(2)
-            wav.setframerate(sample_rate)
-            wav.writeframes(b"\x00\x00" * frames)
+    async def _generate_windows_sapi(self, text: str, wav_path) -> None:
+        encoded_text = base64.b64encode(text.encode("utf-8")).decode("ascii")
+        escaped_path = str(wav_path).replace("'", "''")
+        ps = f"""
+$ErrorActionPreference = 'Stop'
+$text = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded_text}'))
+$path = '{escaped_path}'
+$dir = Split-Path -Parent $path
+New-Item -ItemType Directory -Force -Path $dir | Out-Null
+$voice = New-Object -ComObject SAPI.SpVoice
+$stream = New-Object -ComObject SAPI.SpFileStream
+$format = New-Object -ComObject SAPI.SpAudioFormat
+$format.Type = 22
+$stream.Format = $format
+$stream.Open($path, 3)
+$voice.AudioOutputStream = $stream
+[void]$voice.Speak($text)
+$stream.Close()
+"""
+        encoded_command = base64.b64encode(ps.encode("utf-16le")).decode("ascii")
+        proc = await asyncio.create_subprocess_exec(
+            "powershell",
+            "-NoProfile",
+            "-NonInteractive",
+            "-EncodedCommand",
+            encoded_command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(stderr.decode("utf-8", errors="ignore")[-1000:])
+        if not wav_path.exists() or wav_path.stat().st_size <= 2048:
+            raise RuntimeError("Windows SAPI 未生成有效音频")
 
     async def list_voices(self) -> list[dict]:
         voices = await edge_tts.list_voices()

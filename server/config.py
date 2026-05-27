@@ -1,4 +1,3 @@
-import os
 from pathlib import Path
 from pydantic_settings import BaseSettings
 
@@ -17,19 +16,24 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str = ""
     OPENAI_BASE_URL: str = ""
     OPENAI_MODEL: str = "gpt-4o"
+    LLM_MAX_TOKENS: int = 4096
 
     # Mimo (小米 MiMo, 通过硅基流动 SiliconFlow 调用)
     MIMO_API_KEY: str = ""
-    MIMO_BASE_URL: str = "https://api.siliconflow.cn/v1"
-    MIMO_MODEL: str = "XiaomiMiMo/MiMo-7B-RL"
+    MIMO_BASE_URL: str = "https://token-plan-cn.xiaomimimo.com/v1"
+    MIMO_MODEL: str = "mimo-v2.5"
+    MIMO_MULTIMODAL_MODEL: str = "mimo-v2-omni"
 
-    # SeedDance (字节跳动, 通过火山引擎方舟平台调用)
+    # SeedDance / Seedream (字节跳动, 通过火山引擎方舟平台调用)
+    ARK_API_KEY: str = ""
     SEEDDANCE_API_KEY: str = ""
-    SEEDDANCE_BASE_URL: str = "https://ark.cn-beijing.volces.com/api/v3"
-    SEEDDANCE_MODEL: str = "doubao-1.5-pro-32k"
+    SEEDDANCE_BASE_URL: str = "https://ark.cn-beijing.volces.com/api/plan/v3"
+    SEEDDANCE_MODEL: str = "doubao-seedance-1.0-lite"
+    SEEDREAM_MODEL: str = "doubao-seedream-5.0-lite"
+    SEEDREAM_IMAGE_SIZE: str = "1440x2560"
 
     # 图像生成配置
-    IMAGE_PROVIDER: str = "local"  # local / stability
+    IMAGE_PROVIDER: str = "local"  # local / stability / doubao-seedream-5.0-lite
     STABILITY_API_KEY: str = ""
     STABILITY_API_URL: str = "https://api.stability.ai/v2beta"
     SD_LOCAL_URL: str = "http://127.0.0.1:7860"
@@ -52,8 +56,12 @@ class Settings(BaseSettings):
     DEFAULT_RESOLUTION: str = "1080p"
 
     class Config:
-        env_file = ".env"
+        env_file = (
+            str(Path(__file__).parent / ".env"),
+            str(Path(__file__).parent.parent / ".env"),
+        )
         env_file_encoding = "utf-8"
+        extra = "ignore"
 
 
 settings = Settings()

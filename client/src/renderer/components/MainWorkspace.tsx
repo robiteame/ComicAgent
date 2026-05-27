@@ -166,10 +166,14 @@ const MainWorkspace: React.FC = () => {
       if (data.type === 'complete') {
         appendLog(`[${ts}] 流程执行完成`)
 
-        if (awaitingRef.current || stepRef.current === 'wait_storyboard_confirm') {
+        if (!data.video_path || awaitingRef.current || stepRef.current === 'wait_storyboard_confirm') {
           setGenerating(false)
           setLoading(false)
           setAwaitingStoryboardConfirm(true)
+          setPreviewMode('shot')
+          if (Array.isArray(data.shots) && data.shots.length > 0) {
+            replaceShots(data.shots)
+          }
           void loadProjectShots(pid)
           return
         }
@@ -211,6 +215,7 @@ const MainWorkspace: React.FC = () => {
         setGenerating(false)
         setLoading(false)
         setAwaitingStoryboardConfirm(false)
+        void loadProjectShots(pid)
       }
     })
 

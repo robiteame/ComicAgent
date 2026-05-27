@@ -36,22 +36,34 @@ async def run(state: AgentState) -> dict:
         except Exception:
             rag_context = []
 
-    result = None
-    if llm_service.available and user_input:
-        try:
-            result = await llm_service.call_json(
-                _load_system_prompt(),
-                _build_task_prompt(user_input, rag_context),
-                temperature=0.25,
-            )
-        except Exception:
-            result = None
+    if not llm_service.available:
+        raise RuntimeError("未配置可用的 Mimo/LLM API Key，无法解析剧本")
+    if not user_input:
+        raise RuntimeError("剧本内容为空，无法解析")
 
-    if not result:
-        result = _fallback_parse(user_input)
+    try:
+        result = await llm_service.call_json(
+            _load_system_prompt(),
+            _build_task_prompt(user_input, rag_context),
+            temperature=0.25,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Mimo 剧本解析失败: {exc}") from exc
 
-    characters = _normalize_characters(result.get("characters", []), user_input)
-    script_scenes = _normalize_scenes(result.get("script_scenes") or result.get("scenes") or [], user_input, characters)
+    if not isinstance(result, dict):
+        raise RuntimeError("Mimo 剧本解析没有返回 JSON 对象")
+
+    raw_characters = result.get("characters", [])
+    raw_scenes = result.get("script_scenes") or result.get("scenes") or []
+    if not raw_characters or not raw_scenes:
+        raise RuntimeError("Mimo 剧本解析结果缺少角色或场景")
+
+    characters = _normalize_characters(raw_characters, user_input)
+    if not characters:
+        raise RuntimeError("Mimo 剧本解析结果缺少可用角色")
+    script_scenes = _normalize_scenes(raw_scenes, user_input, characters)
+    if not script_scenes:
+        raise RuntimeError("Mimo 剧本解析结果缺少角色或场景")
 
     project_memory.save_characters(project_id, characters)
     project_memory.save_narrative_context(
@@ -107,7 +119,7 @@ def _normalize_characters(raw: list, user_input: str) -> list[dict]:
             }
         )
 
-    if characters:
+    if characters or raw:
         return characters
 
     names = re.findall(r"(?:人物|角色)[:：]\s*([^\n，。]+)", user_input)

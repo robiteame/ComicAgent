@@ -14,6 +14,7 @@ async def run(state: AgentState) -> dict:
     voice_map = {char["name"]: char.get("voice_id", "") for char in characters}
 
     updated_shots = []
+    failures: list[str] = []
     for shot in shots:
         if not shot.get("dialogue"):
             updated_shots.append(shot)
@@ -36,8 +37,12 @@ async def run(state: AgentState) -> dict:
             shot["audio_path"] = ""
             shot["status"] = "needs_review"
             shot["visual_notes"] = f"配音失败: {str(e)}"
+            failures.append(f"{shot.get('shot_id')}: {e}")
 
         updated_shots.append(shot)
+
+    if failures:
+        raise RuntimeError("配音生成失败: " + " | ".join(failures))
 
     return {
         "shots": updated_shots,
