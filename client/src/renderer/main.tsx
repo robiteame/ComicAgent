@@ -1,6 +1,6 @@
-import React from 'react'
+﻿import React from 'react'
 import ReactDOM from 'react-dom/client'
-import { ConfigProvider, theme } from 'antd'
+import { App as AntdApp, ConfigProvider, theme } from 'antd'
 import zhCN from 'antd/locale/zh_CN'
 import App from './App'
 import './styles/global.css'
@@ -8,42 +8,43 @@ import './styles/global.css'
 const antTheme = {
   algorithm: theme.defaultAlgorithm,
   token: {
-    colorPrimary: '#0071e3',
-    colorSuccess: '#34c759',
-    colorWarning: '#ff9500',
-    colorError: '#ff3b30',
-    colorInfo: '#0071e3',
+    colorPrimary: '#4f7fd8',
+    colorSuccess: '#5fa783',
+    colorWarning: '#b89266',
+    colorError: '#b26969',
+    colorInfo: '#4f7fd8',
     colorBgContainer: '#ffffff',
-    colorBgLayout: '#f5f5f7',
-    colorBgElevated: '#ffffff',
-    colorBorder: '#e0e0e0',
-    colorBorderSecondary: '#e5e5ea',
-    colorText: '#1d1d1f',
-    colorTextSecondary: '#6e6e73',
-    colorTextTertiary: '#aeaeb2',
-    colorTextQuaternary: '#c7c7cc',
-    borderRadius: 6,
-    fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", "Noto Sans SC", sans-serif',
+    colorBgLayout: 'transparent',
+    colorBgElevated: '#fafdff',
+    colorBorder: '#d7e1ec',
+    colorBorderSecondary: '#e5edf5',
+    colorText: '#27313a',
+    colorTextSecondary: '#647385',
+    colorTextTertiary: '#8a98a9',
+    colorTextQuaternary: '#a0acbb',
+    borderRadius: 8,
+    fontFamily:
+      '-apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif',
     fontSize: 13,
-    controlHeight: 30,
-    controlHeightLG: 36,
-    controlHeightSM: 24,
-    colorLink: '#0071e3',
-    colorLinkHover: '#0077ed',
+    controlHeight: 34,
+    controlHeightLG: 38,
+    controlHeightSM: 30,
+    colorLink: '#4f7fd8',
+    colorLinkHover: '#345fba',
   },
   components: {
     Button: {
-      controlHeight: 30,
-      controlHeightLG: 36,
-      controlHeightSM: 24,
-      borderRadius: 6,
+      controlHeight: 34,
+      controlHeightLG: 38,
+      controlHeightSM: 30,
+      borderRadius: 8,
     },
     Input: {
-      controlHeight: 30,
-      paddingInline: 10,
+      controlHeight: 34,
+      paddingInline: 11,
     },
     Select: {
-      controlHeight: 30,
+      controlHeight: 34,
     },
   },
 }
@@ -51,7 +52,9 @@ const antTheme = {
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <ConfigProvider locale={zhCN} theme={antTheme}>
-      <App />
+      <AntdApp>
+        <App />
+      </AntdApp>
     </ConfigProvider>
-  </React.StrictMode>
+  </React.StrictMode>,
 )

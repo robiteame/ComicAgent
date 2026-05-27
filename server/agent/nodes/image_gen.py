@@ -5,7 +5,7 @@ image_service = ImageService()
 
 
 async def run(state: AgentState) -> dict:
-    """图像生成节点：为每个镜头生成图像，注入角色卡片保持一致性"""
+    """Generate one image for each storyboard shot."""
 
     shots = state.get("shots", [])
     characters = state.get("characters", [])
@@ -14,16 +14,21 @@ async def run(state: AgentState) -> dict:
 
     updated_shots = []
     for shot in shots:
-        if shot.get("status") == "done":
+        if shot.get("status") == "done" and shot.get("image_path"):
             updated_shots.append(shot)
             continue
 
         try:
+            scene_chars = shot.get("characters_in_scene", [])
+            char_seed = next((c.get("seed", 42) for c in characters if c["name"] in scene_chars), None)
+            effective_seed = shot.get("seed", char_seed or 42)
+
             image_path = await image_service.generate_shot_image(
                 shot=shot,
                 characters=characters,
                 style_params=style_params,
                 project_id=project_id,
+                seed=effective_seed,
             )
             shot["image_path"] = image_path
             shot["status"] = "done"
@@ -40,7 +45,7 @@ async def run(state: AgentState) -> dict:
 
 
 async def regenerate_failed_shots(state: AgentState) -> dict:
-    """重新生成失败的镜头"""
+    """Regenerate shots that failed in the image stage."""
     shots = state.get("shots", [])
     characters = state.get("characters", [])
     style_params = state.get("style_params", {})
@@ -53,21 +58,21 @@ async def regenerate_failed_shots(state: AgentState) -> dict:
             continue
 
         try:
-            # 使用不同 seed 重试
-            new_seed = (shot.get("seed", 42) or 42) + 100
+            shot["seed"] = shot.get("seed", 42) + 100
+            shot["version"] = shot.get("version", 1) + 1
+
             image_path = await image_service.generate_shot_image(
                 shot=shot,
                 characters=characters,
                 style_params=style_params,
                 project_id=project_id,
-                seed=new_seed,
+                seed=shot["seed"],
             )
             shot["image_path"] = image_path
             shot["status"] = "done"
-            shot["version"] = shot.get("version", 1) + 1
         except Exception as e:
             shot["status"] = "failed"
-            shot["visual_notes"] = f"重生成失败: {str(e)}"
+            shot["visual_notes"] = f"重新生成失败: {str(e)}"
 
         updated_shots.append(shot)
 

@@ -1,5 +1,5 @@
 import json
-import uuid
+
 from agent.state import AgentState
 from services.llm_service import LLMService
 
@@ -7,40 +7,29 @@ llm_service = LLMService()
 
 
 async def run(state: AgentState) -> dict:
-    """分镜生成节点：根据脚本场景生成分镜方案"""
+    """Generate storyboard shots from parsed scenes."""
+    if state.get("storyboard_confirmed") and state.get("shots"):
+        return {"current_step": "generate_storyboard"}
 
-    system_prompt = _load_system_prompt()
-    task_prompt = _build_task_prompt(
-        script_scenes=state.get("script_scenes", []),
-        characters=state.get("characters", []),
-        style=state.get("style", "anime"),
-        platform=state.get("platform", "douyin"),
-        target_duration=state.get("target_duration", 30),
-    )
+    result = None
+    if llm_service.available:
+        try:
+            result = await llm_service.call_json(
+                _load_system_prompt(),
+                _build_task_prompt(
+                    script_scenes=state.get("script_scenes", []),
+                    characters=state.get("characters", []),
+                    style=state.get("style", "anime"),
+                    platform=state.get("platform", "douyin"),
+                    target_duration=state.get("target_duration", 30),
+                ),
+                temperature=0.35,
+            )
+        except Exception:
+            result = None
 
-    result = await llm_service.call_json(system_prompt, task_prompt)
-
-    # 构建镜头列表
-    shots = []
-    for i, shot_data in enumerate(result if isinstance(result, list) else result.get("shots", [])):
-        shot = {
-            "shot_id": f"shot_{i+1:04d}",
-            "shot_type": shot_data.get("shot_type", "medium"),
-            "scene_description": shot_data.get("scene_description", ""),
-            "characters_in_scene": shot_data.get("characters_in_scene", []),
-            "character_action": shot_data.get("character_action", ""),
-            "dialogue": shot_data.get("dialogue", ""),
-            "camera_angle": shot_data.get("camera_angle", "正面"),
-            "camera_movement": shot_data.get("camera_movement", "静止"),
-            "emotion": shot_data.get("emotion", "neutral"),
-            "duration": shot_data.get("duration", 3.0),
-            "transition": shot_data.get("transition", "cut"),
-            "image_path": "",
-            "audio_path": "",
-            "status": "pending",
-            "visual_notes": shot_data.get("visual_notes", ""),
-        }
-        shots.append(shot)
+    raw_shots = result if isinstance(result, list) else (result or {}).get("shots", [])
+    shots = _normalize_shots(raw_shots, state)
 
     return {
         "shots": shots,
@@ -48,61 +37,117 @@ async def run(state: AgentState) -> dict:
     }
 
 
-def _load_system_prompt() -> str:
-    return """你是一个专业的漫剧分镜师，精通镜头语言和漫剧节奏把控。
+def _normalize_shots(raw_shots: list, state: AgentState) -> list[dict]:
+    project_id = state["project_id"]
+    characters = state.get("characters", [])
+    default_character = characters[0]["name"] if characters else "主角"
+    scenes = state.get("script_scenes", [])
+    source = raw_shots if raw_shots else _fallback_shots(scenes, default_character)
 
-分镜原则：
-1. 镜头类型选择要符合情绪表达：
-   - 全景(wide)：交代环境、展示空间关系、转场
-   - 中景(medium)：对话、日常互动、展示上半身动作
-   - 近景(close-up)：表情特写、情绪高潮、关键动作
-   - 特写(extreme_close)：眼神、手部细节、极致情绪
-2. 镜头节奏要符合剧情：
-   - 甜宠/日常：中景为主，节奏舒缓，每镜头3-5秒
-   - 冲突/紧张：特写+快速切换，每镜头1-3秒
-   - 转场/铺垫：全景，缓慢推进，3-6秒
-3. 镜头之间要有视觉连贯性，避免跳跃
-4. 总镜头数要适配目标时长"""
-
-
-def _build_task_prompt(
-    script_scenes: list, characters: list, style: str, platform: str, target_duration: int
-) -> str:
-    characters_summary = []
-    for c in characters:
-        characters_summary.append(
-            f"- {c['name']}: {c.get('personality', '')} | 外貌: {c.get('visual_prompt', '')}"
+    shots: list[dict] = []
+    for i, item in enumerate(source[:12]):
+        dialogue = item.get("dialogue", "")
+        if isinstance(dialogue, list):
+            dialogue = dialogue[0].get("line", "") if dialogue else ""
+        characters_in_scene = item.get("characters_in_scene") or [default_character]
+        shots.append(
+            {
+                "shot_id": item.get("shot_id") or f"{project_id}_shot_{i + 1:04d}",
+                "shot_type": item.get("shot_type") or item.get("camera_suggestion") or "medium",
+                "scene_description": item.get("scene_description") or item.get("actions") or "角色推进剧情",
+                "characters_in_scene": characters_in_scene,
+                "character_action": item.get("character_action") or item.get("actions") or "",
+                "dialogue": dialogue,
+                "camera_angle": _normalize_camera_angle(item.get("camera_angle", "正面")),
+                "camera_movement": item.get("camera_movement", "静止"),
+                "emotion": item.get("emotion", "neutral"),
+                "duration": float(item.get("duration") or 3.0),
+                "transition": item.get("transition", "cut"),
+                "image_path": item.get("image_path", ""),
+                "audio_path": item.get("audio_path", ""),
+                "status": item.get("status", "pending"),
+                "confirmed": bool(item.get("confirmed", False)),
+                "version": int(item.get("version", 1)),
+                "seed": int(item.get("seed", 42 + i)),
+                "visual_notes": item.get("visual_notes", ""),
+            }
         )
+    return shots
 
-    scenes_text = json.dumps(script_scenes, ensure_ascii=False, indent=2)
 
-    return f"""基于以下脚本场景，生成分镜方案：
+def _fallback_shots(scenes: list[dict], default_character: str) -> list[dict]:
+    if not scenes:
+        scenes = [{"actions": "主角站在窗边，故事开始", "emotion": "neutral", "dialogue": []}]
 
-脚本场景：
-{scenes_text}
+    shots: list[dict] = []
+    shot_types = ["wide", "medium", "close-up"]
+    for index, scene in enumerate(scenes[:5]):
+        dialogue = scene.get("dialogue") or []
+        line = dialogue[0].get("line", "") if isinstance(dialogue, list) and dialogue else ""
+        shots.append(
+            {
+                "shot_type": shot_types[index % len(shot_types)],
+                "scene_description": scene.get("actions") or scene.get("description") or "故事场景中的关键瞬间",
+                "characters_in_scene": scene.get("characters_in_scene") or [default_character],
+                "character_action": scene.get("actions", ""),
+                "dialogue": line,
+                "camera_angle": "正面",
+                "camera_movement": "缓慢推进" if index % 2 else "静止",
+                "emotion": scene.get("emotion", "neutral"),
+                "duration": 3.0 + (index % 2),
+                "transition": "cut",
+                "visual_notes": "本地降级生成，可在右侧继续细化",
+            }
+        )
+    return shots
 
-角色信息：
-{chr(10).join(characters_summary)}
 
-风格要求：{style}
-目标平台：{platform}
-目标时长：{target_duration}秒
+def _normalize_camera_angle(value: str) -> str:
+    aliases = {
+        "front": "正面",
+        "side": "侧面",
+        "overhead": "俯视",
+        "high": "俯视",
+        "low": "仰视",
+        "正面": "正面",
+        "侧面": "侧面",
+        "俯视": "俯视",
+        "仰视": "仰视",
+    }
+    return aliases.get(value, "正面")
 
-请输出JSON格式：
+
+def _load_system_prompt() -> str:
+    return "你是专业漫剧分镜师。根据剧本场景输出可执行分镜 JSON，不要输出 Markdown。"
+
+
+def _build_task_prompt(script_scenes: list, characters: list, style: str, platform: str, target_duration: int) -> str:
+    return f"""
+剧本场景：
+{json.dumps(script_scenes, ensure_ascii=False, indent=2)}
+
+角色：
+{json.dumps(characters, ensure_ascii=False, indent=2)}
+
+风格：{style}
+平台：{platform}
+目标时长：{target_duration} 秒
+输出 JSON：
 {{
-    "shots": [
-        {{
-            "shot_type": "wide/medium/close-up/extreme_close",
-            "scene_description": "画面描述（英文，用于AI图像生成）",
-            "characters_in_scene": ["角色A"],
-            "character_action": "角色动作描述",
-            "dialogue": "台词（如有）",
-            "camera_angle": "正面/侧面/俯视/仰视",
-            "camera_movement": "静止/缓慢推进/平移/跟随",
-            "emotion": "画面情绪",
-            "duration": 3.5,
-            "transition": "fade/cut/dissolve/flash",
-            "visual_notes": "画面注意事项"
-        }}
-    ]
-}}"""
+  "shots": [
+    {{
+      "shot_type": "wide/medium/close-up/extreme_close",
+      "scene_description": "画面描述",
+      "characters_in_scene": ["角色名"],
+      "character_action": "动作",
+      "dialogue": "台词",
+      "camera_angle": "正面/侧面/俯视/仰视",
+      "camera_movement": "静止/缓慢推进/平移/跟随",
+      "emotion": "neutral/happy/shy/sad/angry/surprised",
+      "duration": 3.5,
+      "transition": "cut/fade/dissolve",
+      "visual_notes": "画面注意事项"
+    }}
+  ]
+}}
+"""

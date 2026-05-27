@@ -63,6 +63,7 @@ pnpm-debug.yaml
 
 # ---- Project Runtime Data ----
 # Server output (generated images, audio, video)
+output/
 server/output/
 # ChromaDB vector store
 server/data/chromadb/

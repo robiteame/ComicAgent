@@ -1,8 +1,10 @@
 import uuid
 from datetime import datetime
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+
 from db import get_db
 from models import Project
 
@@ -31,12 +33,11 @@ class ProjectUpdate(BaseModel):
 
 @router.post("")
 async def create_project(data: ProjectCreate, db: Session = Depends(get_db)):
-    project_id = str(uuid.uuid4())
-    project = Project(id=project_id, **data.model_dump())
+    project = Project(id=str(uuid.uuid4()), **data.model_dump())
     db.add(project)
     db.commit()
     db.refresh(project)
-    return {"id": project.id, "title": project.title, "status": project.status}
+    return _serialize_project(project)
 
 
 @router.get("/{project_id}")
@@ -44,19 +45,7 @@ async def get_project(project_id: str, db: Session = Depends(get_db)):
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="项目不存在")
-    return {
-        "id": project.id,
-        "title": project.title,
-        "genre": project.genre,
-        "style": project.style,
-        "status": project.status,
-        "input_text": project.input_text,
-        "output_format": project.output_format,
-        "resolution": project.resolution,
-        "platform": project.platform,
-        "created_at": project.created_at.isoformat(),
-        "updated_at": project.updated_at.isoformat(),
-    }
+    return _serialize_project(project)
 
 
 @router.put("/{project_id}")
@@ -74,14 +63,20 @@ async def update_project(project_id: str, data: ProjectUpdate, db: Session = Dep
 @router.get("")
 async def list_projects(db: Session = Depends(get_db)):
     projects = db.query(Project).order_by(Project.updated_at.desc()).all()
-    return [
-        {
-            "id": p.id,
-            "title": p.title,
-            "genre": p.genre,
-            "style": p.style,
-            "status": p.status,
-            "updated_at": p.updated_at.isoformat(),
-        }
-        for p in projects
-    ]
+    return [_serialize_project(project) for project in projects]
+
+
+def _serialize_project(project: Project) -> dict:
+    return {
+        "id": project.id,
+        "title": project.title,
+        "genre": project.genre,
+        "style": project.style,
+        "status": project.status,
+        "input_text": project.input_text,
+        "output_format": project.output_format,
+        "resolution": project.resolution,
+        "platform": project.platform,
+        "created_at": project.created_at.isoformat(),
+        "updated_at": project.updated_at.isoformat(),
+    }

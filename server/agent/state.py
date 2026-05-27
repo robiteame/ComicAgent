@@ -28,7 +28,10 @@ class Shot(TypedDict):
     transition: str  # fade/cut/dissolve/flash
     image_path: str
     audio_path: str
+    confirmed: bool
     status: Literal["pending", "generating", "done", "failed", "needs_review"]
+    version: int
+    seed: int
     visual_notes: str
 
 
@@ -81,6 +84,7 @@ class AgentState(TypedDict):
     errors: Annotated[list[str], add]
     human_feedback: str
     needs_human_review: bool
+    storyboard_confirmed: bool
 
     # 记忆上下文（从 RAG 和记忆系统注入）
     rag_context: list[str]

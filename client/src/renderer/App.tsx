@@ -1,18 +1,31 @@
-import React from 'react'
-import TopBar from './components/TopBar'
+import React, { useState } from 'react'
+import BottomBar from './components/BottomBar'
 import LeftSidebar from './components/LeftSidebar'
 import MainWorkspace from './components/MainWorkspace'
 import RightSidebar from './components/RightSidebar'
-import BottomBar from './components/BottomBar'
+import TopBar from './components/TopBar'
 
 const App: React.FC = () => {
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  const [rightSidebarCollapsed, setRightSidebarCollapsed] = useState(true)
+
   return (
-    <div style={{ height: '100vh', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+    <div className="app-shell">
       <TopBar />
-      <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
-        <LeftSidebar />
+      <div
+        className={`app-main${sidebarCollapsed ? ' sidebar-collapsed' : ''}${rightSidebarCollapsed ? ' right-sidebar-collapsed' : ''}`}
+        role="main"
+        aria-label="主工作台"
+      >
+        <LeftSidebar
+          collapsed={sidebarCollapsed}
+          onToggleCollapsed={() => setSidebarCollapsed((prev) => !prev)}
+        />
         <MainWorkspace />
-        <RightSidebar />
+        <RightSidebar
+          collapsed={rightSidebarCollapsed}
+          onToggleCollapsed={() => setRightSidebarCollapsed((prev) => !prev)}
+        />
       </div>
       <BottomBar />
     </div>

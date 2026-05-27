@@ -1,32 +1,49 @@
-import { app, BrowserWindow, ipcMain, dialog } from 'electron'
+﻿import { app, BrowserWindow, ipcMain, dialog, Menu } from 'electron'
 import path from 'path'
 
 let mainWindow: BrowserWindow | null = null
 
+app.setName('ComicAgent')
+app.setPath('userData', path.join(app.getPath('appData'), 'ComicAgent'))
+app.commandLine.appendSwitch('disable-http-cache')
+app.commandLine.appendSwitch('disable-gpu-shader-disk-cache')
+
 function createWindow() {
-  mainWindow = new BrowserWindow({
+  const winOpts: Electron.BrowserWindowConstructorOptions = {
     width: 1400,
     height: 900,
     minWidth: 1200,
     minHeight: 800,
-    title: 'AI漫剧Agent',
+    title: '漫剧智能办公台',
+    transparent: true,
+    backgroundColor: '#00000000',
+    autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
     },
-  })
+  }
 
-  // 开发模式加载 Vite dev server
+  if (process.platform === 'win32') {
+    // Win11 下启用 acrylic 材质，配合透明窗口形成桌面透视毛玻璃观感。
+    ;(winOpts as Electron.BrowserWindowConstructorOptions & { backgroundMaterial?: string }).backgroundMaterial = 'acrylic'
+  }
+
+  mainWindow = new BrowserWindow(winOpts)
+  mainWindow.setMenuBarVisibility(false)
+
   if (process.env.NODE_ENV === 'development' || !app.isPackaged) {
-    mainWindow.loadURL('http://localhost:5173')
-    mainWindow.webContents.openDevTools()
+    mainWindow.loadURL('http://127.0.0.1:5173')
   } else {
     mainWindow.loadFile(path.join(__dirname, '../dist/index.html'))
   }
 }
 
-app.whenReady().then(createWindow)
+app.whenReady().then(() => {
+  Menu.setApplicationMenu(null)
+  createWindow()
+})
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
@@ -40,7 +57,6 @@ app.on('activate', () => {
   }
 })
 
-// IPC 处理
 ipcMain.handle('select-file', async () => {
   const result = await dialog.showOpenDialog(mainWindow!, {
     properties: ['openFile'],

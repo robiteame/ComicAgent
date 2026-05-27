@@ -16,6 +16,7 @@ export interface Shot {
   audio_path: string
   status: string
   version: number
+  confirmed: boolean
   characters_in_scene: string[]
 }
 
@@ -25,12 +26,19 @@ interface ShotState {
   isGenerating: boolean
   progress: number
   currentStep: string
+  awaitingStoryboardConfirm: boolean
+  videoPath: string
+  logs: string[]
 
   setShots: (shots: Shot[]) => void
   updateShot: (id: string, data: Partial<Shot>) => void
   selectShot: (id: string | null) => void
   setGenerating: (v: boolean) => void
   setProgress: (progress: number, step: string) => void
+  setAwaitingStoryboardConfirm: (v: boolean) => void
+  setVideoPath: (path: string) => void
+  appendLog: (line: string) => void
+  clearLogs: () => void
   addShot: (shot: Shot) => void
   removeShot: (id: string) => void
   reorderShots: (newOrder: string[]) => void
@@ -42,6 +50,9 @@ export const useShotStore = create<ShotState>((set, get) => ({
   isGenerating: false,
   progress: 0,
   currentStep: '',
+  awaitingStoryboardConfirm: false,
+  videoPath: '',
+  logs: [],
 
   setShots: (shots) => set({ shots }),
 
@@ -55,6 +66,17 @@ export const useShotStore = create<ShotState>((set, get) => ({
   setGenerating: (v) => set({ isGenerating: v }),
 
   setProgress: (progress, step) => set({ progress, currentStep: step }),
+
+  setAwaitingStoryboardConfirm: (v) => set({ awaitingStoryboardConfirm: v }),
+
+  setVideoPath: (path) => set({ videoPath: path }),
+
+  appendLog: (line) =>
+    set((state) => ({
+      logs: [...state.logs, line].slice(-100),
+    })),
+
+  clearLogs: () => set({ logs: [] }),
 
   addShot: (shot) => set((state) => ({ shots: [...state.shots, shot] })),
 

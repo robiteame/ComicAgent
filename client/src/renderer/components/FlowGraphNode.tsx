@@ -12,21 +12,21 @@ export interface FlowNodeData {
 }
 
 const statusColors: Record<NodeStatus, string> = {
-  pending: 'var(--text-quaternary)',
-  running: 'var(--amber)',
+  pending: 'var(--gray)',
+  running: 'var(--orange)',
   done: 'var(--green)',
-  error: 'var(--red)',
+  error: 'var(--orange)',
 }
 
-const typeIcons: Record<string, string> = {
-  input: '▶',
-  output: '◼',
-  process: '◆',
-  condition: '◇',
+const typeLabels: Record<string, string> = {
+  input: '入',
+  output: '出',
+  process: '处',
+  condition: '判',
 }
 
 const FlowGraphNode: React.FC<NodeProps> = ({ data, selected }) => {
-  const { label, description, nodeType, status } = data as FlowNodeData
+  const { label, nodeType, status } = data as FlowNodeData
   const color = statusColors[status]
   const isRunning = status === 'running'
   const isDone = status === 'done'
@@ -34,15 +34,13 @@ const FlowGraphNode: React.FC<NodeProps> = ({ data, selected }) => {
   return (
     <div
       style={{
-        background: 'var(--bg-white)',
-        border: `1.5px solid ${selected ? 'var(--accent)' : isRunning ? 'var(--amber)' : isDone ? 'var(--green)' : 'var(--border)'}`,
-        borderRadius: 'var(--radius)',
-        padding: '6px 10px',
-        minWidth: 90,
-        maxWidth: 140,
-        boxShadow: isRunning
-          ? '0 0 12px rgba(255, 149, 0, 0.2)'
-          : 'var(--shadow-sm)',
+        background: 'var(--white)',
+        border: `1.5px solid ${selected ? 'var(--green)' : isRunning ? 'var(--orange)' : isDone ? 'var(--green)' : 'var(--line)'}`,
+        borderRadius: '14px',
+        padding: '8px 12px',
+        minWidth: 98,
+        maxWidth: 152,
+        boxShadow: '0 1px 2px rgba(30, 33, 36, 0.05)',
         transition: 'all 200ms var(--ease)',
         position: 'relative',
         cursor: 'default',
@@ -53,23 +51,39 @@ const FlowGraphNode: React.FC<NodeProps> = ({ data, selected }) => {
           type="target"
           position={Position.Top}
           style={{
-            width: 6,
-            height: 6,
+            width: 7,
+            height: 7,
             background: color,
-            border: '1.5px solid var(--bg-white)',
-            top: -3,
+            border: '1px solid var(--white)',
+            top: -4,
           }}
         />
       )}
 
-      <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-        <span style={{ fontSize: 8, color, lineHeight: 1 }}>
-          {typeIcons[nodeType]}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+        <span
+          style={{
+            width: 16,
+            height: 16,
+            borderRadius: 6,
+            border: `1px solid ${color}`,
+            color,
+            display: 'grid',
+            placeItems: 'center',
+            fontSize: 10,
+            lineHeight: 1,
+            background: 'rgba(127, 138, 149, 0.06)',
+            fontWeight: 600,
+            flexShrink: 0,
+          }}
+        >
+          {typeLabels[nodeType]}
         </span>
+
         <span
           style={{
             fontSize: 11,
-            fontWeight: 500,
+            fontWeight: 600,
             color: 'var(--text)',
             whiteSpace: 'nowrap',
             overflow: 'hidden',
@@ -78,14 +92,15 @@ const FlowGraphNode: React.FC<NodeProps> = ({ data, selected }) => {
         >
           {label}
         </span>
+
         {isRunning && (
           <span
             style={{
-              width: 5,
-              height: 5,
+              width: 6,
+              height: 6,
               borderRadius: '50%',
-              background: 'var(--amber)',
-              animation: 'pulse 1.5s ease-in-out infinite',
+              background: 'var(--orange)',
+              animation: 'pulse 1.6s ease-in-out infinite',
               flexShrink: 0,
             }}
           />
@@ -97,11 +112,11 @@ const FlowGraphNode: React.FC<NodeProps> = ({ data, selected }) => {
           type="source"
           position={Position.Bottom}
           style={{
-            width: 6,
-            height: 6,
+            width: 7,
+            height: 7,
             background: color,
-            border: '1.5px solid var(--bg-white)',
-            bottom: -3,
+            border: '1px solid var(--white)',
+            bottom: -4,
           }}
         />
       )}

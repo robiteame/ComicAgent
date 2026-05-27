@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     PROMPTS_DIR: Path = Path(__file__).parent / "prompts"
 
     # LLM 配置
-    LLM_PROVIDER: str = "openai"  # openai / mimo / seeddance
+    LLM_PROVIDER: str = "openai"  # openai / deepseek / mimo / seeddance
     OPENAI_API_KEY: str = ""
     OPENAI_BASE_URL: str = ""
     OPENAI_MODEL: str = "gpt-4o"
@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     SEEDDANCE_MODEL: str = "doubao-1.5-pro-32k"
 
     # 图像生成配置
-    IMAGE_PROVIDER: str = "stability"  # stability / dalle / sd_local
+    IMAGE_PROVIDER: str = "local"  # local / stability
     STABILITY_API_KEY: str = ""
     STABILITY_API_URL: str = "https://api.stability.ai/v2beta"
     SD_LOCAL_URL: str = "http://127.0.0.1:7860"

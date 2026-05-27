@@ -1,6 +1,8 @@
 from datetime import datetime
-from sqlalchemy import Column, String, DateTime, Text
+
+from sqlalchemy import Column, DateTime, ForeignKey, String, Text
 from sqlalchemy.orm import relationship
+
 from .base import Base
 
 
@@ -8,18 +10,18 @@ class Character(Base):
     __tablename__ = "characters"
 
     id = Column(String, primary_key=True)
-    project_id = Column(String, nullable=False, index=True)
+    project_id = Column(String, ForeignKey("projects.id"), nullable=False, index=True)
     name = Column(String, nullable=False)
-    appearance = Column(Text, default="")  # JSON: 外貌详细描述
+    appearance = Column(Text, default="")
     personality = Column(Text, default="")
-    visual_prompt = Column(Text, default="")  # 英文 AI 绘画 prompt
+    visual_prompt = Column(Text, default="")
     negative_prompt = Column(Text, default="")
-    voice_id = Column(String, default="")  # TTS 音色标识
-    emotion_variants = Column(Text, default="{}")  # JSON: 情绪变体 prompt
-    key_features = Column(Text, default="[]")  # JSON: 关键视觉特征列表
+    voice_id = Column(String, default="")
+    emotion_variants = Column(Text, default="{}")
+    key_features = Column(Text, default="[]")
     default_outfit = Column(Text, default="")
-    reference_images = Column(Text, default="[]")  # JSON: 参考图路径列表
-    seed = Column(String, default="42")  # 固定 seed 保证一致性
+    reference_images = Column(Text, default="[]")
+    seed = Column(String, default="42")
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

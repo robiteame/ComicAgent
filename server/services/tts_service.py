@@ -1,10 +1,10 @@
-import uuid
+import wave
+
 import edge_tts
-from pathlib import Path
+
 from config import settings
 
 
-# 音色映射：角色类型 -> Edge-TTS 音色
 VOICE_MAP = {
     "少女": "zh-CN-XiaoyiNeural",
     "少年": "zh-CN-YunxiNeural",
@@ -14,7 +14,6 @@ VOICE_MAP = {
     "老人": "zh-CN-YunjianNeural",
 }
 
-# 情绪 -> 语速/语调调整
 EMOTION_PARAMS = {
     "neutral": {"rate": "+0%", "pitch": "+0Hz"},
     "happy": {"rate": "+5%", "pitch": "+5Hz"},
@@ -26,7 +25,7 @@ EMOTION_PARAMS = {
 
 
 class TTSService:
-    """TTS 配音服务（Edge-TTS）"""
+    """Edge-TTS service with a silent WAV fallback."""
 
     def __init__(self):
         self.output_dir = settings.OUTPUT_DIR / "projects"
@@ -40,42 +39,43 @@ class TTSService:
         project_id: str = "",
         shot_id: str = "",
     ) -> str:
-        """为台词生成配音"""
-
-        # 确定音色
-        voice = self._resolve_voice(voice_id)
-
-        # 获取情绪参数
-        params = EMOTION_PARAMS.get(emotion, EMOTION_PARAMS["neutral"])
-
-        # 输出路径
         audio_dir = self.output_dir / project_id / "audio"
         audio_dir.mkdir(parents=True, exist_ok=True)
-        audio_path = audio_dir / f"{shot_id}.mp3"
+        mp3_path = audio_dir / f"{shot_id}.mp3"
 
-        # 生成配音
-        communicate = edge_tts.Communicate(
-            text=text,
-            voice=voice,
-            rate=params["rate"],
-            pitch=params["pitch"],
-        )
-        await communicate.save(str(audio_path))
-
-        return str(audio_path)
+        try:
+            params = EMOTION_PARAMS.get(emotion, EMOTION_PARAMS["neutral"])
+            communicate = edge_tts.Communicate(
+                text=text,
+                voice=self._resolve_voice(voice_id),
+                rate=params["rate"],
+                pitch=params["pitch"],
+            )
+            await communicate.save(str(mp3_path))
+            return str(mp3_path)
+        except Exception:
+            wav_path = audio_dir / f"{shot_id}.wav"
+            self._write_silence(wav_path, max(1.2, min(6.0, len(text) / 8)))
+            return str(wav_path)
 
     def _resolve_voice(self, voice_id: str) -> str:
-        """解析音色标识为 Edge-TTS 音色名"""
         if not voice_id:
             return self.default_voice
         if voice_id in VOICE_MAP:
             return VOICE_MAP[voice_id]
-        # 如果已经是完整的 Edge-TTS 音色名
         if voice_id.startswith("zh-CN-"):
             return voice_id
         return self.default_voice
 
+    def _write_silence(self, path, duration: float) -> None:
+        sample_rate = 16000
+        frames = int(sample_rate * duration)
+        with wave.open(str(path), "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(sample_rate)
+            wav.writeframes(b"\x00\x00" * frames)
+
     async def list_voices(self) -> list[dict]:
-        """列出所有可用的中文音色"""
         voices = await edge_tts.list_voices()
         return [v for v in voices if v["Locale"].startswith("zh-CN")]

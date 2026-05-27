@@ -1,71 +1,267 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
+import { ExportOutlined, ImportOutlined, MenuFoldOutlined, MenuUnfoldOutlined, PlusOutlined, ThunderboltOutlined } from '@ant-design/icons'
+import { message, Tooltip } from 'antd'
+import { characterApi, projectApi, renderApi, scriptApi, shotApi } from '../services/api'
 import { useProjectStore } from '../stores/projectStore'
-import { projectApi } from '../services/api'
-import FlowGraph from './FlowGraph'
+import { useShotStore } from '../stores/shotStore'
+
+const PARSE_SCRIPT_EVENT = 'pipeline:parse-script'
+const OPEN_CREATE_PROJECT_EVENT = 'workspace:open-create-project'
 
 interface ProjectItem {
   id: string
   title: string
   status: string
+  style?: string
+  genre?: string
+  updated_at?: string
 }
 
-const LeftSidebar: React.FC = () => {
-  const { projectId, title, setProject } = useProjectStore()
+interface LeftSidebarProps {
+  collapsed: boolean
+  onToggleCollapsed: () => void
+}
+
+function formatUpdatedAt(value?: string) {
+  if (!value) return '刚刚创建'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return '刚刚创建'
+  return new Intl.DateTimeFormat('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(date)
+}
+
+function cleanTitle(value?: string) {
+  const title = (value || '').trim()
+  if (!title || /^[?？]+$/.test(title)) return '未命名项目'
+  return title
+}
+
+const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed }) => {
+  const { projectId, style, outputFormat, resolution, platform, setProject } = useProjectStore()
+  const {
+    setShots,
+    selectShot,
+    setGenerating,
+    setProgress,
+    setAwaitingStoryboardConfirm,
+    setVideoPath,
+    clearLogs,
+    appendLog,
+  } = useShotStore()
+
   const [projects, setProjects] = useState<ProjectItem[]>([])
+  const [loadingProjectId, setLoadingProjectId] = useState<string | null>(null)
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
+
+  const refreshProjects = () => {
+    projectApi.list().then(setProjects).catch(() => undefined)
+  }
 
   useEffect(() => {
-    projectApi.list().then(setProjects).catch(() => {})
+    refreshProjects()
   }, [projectId])
 
-  return (
-    <div style={{
-      width: 240,
-      background: 'var(--bg)',
-      borderRight: '1px solid var(--border)',
-      padding: 16,
-      overflowY: 'auto',
-      flexShrink: 0,
-    }}>
-      <div className="section-title">我的项目</div>
-      {projectId && (
-        <div style={{
-          padding: '8px 10px',
-          background: 'var(--bg-white)',
-          borderRadius: 'var(--radius)',
-          marginBottom: 6,
-          color: 'var(--text)',
-          boxShadow: 'var(--shadow-sm)',
-          fontSize: 12,
-        }}>
-          {title || '未命名项目'}
-        </div>
-      )}
-      {projects.filter(p => p.id !== projectId).map((p) => (
-        <div
-          key={p.id}
-          style={{
-            padding: '8px 10px',
-            background: 'var(--bg-white)',
-            borderRadius: 'var(--radius)',
-            marginBottom: 6,
-            color: 'var(--text)',
-            boxShadow: 'var(--shadow-sm)',
-            cursor: 'pointer',
-            fontSize: 12,
-          }}
-          onClick={() => setProject({ projectId: p.id, title: p.title })}
-        >
-          {p.title}
-        </div>
-      ))}
-      {!projectId && !projects.length && (
-        <div style={{ padding: '8px 10px', color: 'var(--text-tertiary)', fontSize: 12 }}>暂无项目</div>
-      )}
+  const visibleProjects = useMemo(() => {
+    return [...projects].sort((a, b) => {
+      const ta = a.updated_at ? new Date(a.updated_at).getTime() : 0
+      const tb = b.updated_at ? new Date(b.updated_at).getTime() : 0
+      return tb - ta
+    })
+  }, [projects])
 
-      <div style={{ marginTop: 24 }}>
-        <FlowGraph compact />
+  const handleSelectProject = async (id: string) => {
+    try {
+      setLoadingProjectId(id)
+      const [projectDetail, shotList, characters] = await Promise.all([
+        projectApi.get(id),
+        shotApi.list(id),
+        characterApi.list(id),
+      ])
+
+      setProject({
+        projectId: projectDetail.id,
+        title: projectDetail.title,
+        genre: projectDetail.genre,
+        style: projectDetail.style,
+        status: projectDetail.status,
+        outputFormat: projectDetail.output_format,
+        resolution: projectDetail.resolution,
+        platform: projectDetail.platform,
+        characters,
+      })
+
+      setShots(shotList || [])
+      selectShot(shotList?.[0]?.id || null)
+      setAwaitingStoryboardConfirm(projectDetail.status === 'storyboard_ready')
+      setVideoPath(projectDetail.status === 'completed' ? `/output/projects/${projectDetail.id}/output/final.mp4` : '')
+    } catch (err: any) {
+      message.error('加载项目失败：' + (err.message || '未知错误'))
+    } finally {
+      setLoadingProjectId(null)
+    }
+  }
+
+  const ensureProject = async () => {
+    if (projectId) return projectId
+
+    const project = await projectApi.create({
+      title: '未命名项目',
+      style,
+      genre: '',
+      output_format: outputFormat,
+      resolution,
+      platform,
+    })
+
+    setProject({
+      projectId: project.id,
+      title: project.title,
+      style,
+      outputFormat,
+      resolution,
+      platform,
+    })
+    refreshProjects()
+    return project.id as string
+  }
+
+  const handleImportScript = async (file: File) => {
+    try {
+      const pid = await ensureProject()
+      setGenerating(true)
+      setAwaitingStoryboardConfirm(false)
+      setVideoPath('')
+      setProgress(0, 'parse_script')
+      clearLogs()
+
+      const formData = new FormData()
+      formData.append('project_id', pid)
+      formData.append('file', file)
+      formData.append('style', style)
+      formData.append('output_format', outputFormat)
+      formData.append('resolution', resolution)
+      formData.append('platform', platform)
+
+      await scriptApi.upload(formData)
+      appendLog(`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] 已导入剧本：${file.name}`)
+      message.success('剧本上传成功，已进入解析流程')
+    } catch (err: any) {
+      setGenerating(false)
+      message.error('导入失败：' + (err.message || '未知错误'))
+    }
+  }
+
+  const handleExport = async () => {
+    if (!projectId) {
+      message.warning('请先选择或创建一个项目')
+      return
+    }
+
+    try {
+      await renderApi.start({
+        project_id: projectId,
+        output_format: outputFormat,
+        resolution,
+      })
+      message.success('导出任务已提交')
+    } catch {
+      message.error('导出任务提交失败')
+    }
+  }
+
+  const actionItems = [
+    { id: 'import', label: '导入剧本', icon: <ImportOutlined />, onClick: () => fileInputRef.current?.click() },
+    { id: 'parse', label: '生成分镜', icon: <ThunderboltOutlined />, onClick: () => window.dispatchEvent(new CustomEvent(PARSE_SCRIPT_EVENT)) },
+    { id: 'create', label: '新建项目', icon: <PlusOutlined />, onClick: () => window.dispatchEvent(new CustomEvent(OPEN_CREATE_PROJECT_EVENT)) },
+    { id: 'export', label: '导出成片', icon: <ExportOutlined />, onClick: () => void handleExport() },
+  ]
+
+  return (
+    <aside className={`left-sidebar${collapsed ? ' collapsed' : ''}`} aria-label="左侧导航">
+      <div className="sidebar-head">
+        <button type="button" className="collapse-switch" onClick={onToggleCollapsed} aria-label="展开或收起左侧栏">
+          {collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
+        </button>
+        {!collapsed && <div className="sidebar-brand">漫剧工坊</div>}
       </div>
-    </div>
+
+      <div className="sidebar-content">
+        <div className={collapsed ? 'collapsed-shortcuts' : 'sidebar-quick-actions linear-actions'}>
+          {actionItems.map((item) =>
+            collapsed ? (
+              <Tooltip title={item.label} key={item.id} placement="right">
+                <button type="button" className="collapsed-project-btn" onClick={item.onClick} aria-label={item.label}>
+                  {item.icon}
+                </button>
+              </Tooltip>
+            ) : (
+              <div key={item.id} className="linear-row">
+                <button
+                  type="button"
+                  className={`linear-action${item.id === 'parse' ? ' primary' : ''}`}
+                  onClick={item.onClick}
+                >
+                  <span className="linear-action-icon">{item.icon}</span>
+                  <span>{item.label}</span>
+                </button>
+              </div>
+            ),
+          )}
+
+          <div className="project-list linear-project-list">
+            {visibleProjects.length > 0 ? (
+              visibleProjects.map((project) => {
+                const isActive = project.id === projectId
+                const isLoading = loadingProjectId === project.id
+
+                return collapsed ? (
+                  <Tooltip title={cleanTitle(project.title)} key={project.id} placement="right">
+                    <button
+                      type="button"
+                      className={`collapsed-project-btn${isActive ? ' active' : ''}`}
+                      onClick={() => void handleSelectProject(project.id)}
+                      aria-label={cleanTitle(project.title)}
+                    >
+                      {cleanTitle(project.title).slice(0, 1)}
+                    </button>
+                  </Tooltip>
+                ) : (
+                  <div
+                    key={project.id}
+                    className={`project-item linear-project-item${isActive ? ' active' : ''}${isLoading ? ' loading' : ''}`}
+                  >
+                    <button type="button" className="project-main" onClick={() => void handleSelectProject(project.id)}>
+                      <div className="project-item-title">{cleanTitle(project.title)}</div>
+                      <div className="project-item-meta">最近编辑：{formatUpdatedAt(project.updated_at)}</div>
+                    </button>
+                  </div>
+                )
+              })
+            ) : (
+              <div className="empty-hint">暂无项目</div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept=".txt,.docx"
+        style={{ display: 'none' }}
+        onChange={(e) => {
+          const file = e.target.files?.[0]
+          if (file) {
+            void handleImportScript(file)
+          }
+          e.target.value = ''
+        }}
+      />
+    </aside>
   )
 }
 

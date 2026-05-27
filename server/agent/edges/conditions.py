@@ -1,6 +1,13 @@
 from agent.state import AgentState
 
 
+def route_after_storyboard(state: AgentState) -> str:
+    """分镜生成后的路由：确认则继续，否则等待用户确认"""
+    if state.get("storyboard_confirmed"):
+        return "continue"
+    return "wait_confirm"
+
+
 def route_after_quality_check(state: AgentState) -> str:
     """质量校验后的路由决策"""
     if state.get("needs_human_review"):

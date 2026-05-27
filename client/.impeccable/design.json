@@ -1,0 +1,180 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-05-25T08:00:00.000Z",
+  "title": "Design System: AI漫剧Agent",
+  "extensions": {
+    "colorMeta": {
+      "sage-green": {
+        "role": "primary",
+        "displayName": "鼠尾草绿",
+        "canonical": "oklch(58% 0.05 165)",
+        "tonalRamp": ["#1a2b23", "#2b4236", "#3d594a", "#50715e", "#6f9180", "#8dad9a", "#adc7b7", "#d4e6da"]
+      },
+      "deep-pine": {
+        "role": "primary-hover",
+        "displayName": "深松绿",
+        "canonical": "oklch(50% 0.045 165)",
+        "tonalRamp": ["#162720", "#273d33", "#375247", "#4b695c", "#5f7f6f", "#7d9b8c", "#9eb7a8", "#c1d4c8"]
+      },
+      "warm-amber": {
+        "role": "secondary",
+        "displayName": "暖琥珀",
+        "canonical": "oklch(65% 0.08 70)",
+        "tonalRamp": ["#2c2211", "#47391e", "#6e5930", "#977a46", "#b89266", "#cdac84", "#dfc9aa", "#f2e7d5"]
+      },
+      "cool-gray": {
+        "role": "neutral-tertiary",
+        "displayName": "石板灰",
+        "canonical": "oklch(58% 0.015 250)",
+        "tonalRamp": ["#1e262f", "#313c48", "#4a5866", "#6a7886", "#7f8e9f", "#9aa7b5", "#b9c2cc", "#d9dfe4"]
+      },
+      "paper-white": {
+        "role": "neutral-surface",
+        "displayName": "白纸",
+        "canonical": "oklch(100% 0 none)",
+        "tonalRamp": ["#262a27", "#3e433f", "#626a64", "#8a9590", "#b6c0ba", "#d5ded6", "#e8efe7", "#f8faf5"]
+      },
+      "ink": {
+        "role": "neutral-text",
+        "displayName": "墨色",
+        "canonical": "oklch(25% 0.01 230)",
+        "tonalRamp": ["#0a1014", "#161e24", "#1f2933", "#25333e", "#27313a", "#3d4a56", "#586775", "#7a8b99"]
+      },
+      "smoke": {
+        "role": "neutral-text-secondary",
+        "displayName": "烟色",
+        "canonical": "oklch(44% 0.01 240)",
+        "tonalRamp": ["#1a232b", "#2d3944", "#43515d", "#566675", "#647385", "#7e8d9e", "#9eaab8", "#c1c9d3"]
+      },
+      "hairline": {
+        "role": "neutral-border",
+        "displayName": "发丝线",
+        "canonical": "oklch(90% 0.015 240)",
+        "tonalRamp": ["#38444f", "#51606b", "#6b7b87", "#8796a1", "#a6b3bc", "#c1cad1", "#d7e1ec", "#ebf0f5"]
+      },
+      "glass-surface": {
+        "role": "surface-glass",
+        "displayName": "玻璃面",
+        "canonical": "oklch(100% 0 none / 0.72)",
+        "tonalRamp": []
+      },
+      "glass-strong": {
+        "role": "surface-glass-strong",
+        "displayName": "厚玻璃",
+        "canonical": "oklch(100% 0 none / 0.84)",
+        "tonalRamp": []
+      }
+    },
+    "typographyMeta": {
+      "heading": { "displayName": "Heading", "purpose": "侧栏品牌名、面板标题、项目名称" },
+      "body": { "displayName": "Body", "purpose": "剧本内容、标签、表单字段，基准字号" },
+      "label": { "displayName": "Label", "purpose": "按钮文字、表单项标签、chip 文字" },
+      "meta": { "displayName": "Meta", "purpose": "时间戳、辅助元数据、脚注" }
+    },
+    "shadows": [
+      { "name": "soft-shadow", "value": "0 1px 2px rgba(31, 37, 45, 0.06)", "purpose": "仅用于 Ant Design message 提示和 ReactFlow 小控件，不得用于面板或导航" }
+    ],
+    "motion": [
+      { "name": "ease-standard", "value": "cubic-bezier(0.22, 1, 0.36, 1)", "purpose": "默认缓动曲线，用于 hover/focus 反馈和状态切换" },
+      { "name": "dur-fast", "value": "140ms", "purpose": "hover 反馈、微交互" },
+      { "name": "dur-base", "value": "220ms", "purpose": "面板展开、侧栏折叠、状态切换" },
+      { "name": "dur-slow", "value": "320ms", "purpose": "进度条宽度过渡" }
+    ],
+    "breakpoints": [
+      { "name": "lg", "value": "1360px" },
+      { "name": "md", "value": "1120px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "主操作按钮，仅用于「开始解析」和核心流程触发。灰绿渐变，白字，无阴影。",
+      "html": "<button class=\"ds-btn-primary\">开始解析</button>",
+      "css": ".ds-btn-primary { background: linear-gradient(180deg, #749686, #618171); color: #ffffff; height: 34px; padding: 0 16px; border: none; border-radius: 16px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; font-size: 12px; font-weight: 500; cursor: pointer; transition: background 140ms cubic-bezier(0.22, 1, 0.36, 1); } .ds-btn-primary:hover { background: linear-gradient(180deg, #7ea08f, #6d8d7c); }"
+    },
+    {
+      "name": "Default Button",
+      "kind": "button",
+      "refersTo": "button-default",
+      "description": "辅助操作按钮，用于「导入剧本」「导出成片」等非主流程操作。微白底色 + 发丝线边框。",
+      "html": "<button class=\"ds-btn-default\">导入剧本</button>",
+      "css": ".ds-btn-default { background: rgba(252, 254, 255, 0.85); color: #27313a; height: 34px; padding: 0 16px; border: 1px solid #d7e1ec; border-radius: 16px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; font-size: 12px; font-weight: 500; cursor: pointer; transition: all 140ms cubic-bezier(0.22, 1, 0.36, 1); } .ds-btn-default:hover { border-color: rgba(95, 127, 111, 0.44); color: #5f7f6f; }"
+    },
+    {
+      "name": "Inactive Chip",
+      "kind": "chip",
+      "refersTo": "chip",
+      "description": "运行模式选择胶囊，未选中态。胶囊形，微白底色 + 发丝线边框。hover 时边框向绿靠拢。",
+      "html": "<div class=\"ds-chip\">全自动</div>",
+      "css": ".ds-chip { background: rgba(252, 254, 255, 0.88); color: #647385; padding: 6px 10px; border: 1px solid #d7e1ec; border-radius: 999px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; font-size: 12px; cursor: pointer; display: inline-block; transition: all 140ms cubic-bezier(0.22, 1, 0.36, 1); } .ds-chip:hover { border-color: rgba(95, 127, 111, 0.44); }"
+    },
+    {
+      "name": "Active Chip",
+      "kind": "chip",
+      "refersTo": "chip-active",
+      "description": "运行模式选择胶囊，选中态。灰绿背景 14% 透明度 + 深松绿文字。低饱和度区分，不喧哗。",
+      "html": "<div class=\"ds-chip-active\">半自动干预</div>",
+      "css": ".ds-chip-active { background: rgba(111, 145, 128, 0.14); color: #5f7f6f; padding: 6px 10px; border: 1px solid rgba(95, 127, 111, 0.5); border-radius: 999px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; font-size: 12px; cursor: pointer; display: inline-block; }"
+    },
+    {
+      "name": "Text Input",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "剧本输入等文本字段。静态融入背景，聚焦时绿色边框 + 外圈柔光。",
+      "html": "<input class=\"ds-input\" placeholder=\"输入剧本内容...\" />",
+      "css": ".ds-input { background: rgba(253, 255, 255, 0.92); color: #27313a; height: 30px; padding: 0 12px; border: 1px solid #d7e1ec; border-radius: 16px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; font-size: 12px; line-height: 1.5; transition: all 140ms cubic-bezier(0.22, 1, 0.36, 1); outline: none; box-sizing: border-box; width: 100%; } .ds-input::placeholder { color: #a0acbb; } .ds-input:hover { border-color: rgba(95, 127, 111, 0.44); } .ds-input:focus { border-color: #6f9180; box-shadow: 0 0 0 2px rgba(111, 145, 128, 0.15); }"
+    },
+    {
+      "name": "Sidebar Nav Item",
+      "kind": "nav",
+      "refersTo": null,
+      "description": "左侧栏项目列表项。透明底色，hover 时微白高亮，选中态更白。600 weight 标题 + meta 时间信息。",
+      "html": "<button class=\"ds-nav-item\">未命名项目</button>",
+      "css": ".ds-nav-item { background: transparent; color: #27313a; padding: 6px 6px; border: none; border-radius: 12px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; font-size: 12px; font-weight: 600; text-align: left; cursor: pointer; transition: background 140ms cubic-bezier(0.22, 1, 0.36, 1); width: 100%; } .ds-nav-item:hover { background: rgba(255, 255, 255, 0.28); } .ds-nav-item-active { background: rgba(255, 255, 255, 0.4); }"
+    },
+    {
+      "name": "Sidebar Action Button",
+      "kind": "custom",
+      "refersTo": null,
+      "description": "左侧栏线性操作项（导入、解析、新建、导出）。图标 + 文字行内排列，hover 时右移 2px + 文字变色。",
+      "html": "<button class=\"ds-linear-action\">⚡ 开始解析</button>",
+      "css": ".ds-linear-action { width: 100%; min-height: 30px; border: none; background: transparent; display: inline-flex; align-items: center; gap: 8px; padding: 0 4px; color: #27313a; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; font-size: 12px; text-align: left; cursor: pointer; transition: color 140ms cubic-bezier(0.22, 1, 0.36, 1), transform 140ms cubic-bezier(0.22, 1, 0.36, 1); } .ds-linear-action:hover { color: #5f7f6f; transform: translateX(2px); background: rgba(255, 255, 255, 0.34); border-radius: 12px; } .ds-linear-action-primary { color: #5f7f6f; font-weight: 600; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "清晰的静默",
+    "overview": "Linear 式的极简克制与温柔的白噪基底相遇——像一本摊开的速写本，干净但不冰冷，安静但不沉闷。每个像素的任务是退后一步，让创作者的注意力落在内容上，而非界面上。从 Linear 借用命令感和极简决策密度，从 Notion 借用亲和留白，但刻意避开两者的两端极端。",
+    "keyCharacteristics": [
+      "单主色驱动：鼠尾草绿作为唯一强调色，覆盖率 ≤10%",
+      "控件融入背景：hover 显现，静态隐退",
+      "毛玻璃作为空间模型，非装饰效果",
+      "白色工作区与玻璃外围形成「画布浮在玻璃上」的纵深关系",
+      "系统字体栈，零图标字体依赖"
+    ],
+    "rules": [
+      { "name": "The One Voice Rule", "body": "鼠尾草绿是唯一的彩色强调。任何新颜色加入前，先问：这个状态能不能用灰绿或灰度表达？", "section": "colors" },
+      { "name": "The Glass Foundation Rule", "body": "毛玻璃不是装饰。它是 app-shell 的空间基底，建立窗口与环境之间的纵深关系。内部控件不使用毛玻璃，工作区用纯白画布从中切出。", "section": "colors" },
+      { "name": "The No-Type-Trick Rule", "body": "不靠字号差异建立层级。标题和正文同号时用 weight（600 vs 400）区分；需要信息密度时用两号（11px / 13px），不引入第三号。", "section": "typography" },
+      { "name": "The Flat-By-Default Rule", "body": "界面是扁平的。玻璃基底提供唯一的环境纵深——app-shell 的 backdrop-filter 模糊了桌面背景，模拟画布浮于玻璃上的空间关系。在此之上的所有面板一律用 1px 细线边框分隔，不叠加阴影。", "section": "elevation" }
+    ],
+    "dos": [
+      "用灰绿作为唯一彩色强调——按钮、选中态、进度条。不超过界面面积的 10%",
+      "用毛玻璃（blur 22px + 72% 白透明）作为 app-shell 基底，工作区以纯白画布从中切出",
+      "用 weight（600 v 400）区分同级字号的标题与正文",
+      "用 1px 细线（hairline: #d7e1ec）和留白替代投影来表达层级关系",
+      "控件在 hover 时浮现反馈，静态时融入背景",
+      "侧栏操作项和项目列表从顶部紧密堆叠，不均匀撑满纵轴空间"
+    ],
+    "donts": [
+      "使用游戏化炫技——拒绝过饱和渐变、霓虹描边、装饰性粒子、无意义动画",
+      "引入第二种彩色强调色。暖琥珀仅用于星标和极低频警告，不扩展至新场景",
+      "在面板或卡片上使用投影。唯一允许的阴影是 0 1px 2px rgba(31,37,45,0.06)，且仅用于 message 提示",
+      "嵌套卡片。面板即面板",
+      "用 border-left 或 border-right 大于 1px 作为彩色侧边条纹装饰",
+      "用 gradient text (background-clip: text) 制造文字渐变",
+      "使用 Premiere/DaVinci 式的深灰工业调性"
+    ]
+  }
+}
