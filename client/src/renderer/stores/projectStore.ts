@@ -2,6 +2,9 @@
 
 interface ProjectState {
   projectId: string | null
+  parentProjectId: string
+  projectType: 'series' | 'episode'
+  episodeNumber: number
   title: string
   genre: string
   style: string
@@ -15,8 +18,11 @@ interface ProjectState {
   reset: () => void
 }
 
-const DEFAULT_PROJECT = {
+const DEFAULT_PROJECT: Omit<ProjectState, 'setProject' | 'reset'> = {
   projectId: null,
+  parentProjectId: '',
+  projectType: 'series',
+  episodeNumber: 0,
   title: '未命名项目',
   genre: '',
   style: 'anime',

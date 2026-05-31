@@ -79,18 +79,26 @@ class LLMService:
             )
         return self._fallback_client
 
-    async def call(self, system_prompt: str, user_prompt: str, temperature: float = 0.7) -> str:
+    async def call(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.7,
+        allow_fallback: bool = True,
+        model_override: str | None = None,
+    ) -> str:
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
         response = await self._completion_with_fallback(
             lambda client, model: client.chat.completions.create(
-                model=model,
+                model=model_override or model,
                 messages=messages,
                 temperature=temperature,
                 max_tokens=self.max_tokens,
-            )
+            ),
+            allow_fallback=allow_fallback,
         )
         return self._message_text(response.choices[0].message)
 
@@ -100,11 +108,19 @@ class LLMService:
         user_prompt: str,
         temperature: float = 0.3,
         max_retries: int = 2,
+        allow_fallback: bool = True,
+        model_override: str | None = None,
     ) -> dict:
         last_error: Exception | None = None
         for attempt in range(max_retries + 1):
             try:
-                response = await self._create_json_completion(system_prompt, user_prompt, temperature)
+                response = await self._create_json_completion(
+                    system_prompt,
+                    user_prompt,
+                    temperature,
+                    allow_fallback,
+                    model_override,
+                )
                 return self._loads_json(self._message_text(response.choices[0].message) or "{}")
             except Exception as exc:
                 last_error = exc
@@ -113,7 +129,14 @@ class LLMService:
 
         raise ValueError(f"LLM JSON 解析失败，已重试 {max_retries} 次: {last_error}")
 
-    async def _create_json_completion(self, system_prompt: str, user_prompt: str, temperature: float):
+    async def _create_json_completion(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float,
+        allow_fallback: bool = True,
+        model_override: str | None = None,
+    ):
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -121,32 +144,34 @@ class LLMService:
         try:
             return await self._completion_with_fallback(
                 lambda client, model: client.chat.completions.create(
-                    model=model,
+                    model=model_override or model,
                     messages=messages,
                     temperature=temperature,
                     response_format={"type": "json_object"},
                     max_tokens=self.max_tokens,
-                )
+                ),
+                allow_fallback=allow_fallback,
             )
         except Exception as exc:
             if "response_format" not in str(exc):
                 raise
             return await self._completion_with_fallback(
                 lambda client, model: client.chat.completions.create(
-                    model=model,
+                    model=model_override or model,
                     messages=messages,
                     temperature=temperature,
                     max_tokens=self.max_tokens,
-                )
+                ),
+                allow_fallback=allow_fallback,
             )
 
-    async def _completion_with_fallback(self, create_completion):
+    async def _completion_with_fallback(self, create_completion, allow_fallback: bool = True):
         try:
             response = await create_completion(self.client, self.model)
             self.last_provider_used = self.provider
             return response
         except Exception as primary_error:
-            if not self._fallback_cfg:
+            if not allow_fallback or not self._fallback_cfg:
                 raise
             response = await create_completion(self.fallback_client, self._fallback_cfg["model"])
             self.last_provider_used = self._fallback_cfg["provider"]

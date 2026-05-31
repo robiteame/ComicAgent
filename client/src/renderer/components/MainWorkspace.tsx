@@ -3,7 +3,7 @@ import { Button, Input, Select, message } from 'antd'
 import { BulbOutlined, CheckCircleOutlined, SendOutlined, UploadOutlined } from '@ant-design/icons'
 import { useShotStore } from '../stores/shotStore'
 import { useProjectStore } from '../stores/projectStore'
-import { API_OUTPUT_BASE, createWebSocket, projectApi, scriptApi, shotApi } from '../services/api'
+import { API_OUTPUT_BASE, assetApi, createWebSocket, projectApi, scriptApi, shotApi } from '../services/api'
 
 const { TextArea } = Input
 const PARSE_SCRIPT_EVENT = 'pipeline:parse-script'
@@ -13,10 +13,10 @@ const STEP_LABELS: Record<string, string> = {
   start: '开始',
   parse_script: '剧本解析',
   generate_storyboard: '分镜生成',
-  generate_reference_images: '参考画面',
-  wait_storyboard_confirm: '等待分镜确认',
+  wait_asset_confirm: '等待素材确认',
+  generate_storyboard_images: '故事板生成',
+  wait_storyboard_approval: '等待故事板审核',
   phase2_start: '进入第二阶段',
-  generate_images: '画面生成',
   generate_voice: '配音生成',
   compose_video: '视频合成',
   quality_check: '质量校验',
@@ -43,11 +43,15 @@ function normalizeShot(shot: any) {
     emotion: shot.emotion || 'neutral',
     transition: shot.transition || 'cut',
     image_path: shot.image_path || '',
+    storyboard_path: shot.storyboard_path || '',
     audio_path: shot.audio_path || '',
     status: shot.status || 'pending',
+    storyboard_status: shot.storyboard_status || 'pending',
     version: Number(shot.version || 1),
     confirmed: Boolean(shot.confirmed),
     characters_in_scene: Array.isArray(shot.characters_in_scene) ? shot.characters_in_scene : [],
+    scene_asset_id: shot.scene_asset_id || '',
+    character_asset_ids: Array.isArray(shot.character_asset_ids) ? shot.character_asset_ids : [],
   }
 }
 
@@ -85,6 +89,9 @@ const MainWorkspace: React.FC = () => {
   const [autoWriting, setAutoWriting] = useState(false)
   const [uploading, setUploading] = useState(false)
   const [confirming, setConfirming] = useState(false)
+  const [generatingStoryboard, setGeneratingStoryboard] = useState(false)
+  const [assetBoard, setAssetBoard] = useState<{ characters: any[]; scenes: any[] } | null>(null)
+  const [assetBoardReady, setAssetBoardReady] = useState(false)
   const [previewMode, setPreviewMode] = useState<'shot' | 'video'>('shot')
   const wsRef = useRef<WebSocket | null>(null)
   const wsProjectIdRef = useRef<string | null>(null)
@@ -112,6 +119,12 @@ const MainWorkspace: React.FC = () => {
     replaceShots(list || [])
   }
 
+  const loadAssetBoard = async (pid: string) => {
+    const board = await assetApi.board(pid)
+    setAssetBoard({ characters: board.characters || [], scenes: board.scenes || [] })
+    return board
+  }
+
   const connectWebSocket = (pid: string) => {
     if (
       wsRef.current &&
@@ -132,18 +145,29 @@ const MainWorkspace: React.FC = () => {
         appendLog(`[${ts}] ${getStepLabel(data.step)} | ${data.progress ?? 0}%`)
         setProgress(Number(data.progress || 0), data.step || '')
 
-        if (data.step === 'wait_storyboard_confirm') {
+        if (data.step === 'wait_asset_confirm') {
           setGenerating(false)
           setLoading(false)
+          setAssetBoardReady(true)
+          setAwaitingStoryboardConfirm(false)
+          void loadProjectShots(pid)
+          void loadAssetBoard(pid)
+          message.info('角色板和场景板已生成，请确认素材后生成故事板')
+          return
+        }
+
+        if (data.step === 'wait_storyboard_approval') {
+          setGenerating(false)
+          setLoading(false)
+          setGeneratingStoryboard(false)
           setAwaitingStoryboardConfirm(true)
           void loadProjectShots(pid)
-          message.info('分镜已生成，请确认后继续')
+          message.info('故事板已生成，请审核后触发成片')
           return
         }
 
         if (
           data.step === 'phase2_start' ||
-          data.step === 'generate_images' ||
           data.step === 'generate_voice' ||
           data.step === 'compose_video' ||
           data.step === 'quality_check'
@@ -159,6 +183,8 @@ const MainWorkspace: React.FC = () => {
         updateShot(data.shot_id, {
           status: data.status || 'done',
           image_path: data.image_path || '',
+          storyboard_path: data.storyboard_path || data.image_path || '',
+          storyboard_status: data.storyboard_status || 'done',
         })
         return
       }
@@ -166,7 +192,19 @@ const MainWorkspace: React.FC = () => {
       if (data.type === 'complete') {
         appendLog(`[${ts}] 流程执行完成`)
 
-        if (!data.video_path || awaitingRef.current || stepRef.current === 'wait_storyboard_confirm') {
+        if (data.asset_board_ready) {
+          setGenerating(false)
+          setLoading(false)
+          setAssetBoardReady(true)
+          setAwaitingStoryboardConfirm(false)
+          if (Array.isArray(data.shots) && data.shots.length > 0) {
+            replaceShots(data.shots)
+          }
+          void loadAssetBoard(pid)
+          return
+        }
+
+        if (!data.video_path || awaitingRef.current || stepRef.current === 'wait_storyboard_approval') {
           setGenerating(false)
           setLoading(false)
           setAwaitingStoryboardConfirm(true)
@@ -195,6 +233,16 @@ const MainWorkspace: React.FC = () => {
         }
 
         message.success('生成完成')
+        return
+      }
+
+      if (data.type === 'storyboard_ready') {
+        appendLog(`[${ts}] 故事板生成完成，等待审核`)
+        setGenerating(false)
+        setGeneratingStoryboard(false)
+        setAwaitingStoryboardConfirm(true)
+        setAssetBoardReady(false)
+        void loadProjectShots(pid)
         return
       }
 
@@ -234,6 +282,9 @@ const MainWorkspace: React.FC = () => {
 
     setProject({
       projectId: project.id,
+      parentProjectId: project.parent_project_id || '',
+      projectType: project.project_type || 'series',
+      episodeNumber: project.episode_number || 0,
       title: project.title,
       style,
       outputFormat,
@@ -263,6 +314,9 @@ const MainWorkspace: React.FC = () => {
 
       setProject({
         projectId: project.id,
+        parentProjectId: project.parent_project_id || '',
+        projectType: project.project_type || 'series',
+        episodeNumber: project.episode_number || 0,
         title: project.title,
         style,
         outputFormat,
@@ -274,6 +328,8 @@ const MainWorkspace: React.FC = () => {
       selectShot(null)
       setGenerating(false)
       setAwaitingStoryboardConfirm(false)
+      setAssetBoardReady(false)
+      setAssetBoard(null)
       setVideoPath('')
       setProgress(0, '')
       clearLogs()
@@ -296,6 +352,7 @@ const MainWorkspace: React.FC = () => {
     setLoading(true)
     setGenerating(true)
     setAwaitingStoryboardConfirm(false)
+    setAssetBoardReady(false)
     setVideoPath('')
     setPreviewMode('shot')
     clearLogs()
@@ -331,6 +388,7 @@ const MainWorkspace: React.FC = () => {
       setAutoWriting(true)
       setGenerating(true)
       setAwaitingStoryboardConfirm(false)
+      setAssetBoardReady(false)
       setVideoPath('')
       clearLogs()
       setProgress(0, 'generate_script')
@@ -363,6 +421,7 @@ const MainWorkspace: React.FC = () => {
       setUploading(true)
       setGenerating(true)
       setAwaitingStoryboardConfirm(false)
+      setAssetBoardReady(false)
       setVideoPath('')
       setPreviewMode('shot')
       clearLogs()
@@ -411,6 +470,25 @@ const MainWorkspace: React.FC = () => {
     }
   }
 
+  const handleGenerateStoryboard = async () => {
+    if (!projectId) return
+
+    try {
+      setGeneratingStoryboard(true)
+      setGenerating(true)
+      setAwaitingStoryboardConfirm(false)
+      connectWebSocket(projectId)
+      await shotApi.generateStoryboard(projectId)
+      appendLog(`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] 已确认素材，开始生成线稿故事板`)
+      message.success('故事板任务已启动')
+    } catch (err: any) {
+      message.error('故事板生成失败：' + (err.message || '未知错误'))
+      setGenerating(false)
+    } finally {
+      setGeneratingStoryboard(false)
+    }
+  }
+
   useEffect(() => {
     generateRef.current = handleGenerate
   }, [script, projectId, style, outputFormat, resolution, platform])
@@ -441,6 +519,7 @@ const MainWorkspace: React.FC = () => {
     if (!projectId) return
 
     connectWebSocket(projectId)
+    void loadAssetBoard(projectId).catch(() => undefined)
     return () => {
       wsRef.current?.close()
       wsRef.current = null
@@ -448,7 +527,7 @@ const MainWorkspace: React.FC = () => {
     }
   }, [projectId])
 
-  const imageUrl = toOutputUrl(selectedShot?.image_path)
+  const imageUrl = toOutputUrl(selectedShot?.storyboard_path || selectedShot?.image_path)
   const videoUrl = videoPath
     ? videoPath.startsWith('/output/')
       ? `${API_OUTPUT_BASE}${videoPath.replace('/output/', '')}`
@@ -511,6 +590,46 @@ const MainWorkspace: React.FC = () => {
               </Button>
               <Button onClick={() => setShowCreatePanel(false)}>取消</Button>
             </div>
+          </div>
+        )}
+
+        {(assetBoardReady || assetBoard) && (
+          <div className="asset-board-panel">
+            <div className="asset-board-copy">
+              <div className="asset-board-title">项目素材板</div>
+              <div className="asset-board-note">
+                角色与场景将作为项目级素材复用到本集故事板和后续成片。
+              </div>
+            </div>
+            <div className="asset-board-lists">
+              <div className="asset-board-group">
+                <span className="asset-board-label">角色</span>
+                <div className="asset-chip-row">
+                  {(assetBoard?.characters || []).slice(0, 5).map((item) => (
+                    <span className="asset-chip" key={item.id}>{item.name}</span>
+                  ))}
+                  {!assetBoard?.characters?.length && <span className="asset-chip muted">待生成</span>}
+                </div>
+              </div>
+              <div className="asset-board-group">
+                <span className="asset-board-label">场景</span>
+                <div className="asset-chip-row">
+                  {(assetBoard?.scenes || []).slice(0, 5).map((item) => (
+                    <span className="asset-chip" key={item.id}>{item.name}</span>
+                  ))}
+                  {!assetBoard?.scenes?.length && <span className="asset-chip muted">待生成</span>}
+                </div>
+              </div>
+            </div>
+            <Button
+              type="primary"
+              size="small"
+              loading={generatingStoryboard}
+              disabled={!shots.length}
+              onClick={() => void handleGenerateStoryboard()}
+            >
+              生成故事板
+            </Button>
           </div>
         )}
 
@@ -583,8 +702,8 @@ const MainWorkspace: React.FC = () => {
                 icon={<CheckCircleOutlined />}
                 loading={confirming}
                 onClick={handleConfirmStoryboard}
-              >
-                确认分镜并继续
+            >
+                审核通过，生成成片
               </Button>
             </div>
           )}
@@ -637,7 +756,7 @@ const MainWorkspace: React.FC = () => {
         {shots.length > 0 && (
           <div className="thumb-strip">
             {shots.map((shot, i) => {
-              const thumbUrl = toOutputUrl(shot.image_path)
+              const thumbUrl = toOutputUrl(shot.storyboard_path || shot.image_path)
               const isSelected = (selectedShotId || shots[0]?.id) === shot.id
 
               return (

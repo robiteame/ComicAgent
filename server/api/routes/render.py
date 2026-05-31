@@ -45,6 +45,10 @@ async def _render_task(project_id: str, output_format: str, resolution: str):
         db_shots = db.query(ShotModel).filter(ShotModel.project_id == project_id).order_by(ShotModel.sequence).all()
         if not db_shots:
             raise ValueError("没有可导出的镜头")
+        if any(not s.confirmed for s in db_shots):
+            raise ValueError("故事板尚未人工审核通过，不能导出成片")
+        if any(not (s.storyboard_path or s.image_path) for s in db_shots):
+            raise ValueError("故事板尚未全部生成，不能导出成片")
 
         shots = [
             {
@@ -59,7 +63,7 @@ async def _render_task(project_id: str, output_format: str, resolution: str):
                 "emotion": s.emotion,
                 "duration": s.duration,
                 "transition": s.transition,
-                "image_path": s.image_path,
+                "image_path": s.image_path or s.storyboard_path,
                 "audio_path": s.audio_path,
                 "status": s.status,
                 "version": s.version,
@@ -85,10 +89,7 @@ async def _render_task(project_id: str, output_format: str, resolution: str):
         )
     except Exception as exc:
         _render_status[project_id] = {"status": "error", "progress": 0, "message": str(exc)}
-        await ws_manager.send_to_project(
-            project_id,
-            {"type": "error", "message": f"导出失败: {exc}\n{traceback.format_exc()}"},
-        )
+        await ws_manager.send_to_project(project_id, {"type": "error", "message": f"导出失败: {exc}\n{traceback.format_exc()}"})
     finally:
         db.close()
 

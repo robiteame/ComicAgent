@@ -13,11 +13,15 @@ export interface Shot {
   emotion: string
   transition: string
   image_path: string
+  storyboard_path: string
   audio_path: string
   status: string
+  storyboard_status: string
   version: number
   confirmed: boolean
   characters_in_scene: string[]
+  scene_asset_id: string
+  character_asset_ids: string[]
 }
 
 interface ShotState {

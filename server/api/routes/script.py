@@ -7,12 +7,12 @@ import aiofiles
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
-from agent.nodes import image_gen, script_parser, storyboard_gen
+from agent.nodes import script_parser, storyboard_gen
 from api.websocket import ws_manager
 from config import settings
 from db import SessionLocal
 from models import Character as CharacterModel
-from models import Project, Shot as ShotModel
+from models import Project, SceneAsset, Shot as ShotModel
 from services.llm_service import LLMService
 
 router = APIRouter(prefix="/api/script", tags=["script"])
@@ -175,14 +175,9 @@ async def _run_storyboard_phase(project_id: str, state: dict):
 
         await _progress(project_id, "generate_storyboard", 32, "正在生成分镜列表")
         state.update(await storyboard_gen.run(state))
-        _persist_phase1(db, project_id, state, status="generating_images")
 
-        await _progress(project_id, "generate_reference_images", 46, "正在生成分镜参考画面")
-        state["on_shot_done"] = lambda shot: _persist_shot_update(project_id, shot)
-        state.update(await image_gen.run(state))
-
-        _persist_phase1(db, project_id, state, status="storyboard_ready")
-        await _progress(project_id, "wait_storyboard_confirm", 55, "分镜和参考画面已生成")
+        _persist_phase1(db, project_id, state, status="assets_ready")
+        await _progress(project_id, "wait_asset_confirm", 45, "角色板、场景板与分镜已生成，请确认素材后生成故事板")
         await ws_manager.send_to_project(
             project_id,
             {
@@ -190,6 +185,7 @@ async def _run_storyboard_phase(project_id: str, state: dict):
                 "project_id": project_id,
                 "shots": state.get("shots", []),
                 "video_path": "",
+                "asset_board_ready": True,
             },
         )
     except Exception as exc:
@@ -203,46 +199,90 @@ async def _run_storyboard_phase(project_id: str, state: dict):
         db.close()
 
 
-def _persist_phase1(db, project_id: str, state: dict, status: str = "storyboard_ready") -> None:
+def _persist_phase1(db, project_id: str, state: dict, status: str = "assets_ready") -> None:
     project = db.query(Project).filter(Project.id == project_id).first()
-    if project:
-        project.title = state.get("script_title") or _script_title(state.get("user_input", "")) or project.title
-        project.genre = state.get("genre") or project.genre
-        project.style = state.get("style") or project.style
-        project.input_text = state.get("user_input", "")
-        project.input_type = state.get("input_type", "text")
-        project.output_format = state.get("output_format", project.output_format)
-        project.resolution = state.get("resolution", project.resolution)
-        project.platform = state.get("platform", project.platform)
-        project.status = status
+    if not project:
+        raise RuntimeError("项目不存在")
+    asset_project_id = project.parent_project_id or project.id
 
-    db.query(CharacterModel).filter(CharacterModel.project_id == project_id).delete()
-    for index, char in enumerate(state.get("characters", [])):
-        db.add(
-            CharacterModel(
-                id=f"{project_id}_char_{index + 1:04d}",
-                project_id=project_id,
-                name=char["name"],
-                appearance=json.dumps(char.get("appearance", {}), ensure_ascii=False),
-                personality=char.get("personality", ""),
-                visual_prompt=char.get("visual_prompt", ""),
-                negative_prompt=char.get("negative_prompt", ""),
-                voice_id=char.get("voice_id", ""),
-                emotion_variants=json.dumps(char.get("emotion_variants", {}), ensure_ascii=False),
-                key_features=json.dumps(char.get("key_features", []), ensure_ascii=False),
-                default_outfit=char.get("appearance", {}).get("default_outfit", ""),
-                seed=str(char.get("seed", 42)),
-            )
-        )
+    project.title = state.get("script_title") or _script_title(state.get("user_input", "")) or project.title
+    project.genre = state.get("genre") or project.genre
+    project.style = state.get("style") or project.style
+    project.input_text = state.get("user_input", "")
+    project.input_type = state.get("input_type", "text")
+    project.output_format = state.get("output_format", project.output_format)
+    project.resolution = state.get("resolution", project.resolution)
+    project.platform = state.get("platform", project.platform)
+    project.status = status
+
+    character_ids = _upsert_characters(db, asset_project_id, state.get("characters", []))
+    scene_ids = _upsert_scenes(db, asset_project_id, state.get("script_scenes", []))
 
     db.query(ShotModel).filter(ShotModel.project_id == project_id).delete()
-    for index, shot in enumerate(state.get("shots", [])):
-        db.add(_shot_model(project_id, shot, index + 1))
+    shots = state.get("shots", [])
+    for index, shot in enumerate(shots):
+        db.add(_shot_model(project_id, shot, index + 1, character_ids, scene_ids))
 
     db.commit()
 
 
-def _shot_model(project_id: str, shot: dict, sequence: int) -> ShotModel:
+def _upsert_characters(db, asset_project_id: str, characters: list[dict]) -> dict[str, str]:
+    ids: dict[str, str] = {}
+    for index, char in enumerate(characters):
+        name = char.get("name") or f"角色{index + 1}"
+        char_id = f"{asset_project_id}_char_{index + 1:04d}"
+        existing = (
+            db.query(CharacterModel)
+            .filter(CharacterModel.project_id == asset_project_id, CharacterModel.name == name)
+            .first()
+        )
+        item = existing or CharacterModel(id=char_id, project_id=asset_project_id, name=name)
+        item.appearance = json.dumps(char.get("appearance", {}), ensure_ascii=False)
+        item.personality = char.get("personality", "")
+        item.visual_prompt = char.get("visual_prompt", "")
+        item.negative_prompt = char.get("negative_prompt", "")
+        item.voice_id = char.get("voice_id", "")
+        item.emotion_variants = json.dumps(char.get("emotion_variants", {}), ensure_ascii=False)
+        item.key_features = json.dumps(char.get("key_features", []), ensure_ascii=False)
+        item.default_outfit = char.get("appearance", {}).get("default_outfit", "")
+        item.seed = str(char.get("seed", 42 + index))
+        if not existing:
+            db.add(item)
+        ids[name] = item.id
+    return ids
+
+
+def _upsert_scenes(db, asset_project_id: str, scenes: list[dict]) -> list[str]:
+    ids: list[str] = []
+    for index, scene in enumerate(scenes):
+        name = scene.get("location") or f"场景{index + 1}"
+        scene_id = f"{asset_project_id}_scene_{index + 1:04d}"
+        existing = (
+            db.query(SceneAsset)
+            .filter(SceneAsset.project_id == asset_project_id, SceneAsset.name == name)
+            .first()
+        )
+        item = existing or SceneAsset(id=scene_id, project_id=asset_project_id, name=name)
+        item.description = scene.get("actions") or scene.get("description") or ""
+        item.visual_prompt = scene.get("visual_prompt") or f"{name}, consistent comic background, clean composition"
+        item.negative_prompt = "watermark, subtitles, text artifacts, low quality"
+        item.key_features = json.dumps([scene.get("emotion", "neutral"), scene.get("camera_suggestion", "medium")], ensure_ascii=False)
+        item.seed = 1200 + index
+        if not existing:
+            db.add(item)
+        ids.append(item.id)
+    return ids
+
+
+def _shot_model(
+    project_id: str,
+    shot: dict,
+    sequence: int,
+    character_ids: dict[str, str],
+    scene_ids: list[str],
+) -> ShotModel:
+    characters_in_scene = shot.get("characters_in_scene", [])
+    scene_asset_id = scene_ids[min(sequence - 1, len(scene_ids) - 1)] if scene_ids else ""
     return ShotModel(
         id=shot.get("shot_id") or f"{project_id}_shot_{sequence:04d}",
         project_id=project_id,
@@ -256,12 +296,16 @@ def _shot_model(project_id: str, shot: dict, sequence: int) -> ShotModel:
         duration=shot.get("duration", 3.0),
         emotion=shot.get("emotion", "neutral"),
         transition=shot.get("transition", "cut"),
-        image_path=shot.get("image_path", ""),
-        audio_path=shot.get("audio_path", ""),
-        status=shot.get("status", "done"),
+        image_path="",
+        audio_path="",
+        status="pending",
         version=shot.get("version", 1),
-        confirmed=shot.get("confirmed", False),
-        characters_in_scene=json.dumps(shot.get("characters_in_scene", []), ensure_ascii=False),
+        confirmed=False,
+        characters_in_scene=json.dumps(characters_in_scene, ensure_ascii=False),
+        character_asset_ids=json.dumps([character_ids[name] for name in characters_in_scene if name in character_ids], ensure_ascii=False),
+        scene_asset_id=scene_asset_id,
+        storyboard_path="",
+        storyboard_status="pending",
         visual_notes=shot.get("visual_notes", ""),
     )
 
@@ -273,8 +317,10 @@ async def _persist_shot_update(project_id: str, shot: dict) -> None:
         db_shot = db.query(ShotModel).filter(ShotModel.id == shot_id, ShotModel.project_id == project_id).first()
         if db_shot:
             db_shot.image_path = shot.get("image_path", db_shot.image_path)
+            db_shot.storyboard_path = shot.get("storyboard_path") or shot.get("image_path", db_shot.storyboard_path)
             db_shot.audio_path = shot.get("audio_path", db_shot.audio_path)
             db_shot.status = shot.get("status", db_shot.status)
+            db_shot.storyboard_status = shot.get("storyboard_status", db_shot.storyboard_status)
             db_shot.version = shot.get("version", db_shot.version)
             db_shot.visual_notes = shot.get("visual_notes", db_shot.visual_notes)
             db.commit()
@@ -285,6 +331,7 @@ async def _persist_shot_update(project_id: str, shot: dict) -> None:
                 "shot_id": shot_id,
                 "status": shot.get("status", "done"),
                 "image_path": shot.get("image_path", ""),
+                "storyboard_path": shot.get("storyboard_path") or shot.get("image_path", ""),
                 "audio_path": shot.get("audio_path", ""),
             },
         )

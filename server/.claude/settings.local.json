@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python *)",
+      "Bash(uvicorn main:app *)",
+      "Bash(dir apiroutes *)",
+      "Bash(pip list *)",
+      "Bash(findstr fastapi *)",
+      "Bash(cmd *)",
+      "Bash(timeout 5)",
+      "Bash(netstat -ano)",
+      "Bash(findstr \":8011\")",
+      "Bash(findstr \"LISTENING\")",
+      "Bash(findstr \"80\")",
+      "mcp__ide__getDiagnostics",
+      "Bash(findstr \"8011\")",
+      "Bash(powershell *)",
+      "Bash(dir D:\\\\WorkSpace\\\\ComicAgent\\\\server\\\\*.log)",
+      "Bash(tasklist)",
+      "Bash(findstr python *)"
+    ]
+  }
+}

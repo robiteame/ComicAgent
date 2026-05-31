@@ -1,8 +1,9 @@
-import React, { useState } from 'react'
+import React, { useEffect, useState } from 'react'
 import { DownOutlined, MenuFoldOutlined, MenuUnfoldOutlined } from '@ant-design/icons'
 import { Input, InputNumber, message, Select } from 'antd'
 import FlowGraph from './FlowGraph'
-import { shotApi } from '../services/api'
+import { assetApi, shotApi } from '../services/api'
+import { useProjectStore } from '../stores/projectStore'
 import { useShotStore } from '../stores/shotStore'
 
 const { TextArea } = Input
@@ -13,10 +14,10 @@ const stepLabels: Record<string, string> = {
   generate_script: '剧本生成',
   parse_script: '剧本解析',
   generate_storyboard: '分镜生成',
-  generate_reference_images: '参考画面',
-  wait_storyboard_confirm: '等待确认',
+  wait_asset_confirm: '等待素材确认',
+  generate_storyboard_images: '故事板生成',
+  wait_storyboard_approval: '等待故事板审核',
   phase2_start: '开始成片',
-  generate_images: '镜头渲染',
   generate_voice: '音频合成',
   compose_video: '视频合成',
   quality_check: '质量校验',
@@ -30,7 +31,9 @@ interface RightSidebarProps {
 
 const RightSidebar: React.FC<RightSidebarProps> = ({ collapsed, onToggleCollapsed }) => {
   const { updateShot, logs, isGenerating, currentStep, shots, videoPath } = useShotStore()
+  const { projectId } = useProjectStore()
   const [runMode, setRunMode] = useState('确认分镜后继续')
+  const [assetBoard, setAssetBoard] = useState<{ characters: any[]; scenes: any[] }>({ characters: [], scenes: [] })
   const [shotExpanded, setShotExpanded] = useState(true)
   const [runtimeExpanded, setRuntimeExpanded] = useState(true)
   const [flowExpanded, setFlowExpanded] = useState(false)
@@ -40,6 +43,16 @@ const RightSidebar: React.FC<RightSidebarProps> = ({ collapsed, onToggleCollapse
     const id = state.selectedShotId
     return state.shots.find((shot) => shot.id === id) || state.shots[0]
   })
+
+  useEffect(() => {
+    if (!projectId) {
+      setAssetBoard({ characters: [], scenes: [] })
+      return
+    }
+    assetApi.board(projectId)
+      .then((board) => setAssetBoard({ characters: board.characters || [], scenes: board.scenes || [] }))
+      .catch(() => undefined)
+  }, [projectId])
 
   const updateCurrentShot = async (changes: Record<string, any>) => {
     if (!selectedShot) return
@@ -152,6 +165,30 @@ const RightSidebar: React.FC<RightSidebarProps> = ({ collapsed, onToggleCollapse
                             void updateCurrentShot({ duration: value })
                           }
                         }}
+                      />
+                    </div>
+
+                    <div className="form-block">
+                      <label className="form-label">匹配角色资产</label>
+                      <Select
+                        mode="multiple"
+                        value={selectedShot.character_asset_ids || []}
+                        size="small"
+                        style={{ width: '100%' }}
+                        onChange={(value) => void updateCurrentShot({ character_asset_ids: value })}
+                        options={assetBoard.characters.map((item) => ({ value: item.id, label: item.name }))}
+                      />
+                    </div>
+
+                    <div className="form-block">
+                      <label className="form-label">匹配场景资产</label>
+                      <Select
+                        value={selectedShot.scene_asset_id || undefined}
+                        size="small"
+                        allowClear
+                        style={{ width: '100%' }}
+                        onChange={(value) => void updateCurrentShot({ scene_asset_id: value || '' })}
+                        options={assetBoard.scenes.map((item) => ({ value: item.id, label: item.name }))}
                       />
                     </div>
 

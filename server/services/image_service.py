@@ -11,7 +11,7 @@ class ImageService:
     """Image generation service backed by real remote image APIs."""
 
     def __init__(self):
-        self.api_key = settings.ARK_API_KEY or settings.SEEDDANCE_API_KEY or settings.STABILITY_API_KEY
+        self.api_key = settings.ARK_API_KEY or settings.SEEDDANCE_API_KEY or settings.SEEDREAM_API_KEY or settings.STABILITY_API_KEY
         self.api_url = settings.STABILITY_API_URL
         self.provider = (settings.IMAGE_PROVIDER or "").lower()
         self.output_dir = settings.OUTPUT_DIR / "projects"

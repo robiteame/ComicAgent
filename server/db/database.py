@@ -14,7 +14,7 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
 def init_db():
-    from models import Character, Project, Shot  # noqa: F401
+    from models import Character, Project, SceneAsset, Shot  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
     _ensure_sqlite_columns()
@@ -29,6 +29,10 @@ def _ensure_sqlite_columns() -> None:
             {
                 "confirmed": "BOOLEAN DEFAULT 0",
                 "parent_version_id": "VARCHAR DEFAULT ''",
+                "scene_asset_id": "VARCHAR DEFAULT ''",
+                "character_asset_ids": "TEXT DEFAULT '[]'",
+                "storyboard_path": "VARCHAR DEFAULT ''",
+                "storyboard_status": "VARCHAR DEFAULT 'pending'",
                 "visual_notes": "TEXT DEFAULT ''",
             },
         )
@@ -39,6 +43,9 @@ def _ensure_sqlite_columns() -> None:
                 "output_format": "VARCHAR DEFAULT '9:16'",
                 "resolution": "VARCHAR DEFAULT '1080p'",
                 "platform": "VARCHAR DEFAULT 'douyin'",
+                "parent_project_id": "VARCHAR DEFAULT ''",
+                "project_type": "VARCHAR DEFAULT 'series'",
+                "episode_number": "INTEGER DEFAULT 0",
             },
         )
     if "characters" in inspector.get_table_names():

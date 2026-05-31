@@ -1,36 +1,15 @@
-import asyncio
 import base64
 
-import edge_tts
+import httpx
 
 from config import settings
 
 
-VOICE_MAP = {
-    "少女": "zh-CN-XiaoyiNeural",
-    "少年": "zh-CN-YunxiNeural",
-    "御姐": "zh-CN-XiaoxiaoNeural",
-    "大叔": "zh-CN-YunjianNeural",
-    "儿童": "zh-CN-XiaoxiaoNeural",
-    "老人": "zh-CN-YunjianNeural",
-}
-
-EMOTION_PARAMS = {
-    "neutral": {"rate": "+0%", "pitch": "+0Hz"},
-    "happy": {"rate": "+5%", "pitch": "+5Hz"},
-    "shy": {"rate": "-5%", "pitch": "+2Hz"},
-    "sad": {"rate": "-10%", "pitch": "-5Hz"},
-    "angry": {"rate": "+10%", "pitch": "+10Hz"},
-    "surprised": {"rate": "+5%", "pitch": "+8Hz"},
-}
-
-
 class TTSService:
-    """Edge-TTS service. Real synthesis failures are surfaced to the pipeline."""
+    """Mimo built-in TTS service."""
 
     def __init__(self):
         self.output_dir = settings.OUTPUT_DIR / "projects"
-        self.default_voice = settings.TTS_DEFAULT_VOICE
 
     async def generate_dialogue(
         self,
@@ -42,91 +21,68 @@ class TTSService:
     ) -> str:
         audio_dir = self.output_dir / project_id / "audio"
         audio_dir.mkdir(parents=True, exist_ok=True)
-        mp3_path = audio_dir / f"{shot_id}.mp3"
+        suffix = (settings.MIMO_TTS_FORMAT or "wav").lstrip(".")
+        audio_path = audio_dir / f"{shot_id}.{suffix}"
+        return await self._generate_mimo_tts(text, voice_id, emotion, audio_path)
 
-        params = EMOTION_PARAMS.get(emotion, EMOTION_PARAMS["neutral"])
-        errors: list[str] = []
-        for voice in self._voice_candidates(voice_id):
-            try:
-                communicate = edge_tts.Communicate(
-                    text=text,
-                    voice=voice,
-                    rate=params["rate"],
-                    pitch=params["pitch"],
-                )
-                await communicate.save(str(mp3_path))
-                if mp3_path.exists() and mp3_path.stat().st_size > 0:
-                    return str(mp3_path)
-                errors.append(f"{voice}: 输出文件为空")
-            except Exception as exc:
-                errors.append(f"{voice}: {exc}")
+    async def _generate_mimo_tts(self, text: str, voice_id: str, emotion: str, audio_path) -> str:
+        if not settings.MIMO_API_KEY:
+            raise RuntimeError("未配置 MIMO_API_KEY，无法调用 Mimo 内置 TTS")
+        if not text.strip():
+            raise RuntimeError("配音文本为空，无法调用 Mimo 内置 TTS")
 
-        wav_path = audio_dir / f"{shot_id}.wav"
+        payload = {
+            "model": settings.MIMO_TTS_MODEL,
+            "messages": [
+                {"role": "user", "content": "请把下一条 assistant 消息合成为自然中文配音。"},
+                {"role": "assistant", "content": f"{self._emotion_hint(emotion)}{text.strip()}"},
+            ],
+            "modalities": ["audio", "text"],
+            "audio": {
+                "voice": voice_id or settings.MIMO_TTS_VOICE,
+                "format": settings.MIMO_TTS_FORMAT or "wav",
+            },
+        }
+        headers = {
+            "api-key": settings.MIMO_API_KEY,
+            "Authorization": f"Bearer {settings.MIMO_API_KEY}",
+            "Content-Type": "application/json",
+        }
+
+        async with httpx.AsyncClient(timeout=120) as client:
+            response = await client.post(
+                f"{settings.MIMO_BASE_URL.rstrip('/')}/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+        if response.status_code >= 400:
+            raise RuntimeError(f"Mimo TTS 调用失败: {response.status_code} {response.text[:600]}")
+
+        audio_data = self._extract_mimo_audio(response.json())
+        audio_path.write_bytes(audio_data)
+        if not audio_path.exists() or audio_path.stat().st_size <= 1024:
+            raise RuntimeError("Mimo TTS 返回音频为空或过小")
+        return str(audio_path)
+
+    def _extract_mimo_audio(self, data: dict) -> bytes:
         try:
-            await self._generate_windows_sapi(text, wav_path)
-            if wav_path.exists() and wav_path.stat().st_size > 2048:
-                return str(wav_path)
-            errors.append("Windows SAPI: 生成文件为空")
-        except Exception as exc:
-            errors.append(f"Windows SAPI: {exc}")
+            message = data["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise RuntimeError(f"Mimo TTS 返回缺少 choices/message: {data}") from exc
 
-        raise RuntimeError("配音生成失败: " + " | ".join(errors[-3:]))
+        audio = message.get("audio") or {}
+        b64_data = audio.get("data") or audio.get("b64_json") or audio.get("base64")
+        if not b64_data:
+            raise RuntimeError(f"Mimo TTS 返回缺少 audio.data: {data}")
+        if "," in b64_data and b64_data.startswith("data:"):
+            b64_data = b64_data.split(",", 1)[1]
+        return base64.b64decode(b64_data)
 
-    def _voice_candidates(self, voice_id: str) -> list[str]:
-        resolved = self._resolve_voice(voice_id)
-        candidates = [
-            resolved,
-            self.default_voice,
-            "zh-CN-XiaoxiaoNeural",
-            "zh-CN-YunxiNeural",
-            "zh-CN-YunjianNeural",
-        ]
-        return list(dict.fromkeys(v for v in candidates if v))
-
-    def _resolve_voice(self, voice_id: str) -> str:
-        if not voice_id:
-            return self.default_voice
-        if voice_id in VOICE_MAP:
-            return VOICE_MAP[voice_id]
-        if voice_id.startswith("zh-CN-"):
-            return voice_id
-        return self.default_voice
-
-    async def _generate_windows_sapi(self, text: str, wav_path) -> None:
-        encoded_text = base64.b64encode(text.encode("utf-8")).decode("ascii")
-        escaped_path = str(wav_path).replace("'", "''")
-        ps = f"""
-$ErrorActionPreference = 'Stop'
-$text = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded_text}'))
-$path = '{escaped_path}'
-$dir = Split-Path -Parent $path
-New-Item -ItemType Directory -Force -Path $dir | Out-Null
-$voice = New-Object -ComObject SAPI.SpVoice
-$stream = New-Object -ComObject SAPI.SpFileStream
-$format = New-Object -ComObject SAPI.SpAudioFormat
-$format.Type = 22
-$stream.Format = $format
-$stream.Open($path, 3)
-$voice.AudioOutputStream = $stream
-[void]$voice.Speak($text)
-$stream.Close()
-"""
-        encoded_command = base64.b64encode(ps.encode("utf-16le")).decode("ascii")
-        proc = await asyncio.create_subprocess_exec(
-            "powershell",
-            "-NoProfile",
-            "-NonInteractive",
-            "-EncodedCommand",
-            encoded_command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            raise RuntimeError(stderr.decode("utf-8", errors="ignore")[-1000:])
-        if not wav_path.exists() or wav_path.stat().st_size <= 2048:
-            raise RuntimeError("Windows SAPI 未生成有效音频")
-
-    async def list_voices(self) -> list[dict]:
-        voices = await edge_tts.list_voices()
-        return [v for v in voices if v["Locale"].startswith("zh-CN")]
+    def _emotion_hint(self, emotion: str) -> str:
+        return {
+            "happy": "用轻快、温暖的语气：",
+            "shy": "用稍微害羞、柔和的语气：",
+            "sad": "用低落、克制的语气：",
+            "angry": "用坚定、略带急切的语气：",
+            "surprised": "用惊讶、明亮的语气：",
+        }.get(emotion, "")

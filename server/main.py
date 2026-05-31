@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from api.routes import character, chat, graph, project, render, script, shot  # noqa: E402
+from api.routes import asset, character, chat, graph, project, render, script, shot  # noqa: E402
 from api.websocket import ws_manager  # noqa: E402
 from db import init_db  # noqa: E402
 
@@ -37,6 +37,7 @@ app.add_middleware(
 )
 
 app.include_router(project.router)
+app.include_router(asset.router)
 app.include_router(script.router)
 app.include_router(shot.router)
 app.include_router(render.router)

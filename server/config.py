@@ -23,12 +23,17 @@ class Settings(BaseSettings):
     MIMO_BASE_URL: str = "https://token-plan-cn.xiaomimimo.com/v1"
     MIMO_MODEL: str = "mimo-v2.5"
     MIMO_MULTIMODAL_MODEL: str = "mimo-v2-omni"
+    MIMO_TTS_MODEL: str = "mimo-v2.5-tts"
+    MIMO_TTS_VOICE: str = "冰糖"
+    MIMO_TTS_FORMAT: str = "wav"
 
     # SeedDance / Seedream (字节跳动, 通过火山引擎方舟平台调用)
     ARK_API_KEY: str = ""
     SEEDDANCE_API_KEY: str = ""
-    SEEDDANCE_BASE_URL: str = "https://ark.cn-beijing.volces.com/api/plan/v3"
-    SEEDDANCE_MODEL: str = "doubao-seedance-1.0-lite"
+    SEEDREAM_API_KEY: str = ""
+    SEEDDANCE_BASE_URL: str = "https://ark.cn-beijing.volces.com/api/v3"
+    SEEDDANCE_MODEL: str = "doubao-seedance-1-5-pro-251215"
+    VIDEO_PROVIDER: str = "Doubao-Seedance-1.5-pro"
     SEEDREAM_MODEL: str = "doubao-seedream-5.0-lite"
     SEEDREAM_IMAGE_SIZE: str = "1440x2560"
 

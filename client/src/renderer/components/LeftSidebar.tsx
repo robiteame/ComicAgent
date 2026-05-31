@@ -10,6 +10,9 @@ const OPEN_CREATE_PROJECT_EVENT = 'workspace:open-create-project'
 
 interface ProjectItem {
   id: string
+  parent_project_id?: string
+  project_type?: 'series' | 'episode'
+  episode_number?: number
   title: string
   status: string
   style?: string
@@ -41,7 +44,7 @@ function cleanTitle(value?: string) {
 }
 
 const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed }) => {
-  const { projectId, style, outputFormat, resolution, platform, setProject } = useProjectStore()
+  const { projectId, parentProjectId, projectType, style, outputFormat, resolution, platform, setProject } = useProjectStore()
   const {
     setShots,
     selectShot,
@@ -73,6 +76,25 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
     })
   }, [projects])
 
+  const projectTree = useMemo(() => {
+    const series = visibleProjects.filter((item) => (item.project_type || 'series') !== 'episode')
+    const episodesByParent = new Map<string, ProjectItem[]>()
+    visibleProjects
+      .filter((item) => item.project_type === 'episode')
+      .forEach((episode) => {
+        const key = episode.parent_project_id || ''
+        episodesByParent.set(key, [...(episodesByParent.get(key) || []), episode])
+      })
+    episodesByParent.forEach((items) => items.sort((a, b) => (a.episode_number || 0) - (b.episode_number || 0)))
+    return { series, episodesByParent }
+  }, [visibleProjects])
+
+  const sidebarProjects = useMemo(() => {
+    const nested = projectTree.series.flatMap((series) => [series, ...(projectTree.episodesByParent.get(series.id) || [])])
+    const orphanEpisodes = visibleProjects.filter((item) => item.project_type === 'episode' && !item.parent_project_id)
+    return [...nested, ...orphanEpisodes]
+  }, [projectTree, visibleProjects])
+
   const handleSelectProject = async (id: string) => {
     try {
       setLoadingProjectId(id)
@@ -84,6 +106,9 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
 
       setProject({
         projectId: projectDetail.id,
+        parentProjectId: projectDetail.parent_project_id || '',
+        projectType: projectDetail.project_type || 'series',
+        episodeNumber: projectDetail.episode_number || 0,
         title: projectDetail.title,
         genre: projectDetail.genre,
         style: projectDetail.style,
@@ -119,6 +144,9 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
 
     setProject({
       projectId: project.id,
+      parentProjectId: project.parent_project_id || '',
+      projectType: project.project_type || 'series',
+      episodeNumber: project.episode_number || 0,
       title: project.title,
       style,
       outputFormat,
@@ -173,6 +201,37 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
     }
   }
 
+  const handleCreateEpisode = async () => {
+    if (!projectId) {
+      message.warning('请先选择一个大项目')
+      return
+    }
+    const rootId = projectType === 'episode' ? parentProjectId : projectId
+    if (!rootId) {
+      message.warning('请先选择一个大项目')
+      return
+    }
+
+    try {
+      const nextNumber = visibleProjects.filter((item) => item.parent_project_id === rootId).length + 1
+      const episode = await projectApi.create({
+        title: `第 ${nextNumber} 集`,
+        parent_project_id: rootId,
+        project_type: 'episode',
+        style,
+        genre: '',
+        output_format: outputFormat,
+        resolution,
+        platform,
+      })
+      refreshProjects()
+      await handleSelectProject(episode.id)
+      message.success('单集已创建')
+    } catch (err: any) {
+      message.error('创建单集失败：' + (err.message || '未知错误'))
+    }
+  }
+
   const actionItems = [
     { id: 'import', label: '导入剧本', icon: <ImportOutlined />, onClick: () => fileInputRef.current?.click() },
     { id: 'parse', label: '生成分镜', icon: <ThunderboltOutlined />, onClick: () => window.dispatchEvent(new CustomEvent(PARSE_SCRIPT_EVENT)) },
@@ -212,11 +271,21 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
             ),
           )}
 
+          {!collapsed && (
+            <div className="linear-row">
+              <button type="button" className="linear-action" onClick={() => void handleCreateEpisode()}>
+                <span className="linear-action-icon"><PlusOutlined /></span>
+                <span>新建单集</span>
+              </button>
+            </div>
+          )}
+
           <div className="project-list linear-project-list">
-            {visibleProjects.length > 0 ? (
-              visibleProjects.map((project) => {
+            {sidebarProjects.length > 0 ? (
+              sidebarProjects.map((project) => {
                 const isActive = project.id === projectId
                 const isLoading = loadingProjectId === project.id
+                const isEpisode = project.project_type === 'episode'
 
                 return collapsed ? (
                   <Tooltip title={cleanTitle(project.title)} key={project.id} placement="right">
@@ -232,10 +301,10 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
                 ) : (
                   <div
                     key={project.id}
-                    className={`project-item linear-project-item${isActive ? ' active' : ''}${isLoading ? ' loading' : ''}`}
+                    className={`project-item linear-project-item${isActive ? ' active' : ''}${isLoading ? ' loading' : ''}${isEpisode ? ' episode-item' : ''}`}
                   >
                     <button type="button" className="project-main" onClick={() => void handleSelectProject(project.id)}>
-                      <div className="project-item-title">{cleanTitle(project.title)}</div>
+                      <div className="project-item-title">{isEpisode ? `第 ${project.episode_number || 1} 集 · ` : ''}{cleanTitle(project.title)}</div>
                       <div className="project-item-meta">最近编辑：{formatUpdatedAt(project.updated_at)}</div>
                     </button>
                   </div>

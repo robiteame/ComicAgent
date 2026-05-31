@@ -12,6 +12,9 @@ const api = axios.create({
 export const projectApi = {
   create: (data: {
     title?: string
+    parent_project_id?: string
+    project_type?: 'series' | 'episode'
+    episode_number?: number
     style?: string
     genre?: string
     output_format?: string
@@ -22,6 +25,8 @@ export const projectApi = {
   get: (id: string) => api.get(`/api/project/${id}`).then((r) => r.data),
 
   list: () => api.get('/api/project').then((r) => r.data),
+
+  episodes: (id: string) => api.get(`/api/project/${id}/episodes`).then((r) => r.data),
 
   update: (id: string, data: Record<string, any>) => api.put(`/api/project/${id}`, data).then((r) => r.data),
 }
@@ -66,7 +71,17 @@ export const shotApi = {
   batchRegenerate: (shotIds: string[], reason?: string) =>
     api.post('/api/shot/batch-regenerate', shotIds, { params: { reason } }).then((r) => r.data),
 
+  generateStoryboard: (projectId: string, shotIds?: string[]) =>
+    api.post(`/api/shot/${projectId}/generate-storyboard`, { shot_ids: shotIds || [] }).then((r) => r.data),
+
   confirmStoryboard: (projectId: string) => api.post(`/api/shot/${projectId}/confirm-storyboard`).then((r) => r.data),
+}
+
+export const assetApi = {
+  board: (projectId: string) => api.get(`/api/asset/${projectId}/board`).then((r) => r.data),
+
+  updateShotAssets: (shotId: string, data: { scene_asset_id?: string; character_asset_ids?: string[] }) =>
+    api.put(`/api/asset/shot/${shotId}`, data).then((r) => r.data),
 }
 
 export const characterApi = {

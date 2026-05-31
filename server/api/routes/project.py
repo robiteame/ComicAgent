@@ -15,6 +15,9 @@ router = APIRouter(prefix="/api/project", tags=["project"])
 
 class ProjectCreate(BaseModel):
     title: str = "未命名项目"
+    parent_project_id: str = ""
+    project_type: str = "series"
+    episode_number: int = 0
     genre: str = ""
     style: str = "anime"
     input_text: str = ""
@@ -26,6 +29,9 @@ class ProjectCreate(BaseModel):
 
 class ProjectUpdate(BaseModel):
     title: str | None = None
+    parent_project_id: str | None = None
+    project_type: str | None = None
+    episode_number: int | None = None
     genre: str | None = None
     style: str | None = None
     output_format: str | None = None
@@ -35,7 +41,10 @@ class ProjectUpdate(BaseModel):
 
 @router.post("")
 async def create_project(data: ProjectCreate, db: Session = Depends(get_db)):
-    project = Project(id=str(uuid.uuid4()), **data.model_dump())
+    payload = data.model_dump()
+    if payload.get("project_type") == "episode" and not payload.get("episode_number"):
+        payload["episode_number"] = _next_episode_number(db, payload.get("parent_project_id", ""))
+    project = Project(id=str(uuid.uuid4()), **payload)
     db.add(project)
     db.commit()
     db.refresh(project)
@@ -70,10 +79,25 @@ async def list_projects(db: Session = Depends(get_db)):
     return [_serialize_project(project) for project in projects]
 
 
+@router.get("/{project_id}/episodes")
+async def list_episodes(project_id: str, db: Session = Depends(get_db)):
+    episodes = (
+        db.query(Project)
+        .filter(Project.parent_project_id == project_id, Project.project_type == "episode")
+        .order_by(Project.episode_number.asc(), Project.created_at.asc())
+        .all()
+    )
+    _sync_completed_status(db, episodes)
+    return [_serialize_project(project) for project in episodes]
+
+
 def _serialize_project(project: Project) -> dict:
     video_path = _final_video_path(project.id)
     return {
         "id": project.id,
+        "parent_project_id": project.parent_project_id or "",
+        "project_type": project.project_type or "series",
+        "episode_number": project.episode_number or 0,
         "title": project.title,
         "genre": project.genre,
         "style": project.style,
@@ -88,6 +112,18 @@ def _serialize_project(project: Project) -> dict:
     }
 
 
+def _next_episode_number(db: Session, parent_project_id: str) -> int:
+    if not parent_project_id:
+        return 1
+    existing = (
+        db.query(Project)
+        .filter(Project.parent_project_id == parent_project_id, Project.project_type == "episode")
+        .order_by(Project.episode_number.desc())
+        .first()
+    )
+    return int(existing.episode_number or 0) + 1 if existing else 1
+
+
 def _final_video_path(project_id: str) -> Path:
     return settings.OUTPUT_DIR / "projects" / project_id / "output" / "final.mp4"
 
@@ -98,7 +134,7 @@ def _has_file(path: Path) -> bool:
 
 def _sync_completed_status(db: Session, projects: list[Project]) -> None:
     changed = False
-    active_statuses = {"generating_images", "storyboard_ready", "rendering"}
+    active_statuses = {"assets_ready", "storyboard_generating", "storyboard_ready", "rendering"}
     for project in projects:
         if project.status not in active_statuses and project.status != "completed" and _has_file(_final_video_path(project.id)):
             project.status = "completed"
