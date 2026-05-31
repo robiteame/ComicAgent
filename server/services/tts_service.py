@@ -5,6 +5,47 @@ import httpx
 from config import settings
 
 
+MIMO_TTS_VOICES = {"mimo_default", "冰糖", "茉莉", "苏打", "白桦", "Mia", "Chloe", "Milo", "Dean"}
+
+VOICE_ALIASES = {
+    "少女": "冰糖",
+    "女声": "冰糖",
+    "甜美": "冰糖",
+    "少年": "Milo",
+    "男声": "Milo",
+    "青年": "Milo",
+    "御姐": "茉莉",
+    "成熟女声": "茉莉",
+    "姐姐": "茉莉",
+    "大叔": "Dean",
+    "成熟男声": "Dean",
+    "叔叔": "Dean",
+    "儿童": "苏打",
+    "孩子": "苏打",
+    "老人": "白桦",
+    "老年": "白桦",
+    "zh-CN-XiaoxiaoNeural": "冰糖",
+    "zh-CN-XiaoyiNeural": "茉莉",
+    "zh-CN-YunjianNeural": "Milo",
+    "zh-CN-YunxiNeural": "Milo",
+    "zh-CN-YunyangNeural": "Dean",
+}
+
+
+def normalize_mimo_voice(voice_id: str = "") -> str:
+    """Map generic or legacy voice labels to voices accepted by Mimo TTS."""
+    voice = (voice_id or "").strip()
+    if voice in MIMO_TTS_VOICES:
+        return voice
+    if voice in VOICE_ALIASES:
+        return VOICE_ALIASES[voice]
+
+    default_voice = (settings.MIMO_TTS_VOICE or "mimo_default").strip()
+    if default_voice in MIMO_TTS_VOICES:
+        return default_voice
+    return "mimo_default"
+
+
 class TTSService:
     """Mimo built-in TTS service."""
 
@@ -39,7 +80,7 @@ class TTSService:
             ],
             "modalities": ["audio", "text"],
             "audio": {
-                "voice": voice_id or settings.MIMO_TTS_VOICE,
+                "voice": normalize_mimo_voice(voice_id),
                 "format": settings.MIMO_TTS_FORMAT or "wav",
             },
         }

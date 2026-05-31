@@ -13,11 +13,13 @@ from db import SessionLocal, get_db
 from models import Character, Project, SceneAsset, Shot
 from services.image_service import ImageService
 from services.tts_service import TTSService
+from services.video_service import SeedanceVideoService
 
 router = APIRouter(prefix="/api/shot", tags=["shot"])
 
 image_service = ImageService()
 tts_service = TTSService()
+seedance_service = SeedanceVideoService()
 _regeneration_tasks: set[asyncio.Task] = set()
 _pipeline_phase2_tasks: set[asyncio.Task] = set()
 
@@ -44,6 +46,10 @@ class RegenerateRequest(BaseModel):
 
 class StoryboardGenerateRequest(BaseModel):
     shot_ids: list[str] = []
+
+
+class StoryboardApprovalRequest(BaseModel):
+    approved: bool = True
 
 
 @router.get("/{project_id}/shots")
@@ -150,13 +156,15 @@ async def generate_storyboard_images(project_id: str, data: StoryboardGenerateRe
 async def confirm_storyboard(project_id: str, db: Session = Depends(get_db)):
     shots = db.query(Shot).filter(Shot.project_id == project_id).order_by(Shot.sequence).all()
     if not shots:
-        raise HTTPException(status_code=404, detail="该项目暂无分镜，请先生成分镜")
+        raise HTTPException(status_code=404, detail="??????????????")
     unfinished = [shot.id for shot in shots if not shot.storyboard_path and not shot.image_path]
     if unfinished:
-        raise HTTPException(status_code=400, detail="故事板尚未全部生成，不能触发视频生成")
+        raise HTTPException(status_code=400, detail="??????????????????")
+    unapproved = [shot.id for shot in shots if not shot.confirmed]
+    if unapproved:
+        raise HTTPException(status_code=400, detail="????????????????????")
 
     for shot in shots:
-        shot.confirmed = True
         shot.status = "storyboard_approved"
     project = db.query(Project).filter(Project.id == project_id).first()
     if project:
@@ -167,6 +175,19 @@ async def confirm_storyboard(project_id: str, db: Session = Depends(get_db)):
     _pipeline_phase2_tasks.add(task)
     task.add_done_callback(_pipeline_phase2_tasks.discard)
     return {"status": "video_phase_started", "project_id": project_id, "confirmed_shots": len(shots)}
+
+
+@router.post("/{shot_id}/approve-storyboard")
+async def approve_storyboard(shot_id: str, data: StoryboardApprovalRequest, db: Session = Depends(get_db)):
+    shot = db.query(Shot).filter(Shot.id == shot_id).first()
+    if not shot:
+        raise HTTPException(status_code=404, detail="镜头不存在")
+    if data.approved and not (shot.storyboard_path or shot.image_path):
+        raise HTTPException(status_code=400, detail="该镜头故事板尚未生成")
+    shot.confirmed = bool(data.approved)
+    shot.status = "storyboard_approved" if data.approved else "needs_review"
+    db.commit()
+    return {"id": shot.id, "approved": shot.confirmed, "status": shot.status}
 
 
 async def _run_storyboard_generation(project_id: str, shot_ids: list[str]) -> None:
@@ -227,6 +248,7 @@ async def _run_phase2_pipeline(project_id: str):
 
         for step, progress, node, message in [
             ("generate_voice", 84, voice_gen.run, "正在合成角色对白音频"),
+            ("generate_seedance_video", 90, _generate_seedance_videos, "正在调用 Seedance 生成单镜头视频"),
             ("compose_video", 94, video_compose.run, "正在拼接完整漫剧视频"),
             ("quality_check", 100, quality_check.run, "正在校验最终结果"),
         ]:
@@ -299,6 +321,38 @@ async def _regenerate_single_shot(shot_id: str, reason: str = ""):
         db.close()
 
 
+async def _generate_seedance_videos(state: dict) -> dict:
+    project_id = state["project_id"]
+    characters = state.get("characters", [])
+    scenes = state.get("scene_assets", {})
+    updated_shots = []
+    failures: list[str] = []
+
+    for shot in state.get("shots", []):
+        if shot.get("video_path"):
+            updated_shots.append(shot)
+            continue
+        try:
+            result = await seedance_service.generate_shot_video(shot, characters, scenes, project_id)
+            shot["video_path"] = result["video_path"]
+            if not shot.get("image_path"):
+                shot["image_path"] = result.get("frame_path", "")
+            shot["status"] = "video_done"
+        except Exception as exc:
+            shot["status"] = "failed"
+            shot["visual_notes"] = f"Seedance 视频生成失败: {exc}"
+            failures.append(f"{shot.get('shot_id')}: {exc}")
+        updated_shots.append(shot)
+
+    if failures:
+        raise RuntimeError("Seedance 视频生成失败: " + " | ".join(failures))
+
+    return {
+        "shots": updated_shots,
+        "current_step": "generate_seedance_video",
+    }
+
+
 def _load_state(db, project_id: str) -> dict:
     project = db.query(Project).filter(Project.id == project_id).first()
     return {
@@ -315,6 +369,7 @@ def _load_state(db, project_id: str) -> dict:
         "script_scenes": [],
         "logic_issues": [],
         "shots": [_shot_dict(s) for s in db.query(Shot).filter(Shot.project_id == project_id).order_by(Shot.sequence).all()],
+        "scene_assets": _scenes(db, project_id),
         "style": project.style if project else "anime",
         "style_params": {},
         "output_format": project.output_format if project else "9:16",
@@ -340,6 +395,7 @@ def _persist_phase2(db, project_id: str, state: dict) -> None:
             continue
         db_shot.image_path = shot.get("image_path", db_shot.image_path)
         db_shot.storyboard_path = shot.get("storyboard_path", db_shot.storyboard_path)
+        db_shot.video_path = shot.get("video_path", db_shot.video_path)
         db_shot.audio_path = shot.get("audio_path", db_shot.audio_path)
         db_shot.status = shot.get("status", db_shot.status)
         db_shot.version = shot.get("version", db_shot.version)
@@ -367,6 +423,7 @@ def _serialize_shot(s: Shot) -> dict:
         "transition": s.transition,
         "image_path": s.image_path,
         "storyboard_path": s.storyboard_path,
+        "video_path": s.video_path,
         "audio_path": s.audio_path,
         "status": s.status,
         "storyboard_status": s.storyboard_status,
@@ -386,6 +443,7 @@ def _shot_dict(s: Shot) -> dict:
     data["visual_notes"] = s.visual_notes or ""
     if not data["image_path"] and data.get("storyboard_path"):
         data["image_path"] = data["storyboard_path"]
+    data["video_path"] = s.video_path or ""
     return data
 
 

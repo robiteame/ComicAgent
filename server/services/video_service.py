@@ -51,6 +51,47 @@ class SeedanceVideoService:
             raise RuntimeError("Seedance 单帧画面保存失败")
         return {"video_path": str(video_path), "frame_path": str(frame_path), "task_id": task_id}
 
+    async def generate_shot_video(
+        self,
+        shot: dict,
+        characters: list[dict],
+        scenes: dict[str, dict],
+        project_id: str,
+    ) -> dict[str, str]:
+        return await self.generate_single_shot(
+            prompt=self._build_prompt(shot, characters, scenes),
+            project_id=project_id,
+            shot_id=shot.get("shot_id", "seedance_shot"),
+            duration=self._duration_for_model(),
+            ratio=shot.get("output_format", "9:16"),
+            resolution="720p",
+        )
+
+    def _duration_for_model(self) -> int:
+        # Seedance pro t2v rejects arbitrary shot durations. Keep generation at
+        # the verified API-safe duration; ffmpeg still uses the shot duration
+        # later when normalizing and composing clips.
+        return 5
+
+    def _build_prompt(self, shot: dict, characters: list[dict], scenes: dict[str, dict]) -> str:
+        scene = scenes.get(shot.get("scene_asset_id", "")) or {}
+        selected_character_ids = set(shot.get("character_asset_ids") or [])
+        selected_characters = [
+            item for item in characters if not selected_character_ids or item.get("id") in selected_character_ids
+        ]
+        parts = [
+            "vertical cinematic anime short video, coherent motion, no subtitles, no watermark",
+            scene.get("visual_prompt", ""),
+            scene.get("description", ""),
+            shot.get("scene_description", ""),
+            shot.get("character_action", ""),
+            shot.get("shot_type", ""),
+            shot.get("camera_angle", ""),
+        ]
+        for char in selected_characters:
+            parts.extend([char.get("visual_prompt", ""), ", ".join(char.get("key_features", []))])
+        return ", ".join(part for part in parts if part)
+
     async def _create_task(self, prompt: str, duration: int, ratio: str, resolution: str) -> dict:
         payload = {
             "model": self.model,

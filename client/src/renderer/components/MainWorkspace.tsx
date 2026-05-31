@@ -1,6 +1,15 @@
 ﻿import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { Button, Input, Select, message } from 'antd'
-import { BulbOutlined, CheckCircleOutlined, SendOutlined, UploadOutlined } from '@ant-design/icons'
+import {
+  BulbOutlined,
+  CheckCircleOutlined,
+  DragOutlined,
+  ReloadOutlined,
+  SendOutlined,
+  UploadOutlined,
+  ZoomInOutlined,
+  ZoomOutOutlined,
+} from '@ant-design/icons'
 import { useShotStore } from '../stores/shotStore'
 import { useProjectStore } from '../stores/projectStore'
 import { API_OUTPUT_BASE, assetApi, createWebSocket, projectApi, scriptApi, shotApi } from '../services/api'
@@ -18,6 +27,7 @@ const STEP_LABELS: Record<string, string> = {
   wait_storyboard_approval: '等待故事板审核',
   phase2_start: '进入第二阶段',
   generate_voice: '配音生成',
+  generate_seedance_video: 'Seedance 视频',
   compose_video: '视频合成',
   quality_check: '质量校验',
   rendering: '导出渲染',
@@ -44,6 +54,7 @@ function normalizeShot(shot: any) {
     transition: shot.transition || 'cut',
     image_path: shot.image_path || '',
     storyboard_path: shot.storyboard_path || '',
+    video_path: shot.video_path || '',
     audio_path: shot.audio_path || '',
     status: shot.status || 'pending',
     storyboard_status: shot.storyboard_status || 'pending',
@@ -92,7 +103,11 @@ const MainWorkspace: React.FC = () => {
   const [generatingStoryboard, setGeneratingStoryboard] = useState(false)
   const [assetBoard, setAssetBoard] = useState<{ characters: any[]; scenes: any[] } | null>(null)
   const [assetBoardReady, setAssetBoardReady] = useState(false)
+  const [assetTab, setAssetTab] = useState<'characters' | 'scenes'>('characters')
   const [previewMode, setPreviewMode] = useState<'shot' | 'video'>('shot')
+  const [previewScale, setPreviewScale] = useState(1)
+  const [previewOffset, setPreviewOffset] = useState({ x: 0, y: 0 })
+  const [dragStart, setDragStart] = useState<{ x: number; y: number; ox: number; oy: number } | null>(null)
   const wsRef = useRef<WebSocket | null>(null)
   const wsProjectIdRef = useRef<string | null>(null)
   const uploadInputRef = useRef<HTMLInputElement | null>(null)
@@ -104,6 +119,17 @@ const MainWorkspace: React.FC = () => {
     () => shots.find((s) => s.id === selectedShotId) || shots[0],
     [shots, selectedShotId],
   )
+
+  const hasStoryboardShots = useMemo(
+    () => shots.some((shot) => Boolean(shot.storyboard_path || shot.image_path)),
+    [shots],
+  )
+  const storyboardReviewVisible = hasStoryboardShots && previewMode === 'shot' && !videoPath
+  const approvedShotCount = useMemo(
+    () => shots.filter((shot) => shot.confirmed).length,
+    [shots],
+  )
+  const allStoryboardApproved = shots.length > 0 && shots.every((shot) => shot.confirmed)
 
   const replaceShots = (nextShots: any[]) => {
     const normalized = nextShots.map(normalizeShot).filter((s) => s.id)
@@ -169,6 +195,7 @@ const MainWorkspace: React.FC = () => {
         if (
           data.step === 'phase2_start' ||
           data.step === 'generate_voice' ||
+          data.step === 'generate_seedance_video' ||
           data.step === 'compose_video' ||
           data.step === 'quality_check'
         ) {
@@ -184,6 +211,7 @@ const MainWorkspace: React.FC = () => {
           status: data.status || 'done',
           image_path: data.image_path || '',
           storyboard_path: data.storyboard_path || data.image_path || '',
+          video_path: data.video_path || '',
           storyboard_status: data.storyboard_status || 'done',
         })
         return
@@ -454,6 +482,11 @@ const MainWorkspace: React.FC = () => {
 
     try {
       setConfirming(true)
+      const pending = shots.filter((shot) => !shot.confirmed)
+      if (pending.length) {
+        message.warning('请先逐项审核所有故事板')
+        return
+      }
       setGenerating(true)
       setPreviewMode('shot')
       connectWebSocket(projectId)
@@ -468,6 +501,40 @@ const MainWorkspace: React.FC = () => {
     } finally {
       setConfirming(false)
     }
+  }
+
+  const handleApproveShot = async (shotId: string, approved: boolean) => {
+    try {
+      await shotApi.approveStoryboard(shotId, approved)
+      updateShot(shotId, { confirmed: approved, status: approved ? 'storyboard_approved' : 'needs_review' })
+      message.success(approved ? '该镜头已通过审核' : '已标记为需调整')
+    } catch (err: any) {
+      message.error('审核操作失败：' + (err.message || '未知错误'))
+    }
+  }
+
+  const changePreviewScale = (delta: number) => {
+    setPreviewScale((value) => Math.min(3, Math.max(0.5, Number((value + delta).toFixed(2)))))
+  }
+
+  const resetPreviewTransform = () => {
+    setPreviewScale(1)
+    setPreviewOffset({ x: 0, y: 0 })
+    setDragStart(null)
+  }
+
+  const beginPreviewDrag = (event: React.MouseEvent<HTMLDivElement>) => {
+    if (!imageUrl || isGenerating || previewMode !== 'shot') return
+    event.preventDefault()
+    setDragStart({ x: event.clientX, y: event.clientY, ox: previewOffset.x, oy: previewOffset.y })
+  }
+
+  const movePreviewDrag = (event: React.MouseEvent<HTMLDivElement>) => {
+    if (!dragStart) return
+    setPreviewOffset({
+      x: dragStart.ox + event.clientX - dragStart.x,
+      y: dragStart.oy + event.clientY - dragStart.y,
+    })
   }
 
   const handleGenerateStoryboard = async () => {
@@ -519,6 +586,7 @@ const MainWorkspace: React.FC = () => {
     if (!projectId) return
 
     connectWebSocket(projectId)
+    void loadProjectShots(projectId).catch(() => undefined)
     void loadAssetBoard(projectId).catch(() => undefined)
     return () => {
       wsRef.current?.close()
@@ -533,6 +601,22 @@ const MainWorkspace: React.FC = () => {
       ? `${API_OUTPUT_BASE}${videoPath.replace('/output/', '')}`
       : toOutputUrl(videoPath)
     : null
+
+  useEffect(() => {
+    resetPreviewTransform()
+  }, [selectedShot?.id, imageUrl])
+
+  const assetItems = assetTab === 'characters' ? assetBoard?.characters || [] : assetBoard?.scenes || []
+
+  const renderReferencePreview = (item: any, label: string) => {
+    const firstImage = Array.isArray(item.reference_images) ? item.reference_images[0] : ''
+    const previewUrl = toOutputUrl(firstImage)
+    return previewUrl ? (
+      <img src={previewUrl} alt={label} />
+    ) : (
+      <span>{label}</span>
+    )
+  }
 
   return (
     <section className="main-workspace" aria-label="主工作区">
@@ -602,23 +686,37 @@ const MainWorkspace: React.FC = () => {
               </div>
             </div>
             <div className="asset-board-lists">
-              <div className="asset-board-group">
-                <span className="asset-board-label">角色</span>
-                <div className="asset-chip-row">
-                  {(assetBoard?.characters || []).slice(0, 5).map((item) => (
-                    <span className="asset-chip" key={item.id}>{item.name}</span>
-                  ))}
-                  {!assetBoard?.characters?.length && <span className="asset-chip muted">待生成</span>}
-                </div>
+              <div className="asset-tabs" aria-label="素材类型">
+                <button type="button" className={assetTab === 'characters' ? 'active' : ''} onClick={() => setAssetTab('characters')}>
+                  角色板
+                </button>
+                <button type="button" className={assetTab === 'scenes' ? 'active' : ''} onClick={() => setAssetTab('scenes')}>
+                  场景板
+                </button>
               </div>
-              <div className="asset-board-group">
-                <span className="asset-board-label">场景</span>
-                <div className="asset-chip-row">
-                  {(assetBoard?.scenes || []).slice(0, 5).map((item) => (
-                    <span className="asset-chip" key={item.id}>{item.name}</span>
-                  ))}
-                  {!assetBoard?.scenes?.length && <span className="asset-chip muted">待生成</span>}
-                </div>
+              <div className="asset-card-strip">
+                {assetItems.slice(0, 4).map((item) => (
+                  <div className="asset-mini-card" key={item.id}>
+                    <div className="asset-thumb">
+                      {assetTab === 'characters'
+                        ? renderReferencePreview(item, '三视图待生成')
+                        : renderReferencePreview(item, '场景预览待生成')}
+                    </div>
+                    <div className="asset-mini-content">
+                      <strong>{item.name}</strong>
+                      <span>{assetTab === 'characters' ? (item.personality || '性格待补充') : (item.description || '场景描述待补充')}</span>
+                      {assetTab === 'characters' ? (
+                        <>
+                          <em>音色：{item.voice_id || 'Mimo 默认音色'}</em>
+                          <em>人设：{item.appearance?.description || item.visual_prompt || '待补充'}</em>
+                        </>
+                      ) : (
+                        <em>{item.visual_prompt || '视觉提示词待补充'}</em>
+                      )}
+                    </div>
+                  </div>
+                ))}
+                {!assetItems.length && <div className="asset-empty-card">素材生成后会在这里预览</div>}
               </div>
             </div>
             <Button
@@ -693,8 +791,14 @@ const MainWorkspace: React.FC = () => {
       </div>
 
       <div className="preview-panel panel-enter">
-        <div className="preview-stage">
-          {awaitingStoryboardConfirm && (
+        <div
+          className={`preview-stage${dragStart ? ' dragging' : ''}`}
+          onMouseDown={beginPreviewDrag}
+          onMouseMove={movePreviewDrag}
+          onMouseUp={() => setDragStart(null)}
+          onMouseLeave={() => setDragStart(null)}
+        >
+          {storyboardReviewVisible && (
             <div className="confirm-overlay">
               <Button
                 type="primary"
@@ -703,8 +807,24 @@ const MainWorkspace: React.FC = () => {
                 loading={confirming}
                 onClick={handleConfirmStoryboard}
             >
-                审核通过，生成成片
+                {allStoryboardApproved ? '生成视频' : `审核后生成视频 ${approvedShotCount}/${shots.length}`}
               </Button>
+            </div>
+          )}
+
+          {imageUrl && previewMode === 'shot' && !isGenerating && (
+            <div className="preview-tools" aria-label="分镜预览工具" onMouseDown={(event) => event.stopPropagation()}>
+              <button type="button" onClick={(event) => { event.stopPropagation(); changePreviewScale(-0.1) }} aria-label="缩小">
+                <ZoomOutOutlined />
+              </button>
+              <span>{Math.round(previewScale * 100)}%</span>
+              <button type="button" onClick={(event) => { event.stopPropagation(); changePreviewScale(0.1) }} aria-label="放大">
+                <ZoomInOutlined />
+              </button>
+              <button type="button" onClick={(event) => { event.stopPropagation(); resetPreviewTransform() }} aria-label="重置视图">
+                <ReloadOutlined />
+              </button>
+              <DragOutlined />
             </div>
           )}
 
@@ -740,7 +860,16 @@ const MainWorkspace: React.FC = () => {
               poster={imageUrl || undefined}
             />
           ) : imageUrl ? (
-            <img src={imageUrl} alt="当前镜头预览" style={{ width: '100%', height: '100%', objectFit: 'contain' }} />
+            <div className="preview-image-pan">
+              <img
+                src={imageUrl}
+                alt="当前镜头预览"
+                draggable={false}
+                style={{
+                  transform: `translate(${previewOffset.x}px, ${previewOffset.y}px) scale(${previewScale})`,
+                }}
+              />
+            </div>
           ) : (
             <span className="preview-placeholder">选择镜头即可预览画面</span>
           )}
@@ -749,6 +878,21 @@ const MainWorkspace: React.FC = () => {
             <div className="preview-caption">
               <div className="preview-scene">{selectedShot.scene_description}</div>
               {selectedShot.dialogue && <div className="preview-dialogue">“{selectedShot.dialogue}”</div>}
+              {storyboardReviewVisible && (selectedShot.storyboard_path || selectedShot.image_path) && (
+                <div className="preview-approval-actions">
+                  <Button
+                    size="small"
+                    type={selectedShot.confirmed ? 'primary' : 'default'}
+                    onClick={() => void handleApproveShot(selectedShot.id, true)}
+                  >
+                    通过此镜头
+                  </Button>
+                  <Button size="small" onClick={() => void handleApproveShot(selectedShot.id, false)}>
+                    退回调整
+                  </Button>
+                  <span>{selectedShot.confirmed ? '已通过' : '待审核'}</span>
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -762,7 +906,7 @@ const MainWorkspace: React.FC = () => {
               return (
                 <div
                   key={shot.id}
-                  className={`thumb-item${isSelected ? ' active' : ''}`}
+                  className={`thumb-item${isSelected ? ' active' : ''}${shot.confirmed ? ' approved' : ''}`}
                   onClick={() => selectShot(shot.id)}
                 >
                   {thumbUrl ? (

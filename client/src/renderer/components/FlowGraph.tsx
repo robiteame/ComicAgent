@@ -13,6 +13,7 @@ const STEPS = [
   { id: 'generate_storyboard_images', label: '故事板' },
   { id: 'wait_storyboard_approval', label: '审核' },
   { id: 'generate_voice', label: '配音' },
+  { id: 'generate_seedance_video', label: '视频' },
   { id: 'compose_video', label: '成片' },
   { id: 'quality_check', label: '校验' },
 ]

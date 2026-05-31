@@ -5,6 +5,7 @@ from agent.state import AgentState
 from memory.project_memory import ProjectMemory
 from rag.rag_service import RAGService
 from services.llm_service import LLMService
+from services.tts_service import normalize_mimo_voice
 
 llm_service = LLMService()
 rag_service = RAGService()
@@ -105,7 +106,7 @@ def _normalize_characters(raw: list, user_input: str) -> list[dict]:
                 "personality": item.get("personality", "性格鲜明，行动目标清晰"),
                 "visual_prompt": item.get("visual_prompt") or f"{name}, expressive comic character, clean line art",
                 "negative_prompt": item.get("negative_prompt", "low quality, blurry, watermark"),
-                "voice_id": item.get("voice_type") or item.get("voice_id") or "少女",
+                "voice_id": normalize_mimo_voice(item.get("voice_type") or item.get("voice_id") or "少女"),
                 "key_features": features,
                 "emotion_variants": {
                     "neutral": "calm expression",
@@ -131,7 +132,7 @@ def _normalize_characters(raw: list, user_input: str) -> list[dict]:
             "personality": "敏感而有行动力",
             "visual_prompt": f"{name}, modern Chinese comic character, clean office-light illustration",
             "negative_prompt": "low quality, blurry, watermark, extra fingers",
-            "voice_id": "少女",
+            "voice_id": normalize_mimo_voice("少女"),
             "key_features": ["清爽造型", "表情细腻"],
             "emotion_variants": {
                 "neutral": "calm expression",

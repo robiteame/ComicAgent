@@ -14,6 +14,7 @@ export interface Shot {
   transition: string
   image_path: string
   storyboard_path: string
+  video_path: string
   audio_path: string
   status: string
   storyboard_status: string

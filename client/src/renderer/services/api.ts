@@ -74,6 +74,9 @@ export const shotApi = {
   generateStoryboard: (projectId: string, shotIds?: string[]) =>
     api.post(`/api/shot/${projectId}/generate-storyboard`, { shot_ids: shotIds || [] }).then((r) => r.data),
 
+  approveStoryboard: (shotId: string, approved = true) =>
+    api.post(`/api/shot/${shotId}/approve-storyboard`, { approved }).then((r) => r.data),
+
   confirmStoryboard: (projectId: string) => api.post(`/api/shot/${projectId}/confirm-storyboard`).then((r) => r.data),
 }
 

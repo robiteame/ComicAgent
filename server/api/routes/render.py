@@ -64,6 +64,7 @@ async def _render_task(project_id: str, output_format: str, resolution: str):
                 "duration": s.duration,
                 "transition": s.transition,
                 "image_path": s.image_path or s.storyboard_path,
+                "video_path": s.video_path,
                 "audio_path": s.audio_path,
                 "status": s.status,
                 "version": s.version,

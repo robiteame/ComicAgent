@@ -24,6 +24,9 @@ class FFmpegService:
 
         clip_paths: list[Path] = []
         for index, shot in enumerate(shots):
+            if shot.get("video_path"):
+                clip_paths.append(await self._normalize_video_clip(shot, width, height, index, video_dir))
+                continue
             if not shot.get("image_path"):
                 continue
             clip_paths.append(await self._render_shot_clip(shot, width, height, index, video_dir))
@@ -73,6 +76,45 @@ class FFmpegService:
                 "-c:a",
                 "aac",
                 *audio_filter,
+                "-shortest",
+                str(clip_path),
+            ]
+        )
+        return clip_path
+
+    async def _normalize_video_clip(self, shot: dict, width: int, height: int, index: int, output_dir: Path) -> Path:
+        clip_path = output_dir / f"clip_{index:04d}.mp4"
+        duration = max(0.5, float(shot.get("duration") or 3.0))
+        video_path = str(shot["video_path"])
+        audio_path = Path(shot["audio_path"]) if shot.get("audio_path") else None
+        if audio_path and audio_path.exists():
+            audio_input = ["-i", str(audio_path)]
+            map_audio = ["-map", "1:a:0"]
+            audio_codec = ["-c:a", "aac", "-af", f"apad=pad_dur={duration}"]
+        else:
+            audio_input = ["-f", "lavfi", "-t", str(duration), "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"]
+            map_audio = ["-map", "1:a:0"]
+            audio_codec = ["-c:a", "aac"]
+
+        await self._run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                video_path,
+                *audio_input,
+                "-vf",
+                f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height}",
+                "-t",
+                str(duration),
+                "-map",
+                "0:v:0",
+                *map_audio,
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                *audio_codec,
                 "-shortest",
                 str(clip_path),
             ]

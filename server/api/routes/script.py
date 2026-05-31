@@ -14,6 +14,7 @@ from db import SessionLocal
 from models import Character as CharacterModel
 from models import Project, SceneAsset, Shot as ShotModel
 from services.llm_service import LLMService
+from services.tts_service import normalize_mimo_voice
 
 router = APIRouter(prefix="/api/script", tags=["script"])
 
@@ -241,7 +242,7 @@ def _upsert_characters(db, asset_project_id: str, characters: list[dict]) -> dic
         item.personality = char.get("personality", "")
         item.visual_prompt = char.get("visual_prompt", "")
         item.negative_prompt = char.get("negative_prompt", "")
-        item.voice_id = char.get("voice_id", "")
+        item.voice_id = normalize_mimo_voice(char.get("voice_id", ""))
         item.emotion_variants = json.dumps(char.get("emotion_variants", {}), ensure_ascii=False)
         item.key_features = json.dumps(char.get("key_features", []), ensure_ascii=False)
         item.default_outfit = char.get("appearance", {}).get("default_outfit", "")

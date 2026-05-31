@@ -33,6 +33,7 @@ def _ensure_sqlite_columns() -> None:
                 "character_asset_ids": "TEXT DEFAULT '[]'",
                 "storyboard_path": "VARCHAR DEFAULT ''",
                 "storyboard_status": "VARCHAR DEFAULT 'pending'",
+                "video_path": "VARCHAR DEFAULT ''",
                 "visual_notes": "TEXT DEFAULT ''",
             },
         )

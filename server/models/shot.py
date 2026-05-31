@@ -22,6 +22,7 @@ class Shot(Base):
     emotion = Column(String, default="neutral")
     transition = Column(String, default="cut")
     image_path = Column(String, default="")
+    video_path = Column(String, default="")
     audio_path = Column(String, default="")
     status = Column(String, default="pending")
     version = Column(Integer, default=1)
