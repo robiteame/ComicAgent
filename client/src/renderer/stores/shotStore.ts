@@ -23,6 +23,14 @@ export interface Shot {
   characters_in_scene: string[]
   scene_asset_id: string
   character_asset_ids: string[]
+  scene_group_id?: string
+  consistency_context?: string
+  reference_weights?: { environment?: number; action?: number }
+  continuity_profile?: Record<string, any>
+  continuity_reference_path?: string
+  pose_reference_path?: string
+  depth_reference_path?: string
+  last_frame_path?: string
 }
 
 interface ShotState {

@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import traceback
+from typing import Literal
 
 import aiofiles
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
@@ -13,13 +14,18 @@ from config import settings
 from db import SessionLocal
 from models import Character as CharacterModel
 from models import Project, SceneAsset, Shot as ShotModel
+from services.consistency_service import ConsistencyService
+from services.image_service import ImageService
 from services.llm_service import LLMService
+from services.style_templates import style_prompt_params, style_template
 from services.tts_service import normalize_mimo_voice
 
 router = APIRouter(prefix="/api/script", tags=["script"])
 
 _background_tasks: set[asyncio.Task] = set()
 llm_service = LLMService()
+image_service = ImageService()
+consistency_service = ConsistencyService()
 
 
 class ScriptGenerateRequest(BaseModel):
@@ -40,6 +46,7 @@ class ScriptParseRequest(BaseModel):
     resolution: str = "1080p"
     platform: str = "douyin"
     target_duration: int = 45
+    mode: Literal["manual", "auto"] = "manual"
 
 
 @router.post("/generate")
@@ -59,10 +66,14 @@ async def generate_script(data: ScriptGenerateRequest):
 async def parse_script(data: ScriptParseRequest):
     if not data.user_input.strip():
         raise HTTPException(status_code=400, detail="请输入剧本内容")
-    task = asyncio.create_task(_run_storyboard_phase(data.project_id, _initial_state(data.model_dump())))
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
-    return {"status": "started", "project_id": data.project_id}
+    task = _spawn_pipeline(
+        data.project_id,
+        _initial_state(data.model_dump()),
+        data.mode,
+        data.output_format,
+        data.resolution,
+    )
+    return {"status": "started", "project_id": data.project_id, "mode": data.mode}
 
 
 @router.post("/upload")
@@ -73,6 +84,7 @@ async def upload_script(
     output_format: str = Form("9:16"),
     resolution: str = Form("1080p"),
     platform: str = Form("douyin"),
+    mode: Literal["manual", "auto"] = Form("manual"),
 ):
     upload_dir = settings.DATA_DIR / "uploads"
     upload_dir.mkdir(parents=True, exist_ok=True)
@@ -103,10 +115,8 @@ async def upload_script(
         "platform": platform,
         "target_duration": 45,
     }
-    task = asyncio.create_task(_run_storyboard_phase(project_id, _initial_state(payload)))
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
-    return {"status": "started", "project_id": project_id, "file": file.filename}
+    _spawn_pipeline(project_id, _initial_state(payload), mode, output_format, resolution)
+    return {"status": "started", "project_id": project_id, "mode": mode, "file": file.filename, "script": user_input}
 
 
 async def _generate_script_text(data: ScriptGenerateRequest) -> str:
@@ -119,7 +129,7 @@ async def _generate_script_text(data: ScriptGenerateRequest) -> str:
             f"""
 创作方向：{data.prompt}
 类型：{data.genre}
-画风：{data.style}
+画风：{style_template(data.style)["label"]}（{data.style}）
 目标时长：{data.target_duration} 秒
 人物提示：{data.characters_hint or "自行设计 1 到 3 名角色"}
 
@@ -136,6 +146,7 @@ async def _generate_script_text(data: ScriptGenerateRequest) -> str:
 
 
 def _initial_state(data: dict) -> dict:
+    style = data.get("style", "anime")
     return {
         "project_id": data["project_id"],
         "user_input": data.get("user_input", ""),
@@ -144,14 +155,14 @@ def _initial_state(data: dict) -> dict:
         "file_type": data.get("file_type", ""),
         "script_title": "",
         "genre": "",
-        "style_suggestion": data.get("style", "anime"),
+        "style_suggestion": style,
         "characters": [],
         "raw_script": "",
         "script_scenes": [],
         "logic_issues": [],
         "shots": [],
-        "style": data.get("style", "anime"),
-        "style_params": {},
+        "style": style,
+        "style_params": style_prompt_params(style),
         "output_format": data.get("output_format", "9:16"),
         "resolution": data.get("resolution", "1080p"),
         "platform": data.get("platform", "douyin"),
@@ -168,14 +179,62 @@ def _initial_state(data: dict) -> dict:
     }
 
 
+def _spawn_pipeline(project_id: str, initial_state: dict, mode: str, output_format: str, resolution: str) -> asyncio.Task:
+    """根据 mode 启动手动(逐步)或自动(LangGraph 端到端)流水线,均后台异步执行。"""
+    if mode == "auto":
+        coro = _run_auto_pipeline(project_id, initial_state, output_format, resolution)
+    else:
+        coro = _run_storyboard_phase(project_id, initial_state)
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
+async def _run_auto_pipeline(project_id: str, initial_state: dict, output_format: str, resolution: str):
+    """自动模式:经 LangGraph 一次 ainvoke 从解析跑到成片,节点复用 route 步骤函数。"""
+    from agent.graph import get_graph
+
+    try:
+        await get_graph().ainvoke(
+            {
+                "project_id": project_id,
+                "mode": "auto",
+                "initial_state": initial_state,
+                "output_format": output_format,
+                "resolution": resolution,
+                "current_step": "",
+                "errors": [],
+            }
+        )
+    except Exception as exc:
+        await ws_manager.send_to_project(
+            project_id,
+            {"type": "error", "message": f"自动流程失败: {exc}\n{traceback.format_exc()}"},
+        )
+
+
 async def _run_storyboard_phase(project_id: str, state: dict):
     db = SessionLocal()
     try:
         await _progress(project_id, "parse_script", 10, "正在解析剧本")
         state.update(await script_parser.run(state))
+        state["characters"] = [
+            consistency_service.enrich_character(character, index)
+            for index, character in enumerate(state.get("characters", []))
+        ]
+        state["script_scenes"] = [
+            consistency_service.enrich_scene(scene, index)
+            for index, scene in enumerate(state.get("script_scenes", []))
+        ]
 
         await _progress(project_id, "generate_storyboard", 32, "正在生成分镜列表")
         state.update(await storyboard_gen.run(state))
+
+        await _progress(project_id, "wait_asset_confirm", 40, "正在生成角色三视图与项目素材板")
+        asset_project_id = _resolve_asset_project_id(db, project_id)
+        await _ensure_character_reference_images(asset_project_id, state)
+        await _ensure_scene_baseline_images(asset_project_id, state)
 
         _persist_phase1(db, project_id, state, status="assets_ready")
         await _progress(project_id, "wait_asset_confirm", 45, "角色板、场景板与分镜已生成，请确认素材后生成故事板")
@@ -214,17 +273,71 @@ def _persist_phase1(db, project_id: str, state: dict, status: str = "assets_read
     project.output_format = state.get("output_format", project.output_format)
     project.resolution = state.get("resolution", project.resolution)
     project.platform = state.get("platform", project.platform)
+    project.consistency_config = json.dumps(consistency_service.project_config(), ensure_ascii=False)
     project.status = status
 
     character_ids = _upsert_characters(db, asset_project_id, state.get("characters", []))
     scene_ids = _upsert_scenes(db, asset_project_id, state.get("script_scenes", []))
 
+    existing_shots = db.query(ShotModel).filter(ShotModel.project_id == project_id).all()
+    if any(shot.confirmed or shot.video_path for shot in existing_shots):
+        raise RuntimeError("项目已存在已确认/已出片的镜头，重新解析会丢失这些成果，请先清空项目后再解析")
     db.query(ShotModel).filter(ShotModel.project_id == project_id).delete()
     shots = state.get("shots", [])
     for index, shot in enumerate(shots):
-        db.add(_shot_model(project_id, shot, index + 1, character_ids, scene_ids))
+        db.add(_shot_model(project_id, shot, index + 1, character_ids, scene_ids, state.get("script_scenes", []), state.get("characters", [])))
 
     db.commit()
+
+
+async def _ensure_character_reference_images(asset_project_id: str, state: dict) -> None:
+    style = state.get("style") or state.get("style_suggestion") or "anime"
+    for index, character in enumerate(state.get("characters", [])):
+        refs = character.get("reference_images")
+        if isinstance(refs, list) and refs:
+            continue
+        try:
+            ref_path = await image_service.generate_character_reference(
+                character=character,
+                style=style,
+                project_id=asset_project_id,
+                seed=int(character.get("seed") or 42) + 7000 + index,
+            )
+            character["reference_images"] = [ref_path]
+        except Exception as exc:
+            character["reference_images"] = []
+            character["visual_prompt"] = ", ".join(
+                part for part in [character.get("visual_prompt", ""), f"three-view reference generation pending: {exc}"] if part
+            )
+
+
+async def _ensure_scene_baseline_images(asset_project_id: str, state: dict) -> None:
+    style = state.get("style") or state.get("style_suggestion") or "anime"
+    for index, scene in enumerate(state.get("script_scenes", [])):
+        refs = scene.get("reference_images")
+        baseline = scene.get("baseline_image_path", "")
+        if baseline or (isinstance(refs, list) and refs):
+            continue
+        try:
+            ref_path = await image_service.generate_scene_baseline_reference(
+                scene=scene,
+                style=style,
+                project_id=asset_project_id,
+                seed=int(scene.get("seed") or 1200) + index,
+            )
+            scene["baseline_image_path"] = ref_path
+            scene["reference_images"] = [ref_path]
+        except Exception as exc:
+            scene["baseline_image_path"] = ""
+            scene["reference_images"] = []
+            scene["visual_prompt"] = ", ".join(
+                part for part in [scene.get("visual_prompt", ""), f"scene baseline generation pending: {exc}"] if part
+            )
+
+
+def _resolve_asset_project_id(db, project_id: str) -> str:
+    project = db.query(Project).filter(Project.id == project_id).first()
+    return (project.parent_project_id or project.id) if project else project_id
 
 
 def _upsert_characters(db, asset_project_id: str, characters: list[dict]) -> dict[str, str]:
@@ -245,7 +358,14 @@ def _upsert_characters(db, asset_project_id: str, characters: list[dict]) -> dic
         item.voice_id = normalize_mimo_voice(char.get("voice_id", ""))
         item.emotion_variants = json.dumps(char.get("emotion_variants", {}), ensure_ascii=False)
         item.key_features = json.dumps(char.get("key_features", []), ensure_ascii=False)
-        item.default_outfit = char.get("appearance", {}).get("default_outfit", "")
+        appearance = char.get("appearance", {}) if isinstance(char.get("appearance"), dict) else {}
+        item.default_outfit = char.get("default_outfit") or appearance.get("default_outfit", "")
+        item.lora_profile = char.get("lora_profile", "")
+        item.ip_adapter_profile = char.get("ip_adapter_profile", "")
+        item.wardrobe_lock = char.get("wardrobe_lock", "")
+        next_refs = char.get("reference_images", [])
+        if next_refs or not existing:
+            item.reference_images = json.dumps(next_refs, ensure_ascii=False)
         item.seed = str(char.get("seed", 42 + index))
         if not existing:
             db.add(item)
@@ -256,18 +376,30 @@ def _upsert_characters(db, asset_project_id: str, characters: list[dict]) -> dic
 def _upsert_scenes(db, asset_project_id: str, scenes: list[dict]) -> list[str]:
     ids: list[str] = []
     for index, scene in enumerate(scenes):
-        name = scene.get("location") or f"场景{index + 1}"
+        location = scene.get("location") or scene.get("name") or f"场景{index + 1}"
+        time_of_day = scene.get("time_of_day") or "locked"
+        scene_group_key = scene.get("scene_group_key", "")
+        name = scene.get("name") or f"{location}-{time_of_day}"
         scene_id = f"{asset_project_id}_scene_{index + 1:04d}"
-        existing = (
-            db.query(SceneAsset)
-            .filter(SceneAsset.project_id == asset_project_id, SceneAsset.name == name)
-            .first()
-        )
+        base_query = db.query(SceneAsset).filter(SceneAsset.project_id == asset_project_id)
+        existing = base_query.filter(SceneAsset.scene_group_key == scene_group_key).first() if scene_group_key else None
+        if not existing:
+            existing = base_query.filter(SceneAsset.name == name).first()
         item = existing or SceneAsset(id=scene_id, project_id=asset_project_id, name=name)
+        item.name = name
         item.description = scene.get("actions") or scene.get("description") or ""
-        item.visual_prompt = scene.get("visual_prompt") or f"{name}, consistent comic background, clean composition"
+        item.visual_prompt = scene.get("visual_prompt") or item.visual_prompt or f"{name}, consistent comic background, clean composition"
         item.negative_prompt = "watermark, subtitles, text artifacts, low quality"
         item.key_features = json.dumps([scene.get("emotion", "neutral"), scene.get("camera_suggestion", "medium")], ensure_ascii=False)
+        item.scene_group_key = scene_group_key
+        item.time_of_day = time_of_day
+        if scene.get("baseline_image_path") or not existing:
+            item.baseline_image_path = scene.get("baseline_image_path", "")
+        item.consistency_profile = json.dumps(scene.get("consistency_profile", {}), ensure_ascii=False)
+        item.prop_lock = scene.get("prop_lock", "")
+        next_refs = scene.get("reference_images", [])
+        if next_refs or not existing:
+            item.reference_images = json.dumps(next_refs, ensure_ascii=False)
         item.seed = 1200 + index
         if not existing:
             db.add(item)
@@ -281,11 +413,43 @@ def _shot_model(
     sequence: int,
     character_ids: dict[str, str],
     scene_ids: list[str],
+    scenes: list[dict],
+    characters: list[dict],
 ) -> ShotModel:
     characters_in_scene = shot.get("characters_in_scene", [])
-    scene_asset_id = scene_ids[min(sequence - 1, len(scene_ids) - 1)] if scene_ids else ""
+    scene_number = int(shot.get("scene_number") or shot.get("source_scene_number") or min(sequence, max(len(scene_ids), 1)))
+    scene_index = max(0, min(scene_number - 1, len(scene_ids) - 1)) if scene_ids else 0
+    scene_asset_id = scene_ids[scene_index] if scene_ids else ""
+    scene_meta = scenes[scene_index] if scenes and scene_index < len(scenes) else {}
+    scene_cards: dict[str, dict] = {}
+    for item_index, item_id in enumerate(scene_ids):
+        item_meta = scenes[item_index] if item_index < len(scenes) else {}
+        scene_cards.setdefault(
+            item_id,
+            {
+                **item_meta,
+                "id": item_id,
+                "name": item_meta.get("name") or item_meta.get("location") or item_id,
+            },
+        )
+    character_cards = []
+    for character in characters:
+        card = dict(character)
+        name = card.get("name", "")
+        if name in character_ids:
+            card["id"] = character_ids[name]
+        character_cards.append(card)
+    shot_context = {
+        **shot,
+        "shot_id": shot.get("shot_id") or f"{project_id}_shot_{sequence:04d}",
+        "scene_asset_id": scene_asset_id,
+        "scene_group_id": scene_meta.get("scene_group_key", scene_asset_id),
+        "characters_in_scene": characters_in_scene,
+        "character_asset_ids": [character_ids[name] for name in characters_in_scene if name in character_ids],
+    }
+    consistency = consistency_service.build_generation_context(shot_context, character_cards, scene_cards)
     return ShotModel(
-        id=shot.get("shot_id") or f"{project_id}_shot_{sequence:04d}",
+        id=shot_context["shot_id"],
         project_id=project_id,
         sequence=sequence,
         shot_type=shot.get("shot_type", "medium"),
@@ -303,8 +467,16 @@ def _shot_model(
         version=shot.get("version", 1),
         confirmed=False,
         characters_in_scene=json.dumps(characters_in_scene, ensure_ascii=False),
-        character_asset_ids=json.dumps([character_ids[name] for name in characters_in_scene if name in character_ids], ensure_ascii=False),
+        character_asset_ids=json.dumps(shot_context["character_asset_ids"], ensure_ascii=False),
         scene_asset_id=scene_asset_id,
+        scene_group_id=consistency.get("scene_group_id", scene_meta.get("scene_group_key", scene_asset_id)),
+        consistency_context=consistency.get("consistency_context", ""),
+        reference_weights=json.dumps(consistency.get("reference_weights", {}), ensure_ascii=False),
+        continuity_profile=json.dumps(consistency.get("continuity_profile", {}), ensure_ascii=False),
+        continuity_reference_path="",
+        pose_reference_path="",
+        depth_reference_path="",
+        last_frame_path="",
         storyboard_path="",
         storyboard_status="pending",
         visual_notes=shot.get("visual_notes", ""),

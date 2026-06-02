@@ -12,6 +12,7 @@ const api = axios.create({
 export const projectApi = {
   create: (data: {
     title?: string
+    first_episode_title?: string
     parent_project_id?: string
     project_type?: 'series' | 'episode'
     episode_number?: number
@@ -29,6 +30,15 @@ export const projectApi = {
   episodes: (id: string) => api.get(`/api/project/${id}/episodes`).then((r) => r.data),
 
   update: (id: string, data: Record<string, any>) => api.put(`/api/project/${id}`, data).then((r) => r.data),
+
+  delete: (id: string) => api.delete(`/api/project/${id}`).then((r) => r.data),
+
+  importVideo: (id: string, formData: FormData) =>
+    api
+      .post(`/api/project/${id}/import-video`, formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      })
+      .then((r) => r.data),
 }
 
 export const scriptApi = {
@@ -65,7 +75,7 @@ export const shotApi = {
 
   update: (shotId: string, data: Record<string, any>) => api.put(`/api/shot/${shotId}`, data).then((r) => r.data),
 
-  regenerate: (shotId: string, data?: { reason?: string }) =>
+  regenerate: (shotId: string, data?: Record<string, any>) =>
     api.post(`/api/shot/${shotId}/regenerate`, data || {}).then((r) => r.data),
 
   batchRegenerate: (shotIds: string[], reason?: string) =>
@@ -77,6 +87,9 @@ export const shotApi = {
   approveStoryboard: (shotId: string, approved = true) =>
     api.post(`/api/shot/${shotId}/approve-storyboard`, { approved }).then((r) => r.data),
 
+  generateVideo: (shotId: string, force = false) =>
+    api.post(`/api/shot/${shotId}/generate-video`, { force }).then((r) => r.data),
+
   confirmStoryboard: (projectId: string) => api.post(`/api/shot/${projectId}/confirm-storyboard`).then((r) => r.data),
 }
 
@@ -85,6 +98,12 @@ export const assetApi = {
 
   updateShotAssets: (shotId: string, data: { scene_asset_id?: string; character_asset_ids?: string[] }) =>
     api.put(`/api/asset/shot/${shotId}`, data).then((r) => r.data),
+
+  updateCharacter: (characterId: string, data: Record<string, any>) =>
+    api.put(`/api/asset/character/${characterId}`, data).then((r) => r.data),
+
+  updateScene: (sceneId: string, data: Record<string, any>) =>
+    api.put(`/api/asset/scene/${sceneId}`, data).then((r) => r.data),
 }
 
 export const characterApi = {
@@ -104,6 +123,13 @@ export const renderApi = {
 export const chatApi = {
   send: (data: { project_id: string; message: string; current_shots?: any[] }) =>
     api.post('/api/chat', data).then((r) => r.data),
+}
+
+export const settingsApi = {
+  styleTemplates: () => api.get('/api/settings/style-templates').then((r) => r.data),
+
+  createStyleTemplate: (data: { label: string; keywords: string; negative_prompt?: string }) =>
+    api.post('/api/settings/style-templates', data).then((r) => r.data),
 }
 
 export function createWebSocket(projectId: string, onMessage: (data: any) => void): WebSocket {

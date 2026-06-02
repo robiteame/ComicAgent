@@ -9,12 +9,12 @@ const STEPS = [
   { id: 'generate_script', label: '剧本' },
   { id: 'parse_script', label: '解析' },
   { id: 'generate_storyboard', label: '分镜' },
-  { id: 'wait_asset_confirm', label: '素材' },
-  { id: 'generate_storyboard_images', label: '故事板' },
-  { id: 'wait_storyboard_approval', label: '审核' },
+  { id: 'wait_asset_confirm', label: '资产' },
+  { id: 'generate_storyboard_images', label: '定稿图' },
+  { id: 'wait_storyboard_approval', label: '镜头审核' },
   { id: 'generate_voice', label: '配音' },
-  { id: 'generate_seedance_video', label: '视频' },
-  { id: 'compose_video', label: '成片' },
+  { id: 'generate_seedance_video', label: '单镜头视频' },
+  { id: 'compose_video', label: '合成' },
   { id: 'quality_check', label: '校验' },
 ]
 

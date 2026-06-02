@@ -1,5 +1,6 @@
 import React, { useState } from 'react'
 import BottomBar from './components/BottomBar'
+import GlobalPlayfulMotion from './components/GlobalPlayfulMotion'
 import LeftSidebar from './components/LeftSidebar'
 import MainWorkspace from './components/MainWorkspace'
 import RightSidebar from './components/RightSidebar'
@@ -11,6 +12,7 @@ const App: React.FC = () => {
 
   return (
     <div className="app-shell">
+      <GlobalPlayfulMotion />
       <TopBar />
       <div
         className={`app-main${sidebarCollapsed ? ' sidebar-collapsed' : ''}${rightSidebarCollapsed ? ' right-sidebar-collapsed' : ''}`}

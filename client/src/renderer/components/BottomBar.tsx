@@ -8,7 +8,7 @@ const stepLabels: Record<string, string> = {
   wait_asset_confirm: '等待素材确认',
   generate_storyboard_images: '故事板生成',
   wait_storyboard_approval: '等待故事板审核',
-  phase2_start: '开始成片',
+  phase2_start: '视频阶段',
   generate_voice: 'Mimo 配音',
   generate_seedance_video: 'Seedance 视频',
   compose_video: '视频合成',

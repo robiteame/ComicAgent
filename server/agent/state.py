@@ -86,6 +86,10 @@ class AgentState(TypedDict):
     needs_human_review: bool
     storyboard_confirmed: bool
 
+    # 运行模式:auto = 经 LangGraph 端到端跑;manual = 由 api/routes 逐步触发(默认)
+    mode: Literal["manual", "auto"]
+    initial_state: dict  # 自动模式下传给阶段1 (_run_storyboard_phase) 的初始 state dict
+
     # 记忆上下文（从 RAG 和记忆系统注入）
     rag_context: list[str]
     narrative_context: dict  # 剧情上下文

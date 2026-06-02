@@ -38,13 +38,15 @@ class Settings(BaseSettings):
     SEEDREAM_IMAGE_SIZE: str = "1440x2560"
 
     # 图像生成配置
-    IMAGE_PROVIDER: str = "local"  # local / stability / doubao-seedream-5.0-lite
+    # local = 无密钥占位图 stub(PIL 生成,使全流程可离线跑通); stability / doubao-seedream-5.0-lite = 真实云端服务
+    # 配置真实 provider 但缺少对应 API Key 时,会自动回退到占位图,不再报错中断
+    IMAGE_PROVIDER: str = "local"
     STABILITY_API_KEY: str = ""
     STABILITY_API_URL: str = "https://api.stability.ai/v2beta"
     SD_LOCAL_URL: str = "http://127.0.0.1:7860"
 
     # TTS 配置
-    TTS_PROVIDER: str = "edge"  # edge / cosyvoice
+    TTS_PROVIDER: str = "mimo"  # legacy field; TTSService always uses Mimo built-in TTS
     TTS_DEFAULT_VOICE: str = "zh-CN-XiaoyiNeural"
 
     # ChromaDB 配置

@@ -3,8 +3,11 @@ import { Button, Input, Select, message } from 'antd'
 import {
   BulbOutlined,
   CheckCircleOutlined,
+  ClockCircleOutlined,
   DragOutlined,
+  EditOutlined,
   ReloadOutlined,
+  SaveOutlined,
   SendOutlined,
   UploadOutlined,
   ZoomInOutlined,
@@ -12,11 +15,15 @@ import {
 } from '@ant-design/icons'
 import { useShotStore } from '../stores/shotStore'
 import { useProjectStore } from '../stores/projectStore'
-import { API_OUTPUT_BASE, assetApi, createWebSocket, projectApi, scriptApi, shotApi } from '../services/api'
+import { API_OUTPUT_BASE, assetApi, createWebSocket, projectApi, renderApi, scriptApi, settingsApi, shotApi } from '../services/api'
+import { STYLE_DESCRIPTIONS, STYLE_OPTIONS } from '../constants/styleTemplates'
+import { OPEN_SETTINGS_EVENT } from './TopBar'
 
 const { TextArea } = Input
 const PARSE_SCRIPT_EVENT = 'pipeline:parse-script'
 const OPEN_CREATE_PROJECT_EVENT = 'workspace:open-create-project'
+
+type StyleOption = { value: string; label: string; keywords?: string; custom?: boolean }
 
 const STEP_LABELS: Record<string, string> = {
   start: '开始',
@@ -32,6 +39,16 @@ const STEP_LABELS: Record<string, string> = {
   quality_check: '质量校验',
   rendering: '导出渲染',
 }
+
+const WORKSPACE_TABS = [
+  { id: 'script', label: '剧本编辑' },
+  { id: 'assets', label: '角色场景资产' },
+  { id: 'storyboard', label: '故事板预览' },
+  { id: 'review', label: '分镜审核' },
+  { id: 'video', label: '成片预览' },
+] as const
+
+type WorkspaceTab = typeof WORKSPACE_TABS[number]['id']
 
 function toOutputUrl(imagePath?: string) {
   if (!imagePath) return null
@@ -63,6 +80,14 @@ function normalizeShot(shot: any) {
     characters_in_scene: Array.isArray(shot.characters_in_scene) ? shot.characters_in_scene : [],
     scene_asset_id: shot.scene_asset_id || '',
     character_asset_ids: Array.isArray(shot.character_asset_ids) ? shot.character_asset_ids : [],
+    scene_group_id: shot.scene_group_id || '',
+    consistency_context: shot.consistency_context || '',
+    reference_weights: shot.reference_weights || {},
+    continuity_profile: shot.continuity_profile || {},
+    continuity_reference_path: shot.continuity_reference_path || '',
+    pose_reference_path: shot.pose_reference_path || '',
+    depth_reference_path: shot.depth_reference_path || '',
+    last_frame_path: shot.last_frame_path || '',
   }
 }
 
@@ -90,20 +115,48 @@ const MainWorkspace: React.FC = () => {
     currentStep,
   } = useShotStore()
 
-  const { projectId, setProject, style, platform, outputFormat, resolution } = useProjectStore()
+  const {
+    projectId,
+    parentProjectTitle,
+    projectType,
+    title,
+    setProject,
+    style,
+    platform,
+    outputFormat,
+    resolution,
+  } = useProjectStore()
 
   const [script, setScript] = useState('')
   const [newProjectTitle, setNewProjectTitle] = useState('')
+  const [newEpisodeTitle, setNewEpisodeTitle] = useState('第 1 集')
+  const [episodeTitleDraft, setEpisodeTitleDraft] = useState(title)
   const [showCreatePanel, setShowCreatePanel] = useState(false)
   const [creatingProject, setCreatingProject] = useState(false)
   const [loading, setLoading] = useState(false)
   const [autoWriting, setAutoWriting] = useState(false)
   const [uploading, setUploading] = useState(false)
   const [confirming, setConfirming] = useState(false)
+  const [composing, setComposing] = useState(false)
   const [generatingStoryboard, setGeneratingStoryboard] = useState(false)
   const [assetBoard, setAssetBoard] = useState<{ characters: any[]; scenes: any[] } | null>(null)
   const [assetBoardReady, setAssetBoardReady] = useState(false)
   const [assetTab, setAssetTab] = useState<'characters' | 'scenes'>('characters')
+  const [styleTemplates, setStyleTemplates] = useState<StyleOption[]>(STYLE_OPTIONS)
+  const [showSettingsPanel, setShowSettingsPanel] = useState(false)
+  const [customStyleName, setCustomStyleName] = useState('')
+  const [customStyleKeywords, setCustomStyleKeywords] = useState('')
+  const [customStyleNegative, setCustomStyleNegative] = useState('')
+  const [savingStyleTemplate, setSavingStyleTemplate] = useState(false)
+  const [editingAssetId, setEditingAssetId] = useState<string | null>(null)
+  const [assetDraft, setAssetDraft] = useState<Record<string, any>>({})
+  const [savingAsset, setSavingAsset] = useState(false)
+  const [shotPromptDraft, setShotPromptDraft] = useState('')
+  const [shotSceneDraft, setShotSceneDraft] = useState('')
+  const [shotActionDraft, setShotActionDraft] = useState('')
+  const [shotCameraDraft, setShotCameraDraft] = useState('')
+  const [regeneratingShot, setRegeneratingShot] = useState(false)
+  const [workspaceTab, setWorkspaceTab] = useState<WorkspaceTab>('script')
   const [previewMode, setPreviewMode] = useState<'shot' | 'video'>('shot')
   const [previewScale, setPreviewScale] = useState(1)
   const [previewOffset, setPreviewOffset] = useState({ x: 0, y: 0 })
@@ -129,7 +182,11 @@ const MainWorkspace: React.FC = () => {
     () => shots.filter((shot) => shot.confirmed).length,
     [shots],
   )
-  const allStoryboardApproved = shots.length > 0 && shots.every((shot) => shot.confirmed)
+  const selectedShotVideoUrl = selectedShot?.video_path ? toOutputUrl(selectedShot.video_path) : null
+  const allShotVideosReady = useMemo(
+    () => shots.length > 0 && shots.every((shot) => Boolean(shot.video_path)),
+    [shots],
+  )
 
   const replaceShots = (nextShots: any[]) => {
     const normalized = nextShots.map(normalizeShot).filter((s) => s.id)
@@ -149,6 +206,31 @@ const MainWorkspace: React.FC = () => {
     const board = await assetApi.board(pid)
     setAssetBoard({ characters: board.characters || [], scenes: board.scenes || [] })
     return board
+  }
+
+  const loadStyleTemplates = async () => {
+    const result = await settingsApi.styleTemplates()
+    if (Array.isArray(result.templates)) {
+      setStyleTemplates(result.templates)
+    }
+  }
+
+  const applyProjectDetail = (projectDetail: any) => {
+    setProject({
+      projectId: projectDetail.id,
+      parentProjectId: projectDetail.parent_project_id || '',
+      parentProjectTitle: projectDetail.parent_project_title || '',
+      projectType: projectDetail.project_type || 'series',
+      episodeNumber: projectDetail.episode_number || 0,
+      title: projectDetail.title,
+      genre: projectDetail.genre,
+      style: projectDetail.style || style,
+      status: projectDetail.status,
+      outputFormat: projectDetail.output_format || outputFormat,
+      resolution: projectDetail.resolution || resolution,
+      platform: projectDetail.platform || platform,
+    })
+    setEpisodeTitleDraft(projectDetail.title || '')
   }
 
   const connectWebSocket = (pid: string) => {
@@ -176,6 +258,7 @@ const MainWorkspace: React.FC = () => {
           setLoading(false)
           setAssetBoardReady(true)
           setAwaitingStoryboardConfirm(false)
+          setWorkspaceTab('assets')
           void loadProjectShots(pid)
           void loadAssetBoard(pid)
           message.info('角色板和场景板已生成，请确认素材后生成故事板')
@@ -187,8 +270,9 @@ const MainWorkspace: React.FC = () => {
           setLoading(false)
           setGeneratingStoryboard(false)
           setAwaitingStoryboardConfirm(true)
+          setWorkspaceTab('review')
           void loadProjectShots(pid)
-          message.info('故事板已生成，请审核后触发成片')
+          message.info('故事板已生成，请逐镜头审核并生成视频')
           return
         }
 
@@ -212,8 +296,22 @@ const MainWorkspace: React.FC = () => {
           image_path: data.image_path || '',
           storyboard_path: data.storyboard_path || data.image_path || '',
           video_path: data.video_path || '',
+          audio_path: data.audio_path || '',
           storyboard_status: data.storyboard_status || 'done',
+          scene_group_id: data.scene_group_id || '',
+          reference_weights: data.reference_weights || {},
+          continuity_profile: data.continuity_profile || {},
+          continuity_reference_path: data.continuity_reference_path || '',
+          pose_reference_path: data.pose_reference_path || '',
+          depth_reference_path: data.depth_reference_path || '',
+          last_frame_path: data.last_frame_path || '',
         })
+        if (data.video_path) {
+          setGenerating(false)
+          setPreviewMode('video')
+          setWorkspaceTab('video')
+          void loadProjectShots(pid)
+        }
         return
       }
 
@@ -225,6 +323,7 @@ const MainWorkspace: React.FC = () => {
           setLoading(false)
           setAssetBoardReady(true)
           setAwaitingStoryboardConfirm(false)
+          setWorkspaceTab('assets')
           if (Array.isArray(data.shots) && data.shots.length > 0) {
             replaceShots(data.shots)
           }
@@ -237,6 +336,7 @@ const MainWorkspace: React.FC = () => {
           setLoading(false)
           setAwaitingStoryboardConfirm(true)
           setPreviewMode('shot')
+          setWorkspaceTab('review')
           if (Array.isArray(data.shots) && data.shots.length > 0) {
             replaceShots(data.shots)
           }
@@ -252,6 +352,7 @@ const MainWorkspace: React.FC = () => {
         if (data.video_path) {
           setVideoPath(data.video_path)
           setPreviewMode('video')
+          setWorkspaceTab('video')
         }
 
         if (Array.isArray(data.shots) && data.shots.length > 0) {
@@ -270,6 +371,7 @@ const MainWorkspace: React.FC = () => {
         setGeneratingStoryboard(false)
         setAwaitingStoryboardConfirm(true)
         setAssetBoardReady(false)
+        setWorkspaceTab('review')
         void loadProjectShots(pid)
         return
       }
@@ -278,6 +380,7 @@ const MainWorkspace: React.FC = () => {
         appendLog(`[${ts}] 成片导出完成`)
         setVideoPath(data.video_url)
         setPreviewMode('video')
+        setWorkspaceTab('video')
         setGenerating(false)
         setLoading(false)
         setProgress(100, 'quality_check')
@@ -304,26 +407,18 @@ const MainWorkspace: React.FC = () => {
 
     const project = await projectApi.create({
       title: script.trim() ? script.slice(0, 20) : '未命名项目',
+      first_episode_title: '第 1 集',
       style,
       genre: '',
     })
+    const activeProject = project.first_episode || project
 
-    setProject({
-      projectId: project.id,
-      parentProjectId: project.parent_project_id || '',
-      projectType: project.project_type || 'series',
-      episodeNumber: project.episode_number || 0,
-      title: project.title,
-      style,
-      outputFormat,
-      resolution,
-      platform,
-    })
+    applyProjectDetail(activeProject)
 
-    return project.id as string
+    return activeProject.id as string
   }
 
-  const updateProjectField = async (field: 'style' | 'resolution', value: string) => {
+  const updateProjectField = async (field: 'style' | 'resolution' | 'title', value: string) => {
     setProject({ [field]: value } as any)
     if (!projectId) return
 
@@ -334,23 +429,127 @@ const MainWorkspace: React.FC = () => {
     }
   }
 
+  const handleSaveCustomStyle = async () => {
+    if (!customStyleName.trim() || !customStyleKeywords.trim()) {
+      message.warning('请输入模板名称和画风关键词')
+      return
+    }
+    try {
+      setSavingStyleTemplate(true)
+      const template = await settingsApi.createStyleTemplate({
+        label: customStyleName,
+        keywords: customStyleKeywords,
+        negative_prompt: customStyleNegative,
+      })
+      await loadStyleTemplates()
+      await updateProjectField('style', template.value)
+      setCustomStyleName('')
+      setCustomStyleKeywords('')
+      setCustomStyleNegative('')
+      message.success('自定义画风模板已保存')
+    } catch (err: any) {
+      message.error('保存画风模板失败：' + (err.message || '未知错误'))
+    } finally {
+      setSavingStyleTemplate(false)
+    }
+  }
+
+  const startEditAsset = (item: any) => {
+    setEditingAssetId(item.id)
+    setAssetDraft({
+      ...item,
+      appearanceText: item.appearance?.description || item.appearance?.default_outfit || '',
+      keyFeaturesText: Array.isArray(item.key_features) ? item.key_features.join('\n') : '',
+    })
+  }
+
+  const updateAssetDraft = (key: string, value: any) => {
+    setAssetDraft((draft) => ({ ...draft, [key]: value }))
+  }
+
+  const handleSaveAsset = async (regenerate = false) => {
+    if (!projectId || !editingAssetId) return
+    try {
+      setSavingAsset(true)
+      const keyFeatures = String(assetDraft.keyFeaturesText || '')
+        .split('\n')
+        .map((item) => item.trim())
+        .filter(Boolean)
+      const payload =
+        assetTab === 'characters'
+          ? {
+              name: assetDraft.name || '',
+              appearance: { ...(assetDraft.appearance || {}), description: assetDraft.appearanceText || '' },
+              personality: assetDraft.personality || '',
+              visual_prompt: assetDraft.visual_prompt || '',
+              negative_prompt: assetDraft.negative_prompt || '',
+              voice_id: assetDraft.voice_id || '',
+              key_features: keyFeatures,
+              default_outfit: assetDraft.default_outfit || '',
+              lora_profile: assetDraft.lora_profile || '',
+              ip_adapter_profile: assetDraft.ip_adapter_profile || '',
+              wardrobe_lock: assetDraft.wardrobe_lock || '',
+              seed: String(assetDraft.seed || '42'),
+              regenerate,
+            }
+          : {
+              name: assetDraft.name || '',
+              description: assetDraft.description || '',
+              visual_prompt: assetDraft.visual_prompt || '',
+              negative_prompt: assetDraft.negative_prompt || '',
+              key_features: keyFeatures,
+              scene_group_key: assetDraft.scene_group_key || '',
+              time_of_day: assetDraft.time_of_day || '',
+              prop_lock: assetDraft.prop_lock || '',
+              seed: Number(assetDraft.seed || 1200),
+              regenerate,
+            }
+      const updated =
+        assetTab === 'characters'
+          ? await assetApi.updateCharacter(editingAssetId, payload)
+          : await assetApi.updateScene(editingAssetId, payload)
+      setAssetBoard((board) => {
+        if (!board) return board
+        const key = assetTab
+        return {
+          ...board,
+          [key]: board[key].map((item: any) => (item.id === editingAssetId ? updated : item)),
+        }
+      })
+      setEditingAssetId(null)
+      setAssetDraft({})
+      message.success(regenerate ? '素材已更新并重生成' : '素材已保存')
+    } catch (err: any) {
+      message.error('素材保存失败：' + (err.message || '未知错误'))
+    } finally {
+      setSavingAsset(false)
+    }
+  }
+
+  const commitEpisodeTitle = async () => {
+    const nextTitle = episodeTitleDraft.trim() || title || '第 1 集'
+    setEpisodeTitleDraft(nextTitle)
+    if (nextTitle !== title) {
+      await updateProjectField('title', nextTitle)
+    }
+  }
+
   const handleCreateProject = async () => {
     try {
       setCreatingProject(true)
       const title = newProjectTitle.trim() || '未命名项目'
-      const project = await projectApi.create({ title, style, genre: '' })
-
-      setProject({
-        projectId: project.id,
-        parentProjectId: project.parent_project_id || '',
-        projectType: project.project_type || 'series',
-        episodeNumber: project.episode_number || 0,
-        title: project.title,
+      const project = await projectApi.create({
+        title,
+        first_episode_title: newEpisodeTitle.trim() || '第 1 集',
         style,
-        outputFormat,
+        genre: '',
+        output_format: outputFormat,
         resolution,
         platform,
       })
+      const activeProject = project.first_episode || project
+
+      applyProjectDetail(activeProject)
 
       setShots([])
       selectShot(null)
@@ -360,10 +559,12 @@ const MainWorkspace: React.FC = () => {
       setAssetBoard(null)
       setVideoPath('')
       setProgress(0, '')
+      setWorkspaceTab('script')
       clearLogs()
       setNewProjectTitle('')
+      setNewEpisodeTitle('第 1 集')
       setShowCreatePanel(false)
-      message.success('新建项目成功')
+      message.success('新建项目成功，已自动创建第一集')
     } catch (err: any) {
       message.error('新建项目失败：' + (err.message || '未知错误'))
     } finally {
@@ -383,6 +584,7 @@ const MainWorkspace: React.FC = () => {
     setAssetBoardReady(false)
     setVideoPath('')
     setPreviewMode('shot')
+    setWorkspaceTab('script')
     clearLogs()
     setProgress(0, 'parse_script')
 
@@ -419,6 +621,7 @@ const MainWorkspace: React.FC = () => {
       setAssetBoardReady(false)
       setVideoPath('')
       clearLogs()
+      setWorkspaceTab('script')
       setProgress(0, 'generate_script')
 
       const pid = await ensureProject()
@@ -452,6 +655,7 @@ const MainWorkspace: React.FC = () => {
       setAssetBoardReady(false)
       setVideoPath('')
       setPreviewMode('shot')
+      setWorkspaceTab('script')
       clearLogs()
       setProgress(0, 'parse_script')
 
@@ -466,7 +670,10 @@ const MainWorkspace: React.FC = () => {
       formData.append('resolution', resolution)
       formData.append('platform', platform)
 
-      await scriptApi.upload(formData)
+      const result = await scriptApi.upload(formData)
+      if (typeof result.script === 'string') {
+        setScript(result.script)
+      }
       appendLog(`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] 已上传剧本：${file.name}`)
       message.success('剧本上传成功')
     } catch (err: any) {
@@ -477,29 +684,57 @@ const MainWorkspace: React.FC = () => {
     }
   }
 
-  const handleConfirmStoryboard = async () => {
-    if (!projectId) return
+  const handleGenerateSelectedShotVideo = async () => {
+    if (!projectId || !selectedShot) return
 
     try {
       setConfirming(true)
-      const pending = shots.filter((shot) => !shot.confirmed)
-      if (pending.length) {
-        message.warning('请先逐项审核所有故事板')
+      if (!selectedShot.confirmed) {
+        message.warning('请先审核通过当前镜头故事板')
+        return
+      }
+      if (!(selectedShot.storyboard_path || selectedShot.image_path)) {
+        message.warning('当前镜头尚未生成定稿故事板')
         return
       }
       setGenerating(true)
       setPreviewMode('shot')
+      setWorkspaceTab('video')
       connectWebSocket(projectId)
-      // 第二阶段：用户确认分镜后继续画面、语音与合成流程。
-      await shotApi.confirmStoryboard(projectId)
+      await shotApi.generateVideo(selectedShot.id, Boolean(selectedShot.video_path))
       setAwaitingStoryboardConfirm(false)
-      appendLog(`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] 已确认分镜，进入第二阶段`)
-      message.success('分镜确认成功，继续生成')
+      appendLog(`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] 已提交镜头 ${selectedShot.sequence} 视频生成`)
+      message.success('当前镜头视频生成已启动')
     } catch (err: any) {
-      message.error('确认分镜失败：' + (err.message || '未知错误'))
+      message.error('镜头视频生成失败：' + (err.message || '未知错误'))
       setGenerating(false)
     } finally {
       setConfirming(false)
+    }
+  }
+
+  const handleComposeProjectVideo = async () => {
+    if (!projectId) return
+    if (!allShotVideosReady) {
+      message.warning('请先完成每个镜头的视频生成')
+      return
+    }
+
+    try {
+      setComposing(true)
+      setGenerating(true)
+      setPreviewMode('video')
+      setWorkspaceTab('video')
+      setProgress(92, 'compose_video')
+      connectWebSocket(projectId)
+      await renderApi.start({ project_id: projectId, output_format: outputFormat, resolution })
+      appendLog(`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] 已提交成片合成任务`)
+      message.success('成片合成已启动')
+    } catch (err: any) {
+      message.error('成片合成失败：' + (err.message || '未知错误'))
+      setGenerating(false)
+    } finally {
+      setComposing(false)
     }
   }
 
@@ -510,6 +745,48 @@ const MainWorkspace: React.FC = () => {
       message.success(approved ? '该镜头已通过审核' : '已标记为需调整')
     } catch (err: any) {
       message.error('审核操作失败：' + (err.message || '未知错误'))
+    }
+  }
+
+  const handleRegenerateSelectedShot = async () => {
+    if (!projectId || !selectedShot) return
+    if (selectedShot.confirmed) {
+      message.warning('已审批锁定的镜头不可改动或重生成')
+      return
+    }
+    try {
+      setRegeneratingShot(true)
+      setGenerating(true)
+      setPreviewMode('shot')
+      setWorkspaceTab('review')
+      connectWebSocket(projectId)
+      await shotApi.regenerate(selectedShot.id, {
+        prompt: shotPromptDraft,
+        visual_notes: shotPromptDraft,
+        new_scene: shotSceneDraft,
+        new_camera_angle: shotCameraDraft,
+        character_action: shotActionDraft,
+        reason: shotPromptDraft,
+      })
+      updateShot(selectedShot.id, {
+        scene_description: shotSceneDraft,
+        character_action: shotActionDraft,
+        camera_angle: shotCameraDraft,
+        confirmed: false,
+        status: 'pending',
+        storyboard_status: 'queued',
+        storyboard_path: '',
+        image_path: '',
+        video_path: '',
+        audio_path: '',
+      })
+      appendLog(`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] 已提交镜头 ${selectedShot.sequence} 重生成`)
+      message.success('镜头重生成已启动')
+    } catch (err: any) {
+      message.error('镜头重生成失败：' + (err.message || '未知错误'))
+      setGenerating(false)
+    } finally {
+      setRegeneratingShot(false)
     }
   }
 
@@ -544,9 +821,10 @@ const MainWorkspace: React.FC = () => {
       setGeneratingStoryboard(true)
       setGenerating(true)
       setAwaitingStoryboardConfirm(false)
+      setWorkspaceTab('storyboard')
       connectWebSocket(projectId)
       await shotApi.generateStoryboard(projectId)
-      appendLog(`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] 已确认素材，开始生成线稿故事板`)
+      appendLog(`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] 已确认素材，开始生成定稿故事板参考图`)
       message.success('故事板任务已启动')
     } catch (err: any) {
       message.error('故事板生成失败：' + (err.message || '未知错误'))
@@ -566,26 +844,58 @@ const MainWorkspace: React.FC = () => {
   }, [awaitingStoryboardConfirm, currentStep])
 
   useEffect(() => {
+    setEpisodeTitleDraft(title)
+  }, [title])
+
+  useEffect(() => {
     const onParse = () => {
       void generateRef.current()
     }
 
     const onOpenCreateProject = () => {
+      setWorkspaceTab('script')
       setShowCreatePanel(true)
+    }
+
+    const onOpenSettings = () => {
+      setShowSettingsPanel(true)
+      void loadStyleTemplates().catch(() => undefined)
     }
 
     window.addEventListener(PARSE_SCRIPT_EVENT, onParse)
     window.addEventListener(OPEN_CREATE_PROJECT_EVENT, onOpenCreateProject)
+    window.addEventListener(OPEN_SETTINGS_EVENT, onOpenSettings)
     return () => {
       window.removeEventListener(PARSE_SCRIPT_EVENT, onParse)
       window.removeEventListener(OPEN_CREATE_PROJECT_EVENT, onOpenCreateProject)
+      window.removeEventListener(OPEN_SETTINGS_EVENT, onOpenSettings)
     }
   }, [])
+
+  useEffect(() => {
+    void loadStyleTemplates().catch(() => undefined)
+  }, [])
+
+  useEffect(() => {
+    setShotPromptDraft(selectedShot?.consistency_context || selectedShot?.scene_description || '')
+    setShotSceneDraft(selectedShot?.scene_description || '')
+    setShotActionDraft(selectedShot?.character_action || '')
+    setShotCameraDraft(selectedShot?.camera_angle || '')
+  }, [selectedShot?.id])
 
   useEffect(() => {
     if (!projectId) return
 
     connectWebSocket(projectId)
+    projectApi.get(projectId)
+      .then((projectDetail) => {
+        applyProjectDetail(projectDetail)
+        setScript(projectDetail.input_text || '')
+        if (projectDetail.video_path) {
+          setVideoPath(projectDetail.video_path)
+        }
+      })
+      .catch(() => undefined)
     void loadProjectShots(projectId).catch(() => undefined)
     void loadAssetBoard(projectId).catch(() => undefined)
     return () => {
@@ -601,6 +911,7 @@ const MainWorkspace: React.FC = () => {
       ? `${API_OUTPUT_BASE}${videoPath.replace('/output/', '')}`
       : toOutputUrl(videoPath)
     : null
+  const currentVideoUrl = selectedShotVideoUrl || videoUrl
 
   useEffect(() => {
     resetPreviewTransform()
@@ -618,9 +929,121 @@ const MainWorkspace: React.FC = () => {
     )
   }
 
+  const selectedShotReady = Boolean(selectedShot && (selectedShot.storyboard_path || selectedShot.image_path))
+  const showPreviewSurface = workspaceTab === 'storyboard' || workspaceTab === 'review' || workspaceTab === 'video'
+
   return (
-    <section className="main-workspace" aria-label="主工作区">
-      <div className="script-panel panel-enter">
+    <section className="main-workspace tabbed-workspace" aria-label="主工作区">
+      <div className="workspace-tabbar" role="tablist" aria-label="工作区模块">
+        {WORKSPACE_TABS.map((tab) => {
+          const active = workspaceTab === tab.id
+          const tabMeta =
+            tab.id === 'review' && shots.length > 0
+              ? `${approvedShotCount}/${shots.length}`
+              : tab.id === 'assets' && (assetBoardReady || assetBoard)
+                ? '已就绪'
+                : tab.id === 'video' && currentVideoUrl
+                  ? '可预览'
+                  : ''
+
+          return (
+            <button
+              key={tab.id}
+              type="button"
+              role="tab"
+              aria-selected={active}
+              className={`workspace-tab${active ? ' active' : ''}`}
+              onClick={() => {
+                setWorkspaceTab(tab.id)
+                if (tab.id === 'video' && currentVideoUrl) {
+                  setPreviewMode('video')
+                }
+                if (tab.id === 'storyboard' || tab.id === 'review') {
+                  setPreviewMode('shot')
+                }
+              }}
+            >
+              <span>{tab.label}</span>
+              {tabMeta && <em>{tabMeta}</em>}
+            </button>
+          )
+        })}
+      </div>
+
+      {showSettingsPanel && (
+        <div className="system-settings-panel panel-enter" role="region" aria-label="系统设置">
+          <div className="settings-head">
+            <div>
+              <strong>系统设置</strong>
+              <span>画风模板会直接进入素材和分镜生成链路。</span>
+            </div>
+            <Button size="small" onClick={() => setShowSettingsPanel(false)}>收起</Button>
+          </div>
+          <div className="settings-grid">
+            <div className="settings-field">
+              <span>当前画风</span>
+              <Select
+                value={style}
+                size="small"
+                onChange={(value) => void updateProjectField('style', value)}
+                options={styleTemplates.map((item) => ({
+                  value: item.value,
+                  label: item.custom ? `${item.label}（自定义）` : item.label,
+                }))}
+              />
+            </div>
+            <div className="settings-field">
+              <span>模板名称</span>
+              <Input size="small" value={customStyleName} onChange={(event) => setCustomStyleName(event.target.value)} />
+            </div>
+            <div className="settings-field wide">
+              <span>自定义画风关键词</span>
+              <TextArea
+                autoSize={{ minRows: 2, maxRows: 4 }}
+                value={customStyleKeywords}
+                onChange={(event) => setCustomStyleKeywords(event.target.value)}
+                placeholder="例如：柔和水彩、低饱和校园光、干净线稿、统一暖色后期"
+              />
+            </div>
+            <div className="settings-field wide">
+              <span>负向关键词</span>
+              <Input
+                size="small"
+                value={customStyleNegative}
+                onChange={(event) => setCustomStyleNegative(event.target.value)}
+                placeholder="例如：过曝、脏乱笔触、文字、水印"
+              />
+            </div>
+            <Button type="primary" size="small" loading={savingStyleTemplate} onClick={() => void handleSaveCustomStyle()}>
+              保存为模板
+            </Button>
+          </div>
+        </div>
+      )}
+
+      <div className="workspace-tab-body">
+        {workspaceTab === 'script' && (
+          <div className="script-panel panel-enter" role="tabpanel">
+        <div className="script-scope-bar">
+          <div className="script-scope-copy">
+            <span>{parentProjectTitle || (projectType === 'series' ? title : '未选择大项目')}</span>
+            <strong>{projectType === 'episode' ? '当前剧集' : '当前项目'}</strong>
+          </div>
+          <Input
+            size="small"
+            value={episodeTitleDraft}
+            className="episode-title-input"
+            placeholder="请输入剧集名称"
+            onChange={(event) => setEpisodeTitleDraft(event.target.value)}
+            onBlur={() => void commitEpisodeTitle()}
+            onPressEnter={() => void commitEpisodeTitle()}
+          />
+        </div>
+        <div className="workflow-rail" aria-label="创作流程">
+          {['新建剧集', '上传剧本', 'AI解析', '资产板', '批量分镜', '逐镜审核', '生成视频'].map((item) => (
+            <span key={item}>{item}</span>
+          ))}
+        </div>
         <div className="workspace-toolbar">
           <div className="workspace-toolbar-controls">
             <div className="toolbar-field">
@@ -628,15 +1051,16 @@ const MainWorkspace: React.FC = () => {
               <Select
                 value={style}
                 size="small"
-                style={{ width: 140 }}
+                style={{ width: 160 }}
                 onChange={(v) => void updateProjectField('style', v)}
-                options={[
-                  { value: 'anime', label: '日系写实漫' },
-                  { value: 'chinese', label: '国漫厚涂' },
-                  { value: 'chibi', label: '简约条漫' },
-                  { value: 'realistic', label: '电影写实' },
-                ]}
+                options={styleTemplates.map((item) => ({
+                  value: item.value,
+                  label: item.custom ? `${item.label}（自定义）` : item.label,
+                }))}
               />
+              <em className="toolbar-hint">
+                {STYLE_DESCRIPTIONS[style] || styleTemplates.find((item) => item.value === style)?.keywords || STYLE_DESCRIPTIONS.anime}
+              </em>
             </div>
             <div className="toolbar-field">
               <span className="toolbar-label">分辨率</span>
@@ -669,65 +1093,17 @@ const MainWorkspace: React.FC = () => {
                 onChange={(e) => setNewProjectTitle(e.target.value)}
                 onPressEnter={() => void handleCreateProject()}
               />
+              <Input
+                value={newEpisodeTitle}
+                placeholder="请输入第一集名称"
+                onChange={(e) => setNewEpisodeTitle(e.target.value)}
+                onPressEnter={() => void handleCreateProject()}
+              />
               <Button type="primary" loading={creatingProject} onClick={() => void handleCreateProject()}>
                 确认创建
               </Button>
               <Button onClick={() => setShowCreatePanel(false)}>取消</Button>
             </div>
-          </div>
-        )}
-
-        {(assetBoardReady || assetBoard) && (
-          <div className="asset-board-panel">
-            <div className="asset-board-copy">
-              <div className="asset-board-title">项目素材板</div>
-              <div className="asset-board-note">
-                角色与场景将作为项目级素材复用到本集故事板和后续成片。
-              </div>
-            </div>
-            <div className="asset-board-lists">
-              <div className="asset-tabs" aria-label="素材类型">
-                <button type="button" className={assetTab === 'characters' ? 'active' : ''} onClick={() => setAssetTab('characters')}>
-                  角色板
-                </button>
-                <button type="button" className={assetTab === 'scenes' ? 'active' : ''} onClick={() => setAssetTab('scenes')}>
-                  场景板
-                </button>
-              </div>
-              <div className="asset-card-strip">
-                {assetItems.slice(0, 4).map((item) => (
-                  <div className="asset-mini-card" key={item.id}>
-                    <div className="asset-thumb">
-                      {assetTab === 'characters'
-                        ? renderReferencePreview(item, '三视图待生成')
-                        : renderReferencePreview(item, '场景预览待生成')}
-                    </div>
-                    <div className="asset-mini-content">
-                      <strong>{item.name}</strong>
-                      <span>{assetTab === 'characters' ? (item.personality || '性格待补充') : (item.description || '场景描述待补充')}</span>
-                      {assetTab === 'characters' ? (
-                        <>
-                          <em>音色：{item.voice_id || 'Mimo 默认音色'}</em>
-                          <em>人设：{item.appearance?.description || item.visual_prompt || '待补充'}</em>
-                        </>
-                      ) : (
-                        <em>{item.visual_prompt || '视觉提示词待补充'}</em>
-                      )}
-                    </div>
-                  </div>
-                ))}
-                {!assetItems.length && <div className="asset-empty-card">素材生成后会在这里预览</div>}
-              </div>
-            </div>
-            <Button
-              type="primary"
-              size="small"
-              loading={generatingStoryboard}
-              disabled={!shots.length}
-              onClick={() => void handleGenerateStoryboard()}
-            >
-              生成故事板
-            </Button>
           </div>
         )}
 
@@ -761,7 +1137,7 @@ const MainWorkspace: React.FC = () => {
               loading={loading}
               size="small"
             >
-              生成分镜
+              AI解析剧本
             </Button>
 
             <Button
@@ -788,9 +1164,187 @@ const MainWorkspace: React.FC = () => {
             />
           </div>
         </div>
-      </div>
+          </div>
+        )}
 
-      <div className="preview-panel panel-enter">
+        {workspaceTab === 'assets' && (
+          <div className="asset-page panel-enter" role="tabpanel">
+            <div className="asset-page-head">
+              <div>
+                <div className="asset-board-title">项目素材板</div>
+                <div className="asset-board-note">
+                  角色与场景将作为项目级素材复用到本集故事板和后续成片。
+                </div>
+              </div>
+              <Button
+                type="primary"
+                size="small"
+                loading={generatingStoryboard}
+                disabled={!shots.length}
+                onClick={() => void handleGenerateStoryboard()}
+              >
+                批量生成分镜
+              </Button>
+            </div>
+
+            {(assetBoardReady || assetBoard) ? (
+              <div className="asset-board-panel asset-page-board">
+                <div className="asset-board-lists">
+                  <div className="asset-tabs" aria-label="素材类型">
+                    <button type="button" className={assetTab === 'characters' ? 'active' : ''} onClick={() => setAssetTab('characters')}>
+                      角色板
+                    </button>
+                    <button type="button" className={assetTab === 'scenes' ? 'active' : ''} onClick={() => setAssetTab('scenes')}>
+                      场景板
+                    </button>
+                  </div>
+                  <div className="asset-card-strip asset-page-strip">
+                    {assetItems.map((item) => (
+                      <div className="asset-mini-card" key={item.id}>
+                        <div className="asset-thumb">
+                          {assetTab === 'characters'
+                            ? renderReferencePreview(item, '三视图待生成')
+                            : renderReferencePreview(item, '场景预览待生成')}
+                        </div>
+                        {editingAssetId === item.id ? (
+                          <div className="asset-edit-form">
+                            <Input size="small" value={assetDraft.name || ''} onChange={(event) => updateAssetDraft('name', event.target.value)} />
+                            <TextArea
+                              autoSize={{ minRows: 2, maxRows: 4 }}
+                              value={assetTab === 'characters' ? assetDraft.personality || '' : assetDraft.description || ''}
+                              onChange={(event) => updateAssetDraft(assetTab === 'characters' ? 'personality' : 'description', event.target.value)}
+                            />
+                            <TextArea
+                              autoSize={{ minRows: 2, maxRows: 5 }}
+                              value={assetDraft.visual_prompt || ''}
+                              onChange={(event) => updateAssetDraft('visual_prompt', event.target.value)}
+                              placeholder="视觉提示词"
+                            />
+                            <Input
+                              size="small"
+                              value={assetDraft.negative_prompt || ''}
+                              onChange={(event) => updateAssetDraft('negative_prompt', event.target.value)}
+                              placeholder="负向提示词"
+                            />
+                            <Input
+                              size="small"
+                              value={assetTab === 'characters' ? assetDraft.default_outfit || '' : assetDraft.prop_lock || ''}
+                              onChange={(event) => updateAssetDraft(assetTab === 'characters' ? 'default_outfit' : 'prop_lock', event.target.value)}
+                              placeholder={assetTab === 'characters' ? '服装锁定' : '道具/光源锁定'}
+                            />
+                            <div className="asset-edit-actions">
+                              <Button size="small" icon={<SaveOutlined />} loading={savingAsset} onClick={() => void handleSaveAsset(false)}>
+                                保存
+                              </Button>
+                              <Button size="small" type="primary" icon={<ReloadOutlined />} loading={savingAsset} onClick={() => void handleSaveAsset(true)}>
+                                保存并重生成
+                              </Button>
+                              <Button size="small" onClick={() => setEditingAssetId(null)}>取消</Button>
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="asset-mini-content">
+                            <div className="asset-mini-title-row">
+                              <strong>{item.name}</strong>
+                              <Button size="small" icon={<EditOutlined />} onClick={() => startEditAsset(item)}>
+                                编辑
+                              </Button>
+                            </div>
+                            <span>{assetTab === 'characters' ? (item.personality || '性格待补充') : (item.description || '场景描述待补充')}</span>
+                            {assetTab === 'characters' ? (
+                              <>
+                                <em>音色：{item.voice_id || 'Mimo 默认音色'}</em>
+                                <em>人设：{item.appearance?.description || item.visual_prompt || '待补充'}</em>
+                              </>
+                            ) : (
+                              <em>{item.visual_prompt || '视觉提示词待补充'}</em>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                    {!assetItems.length && <div className="asset-empty-card">素材生成后会在这里预览</div>}
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="asset-empty-state">素材生成后会在这里集中管理</div>
+            )}
+          </div>
+        )}
+
+        {showPreviewSurface && (
+          <>
+            {workspaceTab === 'review' && (
+              <div className="review-command-bar panel-enter" role="region" aria-label="分镜审核操作">
+                <div className="review-shot-state">
+                  <span>当前镜头 {selectedShot ? String(selectedShot.sequence || 1).padStart(2, '0') : '--'}</span>
+                  <strong className={selectedShot?.confirmed ? 'approved' : 'pending'}>
+                    {selectedShot?.confirmed ? '已过审' : '待审核'}
+                  </strong>
+                </div>
+                <div className="review-actions">
+                  <Button
+                    type="primary"
+                    className="review-approve-main"
+                    icon={<CheckCircleOutlined />}
+                    disabled={!selectedShot || !selectedShotReady || selectedShot.confirmed}
+                    onClick={() => selectedShot && void handleApproveShot(selectedShot.id, true)}
+                  >
+                    {selectedShot?.confirmed ? '已通过审批' : '通过当前镜头'}
+                  </Button>
+                  <Button
+                    disabled={!selectedShot || !selectedShotReady}
+                    onClick={() => selectedShot && void handleApproveShot(selectedShot.id, false)}
+                  >
+                    退回调整
+                  </Button>
+                  <Button
+                    type="primary"
+                    className="shot-video-action"
+                    loading={confirming}
+                    disabled={!selectedShot || !selectedShot.confirmed}
+                    onClick={handleGenerateSelectedShotVideo}
+                  >
+                    {selectedShot?.video_path ? '重新生成本镜头' : '生成本镜头视频'}
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            {workspaceTab === 'review' && selectedShot && (
+              <div className={`shot-regenerate-panel panel-enter${selectedShot.confirmed ? ' locked' : ''}`}>
+                {selectedShot.confirmed ? (
+                  <div className="shot-lock-note">该镜头已审批锁定，禁止修改 Prompt 或重生成。</div>
+                ) : (
+                  <>
+                    <TextArea
+                      autoSize={{ minRows: 2, maxRows: 4 }}
+                      value={shotPromptDraft}
+                      onChange={(event) => setShotPromptDraft(event.target.value)}
+                      placeholder="单独调整当前镜头 Prompt，不覆盖项目一致性 SOP"
+                    />
+                    <div className="shot-regenerate-grid">
+                      <Input size="small" value={shotSceneDraft} onChange={(event) => setShotSceneDraft(event.target.value)} placeholder="场景描述" />
+                      <Input size="small" value={shotActionDraft} onChange={(event) => setShotActionDraft(event.target.value)} placeholder="人物动作" />
+                      <Input size="small" value={shotCameraDraft} onChange={(event) => setShotCameraDraft(event.target.value)} placeholder="机位角度" />
+                      <Button
+                        type="primary"
+                        size="small"
+                        icon={<ReloadOutlined />}
+                        loading={regeneratingShot}
+                        disabled={!selectedShotReady}
+                        onClick={() => void handleRegenerateSelectedShot()}
+                      >
+                        重生成当前镜头
+                      </Button>
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+
+            <div className="preview-panel panel-enter" role="tabpanel">
         <div
           className={`preview-stage${dragStart ? ' dragging' : ''}`}
           onMouseDown={beginPreviewDrag}
@@ -798,17 +1352,30 @@ const MainWorkspace: React.FC = () => {
           onMouseUp={() => setDragStart(null)}
           onMouseLeave={() => setDragStart(null)}
         >
-          {storyboardReviewVisible && (
+          {workspaceTab === 'review' && storyboardReviewVisible && (
             <div className="confirm-overlay">
               <Button
                 type="primary"
                 size="small"
+                className="shot-video-action"
                 icon={<CheckCircleOutlined />}
                 loading={confirming}
-                onClick={handleConfirmStoryboard}
+                disabled={!selectedShot || !selectedShot.confirmed}
+                onClick={handleGenerateSelectedShotVideo}
             >
-                {allStoryboardApproved ? '生成视频' : `审核后生成视频 ${approvedShotCount}/${shots.length}`}
+                {selectedShot?.video_path ? '重新生成本镜头' : selectedShot?.confirmed ? '生成本镜头视频' : `审核后生成 ${approvedShotCount}/${shots.length}`}
               </Button>
+              {allShotVideosReady && (
+                <Button
+                  type="primary"
+                  size="small"
+                  className="shot-video-action"
+                  loading={composing}
+                  onClick={handleComposeProjectVideo}
+                >
+                  合成成片
+                </Button>
+              )}
             </div>
           )}
 
@@ -828,7 +1395,7 @@ const MainWorkspace: React.FC = () => {
             </div>
           )}
 
-          {videoUrl && (
+          {currentVideoUrl && (
             <div className="preview-mode-switch" aria-label="预览模式">
               <button
                 type="button"
@@ -842,7 +1409,7 @@ const MainWorkspace: React.FC = () => {
                 className={previewMode === 'video' ? 'active' : ''}
                 onClick={() => setPreviewMode('video')}
               >
-                成片
+                视频
               </button>
             </div>
           )}
@@ -852,9 +1419,9 @@ const MainWorkspace: React.FC = () => {
               <div>{getStepLabel(currentStep)}...</div>
               <div className="preview-loading-bar" />
             </div>
-          ) : videoUrl && previewMode === 'video' ? (
+          ) : currentVideoUrl && previewMode === 'video' ? (
             <video
-              src={videoUrl}
+              src={currentVideoUrl}
               controls
               className="final-video"
               poster={imageUrl || undefined}
@@ -878,12 +1445,14 @@ const MainWorkspace: React.FC = () => {
             <div className="preview-caption">
               <div className="preview-scene">{selectedShot.scene_description}</div>
               {selectedShot.dialogue && <div className="preview-dialogue">“{selectedShot.dialogue}”</div>}
-              {storyboardReviewVisible && (selectedShot.storyboard_path || selectedShot.image_path) && (
+              {workspaceTab === 'review' && selectedShotReady && (
                 <div className="preview-approval-actions">
                   <Button
                     size="small"
+                    className="approval-pass-btn"
                     type={selectedShot.confirmed ? 'primary' : 'default'}
                     onClick={() => void handleApproveShot(selectedShot.id, true)}
+                    icon={<CheckCircleOutlined />}
                   >
                     通过此镜头
                   </Button>
@@ -914,13 +1483,19 @@ const MainWorkspace: React.FC = () => {
                   ) : (
                     <div className="thumb-index">{i + 1}</div>
                   )}
+                  <span className={`thumb-approval-badge${shot.confirmed ? ' approved' : ' pending'}`}>
+                    {shot.confirmed ? <CheckCircleOutlined /> : <ClockCircleOutlined />}
+                    <span>{shot.confirmed ? '已通过' : '待审核'}</span>
+                  </span>
                 </div>
               )
             })}
           </div>
         )}
+            </div>
+          </>
+        )}
       </div>
-
     </section>
   )
 }

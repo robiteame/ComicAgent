@@ -56,6 +56,7 @@ def _normalize_shots(raw_shots: list, state: AgentState) -> list[dict]:
         shots.append(
             {
                 "shot_id": item.get("shot_id") or f"{project_id}_shot_{i + 1:04d}",
+                "scene_number": int(item.get("scene_number") or item.get("source_scene_number") or min(i + 1, max(len(scenes), 1))),
                 "shot_type": item.get("shot_type") or item.get("camera_suggestion") or "medium",
                 "scene_description": item.get("scene_description") or item.get("actions") or "角色推进剧情",
                 "characters_in_scene": characters_in_scene,
@@ -89,6 +90,7 @@ def _fallback_shots(scenes: list[dict], default_character: str) -> list[dict]:
         line = dialogue[0].get("line", "") if isinstance(dialogue, list) and dialogue else ""
         shots.append(
             {
+                "scene_number": int(scene.get("scene_number") or index + 1),
                 "shot_type": shot_types[index % len(shot_types)],
                 "scene_description": scene.get("actions") or scene.get("description") or "故事场景中的关键瞬间",
                 "characters_in_scene": scene.get("characters_in_scene") or [default_character],
@@ -139,6 +141,7 @@ def _build_task_prompt(script_scenes: list, characters: list, style: str, platfo
 {{
   "shots": [
     {{
+      "scene_number": 1,
       "shot_type": "wide/medium/close-up/extreme_close",
       "scene_description": "画面描述",
       "characters_in_scene": ["角色名"],
@@ -153,4 +156,6 @@ def _build_task_prompt(script_scenes: list, characters: list, style: str, platfo
     }}
   ]
 }}
+
+硬性一致性规则：同一 scene_number 属于同场景组。不得让同场景镜头出现昼夜、冷暖、光源方向、道具位置、人物站位和180度轴线跳变；Agent 会在后续生成阶段强制以场景组基准图、角色三视图和上一镜头末尾帧覆盖单镜头自定义参数。
 """

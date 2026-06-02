@@ -11,9 +11,10 @@ from __future__ import annotations
 import asyncio
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -21,6 +22,11 @@ from config import settings
 from services.llm_service import LLMService
 from services.tts_service import TTSService
 from services.video_service import SeedanceVideoService
+
+
+RUN_ID = uuid.uuid4().hex[:8]
+DIAGNOSTIC_PROJECT_ID = f"api_diagnostics_{RUN_ID}"
+DIAGNOSTIC_SHOT_ID = f"diagnostic_single_shot_{RUN_ID}"
 
 
 def _print_config() -> None:
@@ -34,7 +40,8 @@ def _print_config() -> None:
     print(f"  SEEDDANCE_BASE_URL={settings.SEEDDANCE_BASE_URL}")
     print(f"  SEEDDANCE_MODEL={settings.SEEDDANCE_MODEL}")
     print(f"  SEEDDANCE_KEY_PRESENT={bool(settings.SEEDDANCE_API_KEY or settings.ARK_API_KEY or settings.SEEDREAM_API_KEY)}")
-    print(f"  TTS_PROVIDER={settings.TTS_PROVIDER}")
+    print("  TTS_BACKEND=mimo_builtin")
+    print(f"  LEGACY_TTS_PROVIDER={settings.TTS_PROVIDER}")
 
 
 async def _check_mimo_storyboard() -> dict:
@@ -65,6 +72,7 @@ JSON 结构：
     shot = result.get("shot") or {}
     if not result.get("script") or not shot.get("scene_description") or not shot.get("dialogue"):
         raise RuntimeError(f"unexpected Mimo storyboard result: {result}")
+    shot["shot_id"] = DIAGNOSTIC_SHOT_ID
     print(f"MIMO_OK title={result.get('title', '')} dialogue={shot.get('dialogue', '')}")
     return result
 
@@ -74,8 +82,8 @@ async def _check_tts(story: dict) -> str:
     path = await TTSService().generate_dialogue(
         text=shot["dialogue"],
         emotion=shot.get("emotion", "neutral"),
-        project_id="api_diagnostics",
-        shot_id=shot.get("shot_id", "mimo_tts_check"),
+        project_id=DIAGNOSTIC_PROJECT_ID,
+        shot_id=shot.get("shot_id", DIAGNOSTIC_SHOT_ID),
     )
     audio = Path(path)
     if not audio.exists() or audio.stat().st_size <= 1024:
@@ -95,11 +103,20 @@ async def _check_seedance(story: dict) -> dict[str, str]:
         ]
         if part
     )
-    result = await SeedanceVideoService().generate_single_shot(
+    service = SeedanceVideoService()
+    reference_shot = _seedance_reference_shot(story)
+    reference_manifest = service._validate_video_references(reference_shot)
+    reference_shot["seedance_reference_manifest"] = reference_manifest
+    content = service._build_content(prompt, reference_shot)
+    image_items = [item for item in content if item.get("type") == "image_url"]
+    if not image_items:
+        raise RuntimeError("Seedance diagnostic did not build reference image content")
+    result = await service.generate_single_shot(
         prompt=prompt,
-        project_id="api_diagnostics",
-        shot_id=shot.get("shot_id", "seedance_check"),
+        project_id=DIAGNOSTIC_PROJECT_ID,
+        shot_id=shot.get("shot_id", DIAGNOSTIC_SHOT_ID),
         duration=int(shot.get("duration") or 5),
+        content=content,
     )
     frame_path = Path(result["frame_path"])
     with Image.open(frame_path) as image:
@@ -108,7 +125,43 @@ async def _check_seedance(story: dict) -> dict[str, str]:
     _assert_video(video_path)
     print(f"SEEDDANCE_OK video={video_path} {video_path.stat().st_size} bytes")
     print(f"SEEDDANCE_FRAME_OK {frame_path} {frame_path.stat().st_size} bytes")
+    print(f"SEEDDANCE_REFERENCE_CONTENT_OK images={len(image_items)}")
+    print(f"SEEDDANCE_REFERENCE_MANIFEST_OK loaded={len(reference_manifest)}")
+    print(f"SEEDDANCE_REFERENCE_PAYLOAD_MODE {result.get('reference_payload_mode', '')}")
+    if result.get("reference_payload_mode") != "first_frame_reference":
+        raise RuntimeError(f"Seedance did not use first_frame reference payload: {result.get('reference_payload_mode')}")
     return result
+
+
+def _seedance_reference_shot(story: dict) -> dict:
+    shot = story["shot"]
+    ref_dir = settings.OUTPUT_DIR / "projects" / DIAGNOSTIC_PROJECT_ID / "diagnostic_refs"
+    ref_dir.mkdir(parents=True, exist_ok=True)
+    storyboard_path = _reference_png(ref_dir / "storyboard_keyframe.png", "story", (184, 122, 86))
+    scene_path = _reference_png(ref_dir / "scene_baseline.png", "scene", (82, 148, 126))
+    character_path = _reference_png(ref_dir / "character_three_view.png", "char", (146, 92, 172))
+    previous_frame_path = _reference_png(ref_dir / "previous_last_frame.png", "prev", (92, 118, 184))
+    return {
+        "shot_id": shot.get("shot_id", DIAGNOSTIC_SHOT_ID),
+        "storyboard_path": str(storyboard_path),
+        "image_path": str(storyboard_path),
+        "continuity_reference_path": str(previous_frame_path),
+        "reference_weights": {"environment": 0.45, "action": 0.30},
+        "reference_assets": [
+            {"type": "scene_baseline", "path": str(scene_path), "weight": 0.45, "required": True},
+            {"type": "character_three_view", "path": str(character_path), "weight": 0.30, "required": True},
+            {"type": "continuity_frame", "path": str(previous_frame_path), "weight": 0.30, "required": True},
+        ],
+    }
+
+
+def _reference_png(path: Path, label: str, color: tuple[int, int, int]) -> Path:
+    image = Image.new("RGB", (384, 640), color)
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((68, 92, 316, 548), outline=(250, 250, 250), width=8)
+    draw.text((92, 118), label, fill=(250, 250, 250))
+    image.save(path)
+    return path
 
 
 def _fallback_story() -> dict:
@@ -116,7 +169,7 @@ def _fallback_story() -> dict:
         "title": "diagnostic fallback",
         "script": "固定诊断镜头，仅在 Mimo 失败时用于继续探测 TTS 和 Seedance。",
         "shot": {
-            "shot_id": "diagnostic_single_shot",
+            "shot_id": DIAGNOSTIC_SHOT_ID,
             "shot_type": "medium",
             "scene_description": "A friendly white service robot waves beside a sunlit desk in a vertical cinematic shot",
             "character_action": "the robot gently raises one hand to greet the viewer",

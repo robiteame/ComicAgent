@@ -1,0 +1,444 @@
+import hashlib
+import json
+import re
+from copy import deepcopy
+from typing import Any
+
+from services.style_templates import style_template
+
+
+class ConsistencyService:
+    """Agent-level visual consistency SOP shared by image and video generation."""
+
+    SCENE_SOP = (
+        "NON-NEGOTIABLE AGENT CONSISTENCY SOP. These rules override any single-shot custom prompt. "
+        "Lock the scene group baseline: color temperature, light direction, light intensity, weather, "
+        "ambient mood, spatial perspective, props, LUT, saturation and sharpness. Do not add, remove, "
+        "move, resize, deform or recolor set dressing unless the script explicitly says the prop changes. "
+        "Day and night scenes must stay isolated; no automatic warm/cool or brightness jumps inside one scene group."
+    )
+    CHARACTER_SOP = (
+        "Lock every character identity with the project character reference: face, body, hairstyle, skin tone, "
+        "base outfit, makeup and accessories must remain unchanged unless the script explicitly requests a costume change. "
+        "Use scene lighting to shade the character naturally, never separate character light from background light."
+    )
+    CONTINUITY_SOP = (
+        "Apply continuity editing rules: eye-line continuity, match-on-action cuts, and 180-degree axis lock. "
+        "Inside the same scene only use small camera zoom or position changes; do not cross the axis without explicit direction. "
+        "Use previous shot final frame as continuity reference when available. For complex motion, preserve OpenPose-like body joints; "
+        "bind perspective and depth to the current scene depth map logic."
+    )
+    POST_SOP = (
+        "Same-scene transition must be hard cut or 0.2s fade. Cross-scene transition must be 0.3-0.5s white flash or push-pull. "
+        "Keep ambient room tone continuous; do not cut off background ambience between adjacent shots."
+    )
+
+    def enrich_character(self, character: dict[str, Any], index: int = 0) -> dict[str, Any]:
+        item = deepcopy(character)
+        name = item.get("name") or f"character_{index + 1}"
+        appearance = item.get("appearance") if isinstance(item.get("appearance"), dict) else {}
+        default_outfit = item.get("default_outfit") or appearance.get("default_outfit") or appearance.get("outfit") or "locked default outfit"
+        digest = self._digest(f"{name}|{json.dumps(appearance, ensure_ascii=False, sort_keys=True)}")[:10]
+        item["default_outfit"] = default_outfit
+        item["wardrobe_lock"] = item.get("wardrobe_lock") or (
+            f"LOCKED wardrobe for {name}: {default_outfit}; makeup and accessories unchanged unless script marks costume_change."
+        )
+        item["lora_profile"] = item.get("lora_profile") or f"project_lora_{self._slug(name)}_{digest}"
+        item["ip_adapter_profile"] = item.get("ip_adapter_profile") or f"ip_adapter_identity_{self._slug(name)}_{digest}"
+        item.setdefault("reference_images", item.get("reference_images") or [])
+        return item
+
+    def enrich_scene(self, scene: dict[str, Any], index: int = 0) -> dict[str, Any]:
+        item = deepcopy(scene)
+        location = item.get("location") or item.get("name") or f"scene_{index + 1}"
+        time_of_day = item.get("time_of_day") or self._guess_time_of_day(" ".join(str(item.get(key, "")) for key in ("location", "actions", "description")))
+        scene_type = self._guess_scene_type(location)
+        group_key = item.get("scene_group_key") or f"{self._slug(location)}-{self._slug(time_of_day)}"
+        profile = self._build_scene_profile(item, group_key, time_of_day, scene_type, index)
+        prop_lock = item.get("prop_lock") or self._build_prop_lock(item)
+
+        item["scene_group_key"] = group_key
+        item["time_of_day"] = time_of_day
+        item["consistency_profile"] = profile
+        item["prop_lock"] = prop_lock
+        item.setdefault("reference_images", item.get("reference_images") or [])
+        item["visual_prompt"] = item.get("visual_prompt") or self._scene_visual_prompt(item, profile)
+        return item
+
+    def scene_baseline_prompt(self, scene: dict[str, Any], style: str = "anime") -> tuple[str, str]:
+        profile = self._profile(scene.get("consistency_profile"))
+        template = style_template(style)
+        prompt_parts = [
+            template.get("scene_baseline_prompt", "production background key art, clean vertical composition"),
+            "empty scene baseline reference image, no characters, no subtitles, no watermark",
+            scene.get("location") or scene.get("name") or "",
+            scene.get("visual_prompt", ""),
+            scene.get("actions") or scene.get("description") or "",
+            self._scene_profile_sentence(profile),
+            scene.get("prop_lock", ""),
+        ]
+        negative = (
+            "characters, people, changing props, extra furniture, inconsistent perspective, text, subtitles, watermark, "
+            "low quality, blurry, distorted architecture"
+        )
+        return ", ".join(part for part in prompt_parts if part), negative
+
+    def build_generation_context(
+        self,
+        shot: dict[str, Any],
+        characters: list[dict[str, Any]],
+        scenes: dict[str, dict[str, Any]],
+        previous_reference_path: str = "",
+        for_video: bool = False,
+    ) -> dict[str, Any]:
+        scene = scenes.get(shot.get("scene_asset_id") or "") or {}
+        selected_characters = self.select_characters(shot, characters)
+        weights = self.reference_weights(shot.get("shot_type", "medium"))
+        scene_profile = self._profile(scene.get("consistency_profile"))
+        scene_refs = self._scene_reference_images(scene)
+        char_refs = [ref for char in selected_characters for ref in char.get("reference_images", []) if ref]
+        character_blocking = self._character_blocking_profile(shot, scene, selected_characters, scene_profile)
+        continuity_profile = self._continuity_profile(
+            shot=shot,
+            scene=scene,
+            scene_profile=scene_profile,
+            previous_reference_path=previous_reference_path,
+            for_video=for_video,
+            character_blocking=character_blocking,
+        )
+        reference_assets = self._reference_assets(scene_refs, char_refs, previous_reference_path, weights, continuity_profile)
+
+        parts = [
+            self.SCENE_SOP,
+            self.CHARACTER_SOP,
+            self.CONTINUITY_SOP,
+            self.POST_SOP,
+            f"Scene group: {scene.get('scene_group_key') or shot.get('scene_group_id') or 'locked-current-scene'}; time: {scene.get('time_of_day') or 'locked'}; baseline: {scene.get('name') or 'scene baseline'}.",
+            self._scene_profile_sentence(scene_profile),
+            scene.get("prop_lock", ""),
+            f"Reference weight policy: style/environment {weights['environment']:.2f}, character action {weights['action']:.2f}; Agent chooses by shot type and cannot be overridden by the single shot prompt.",
+            self._continuity_sentence(continuity_profile),
+        ]
+        if scene_refs:
+            parts.append("Mandatory scene baseline/reference asset is available and must drive environment, props, lighting and perspective.")
+        if char_refs:
+            parts.append("Mandatory character three-view references are available and must drive identity, outfit, face, body and hairstyle.")
+        if previous_reference_path:
+            parts.append("Previous shot final frame is available; use it as the continuity frame for pose, eye-line, axis, depth and motion carry-over.")
+        if for_video:
+            parts.append("Seedance video must match the approved storyboard frame first, then animate only within the locked scene and character constraints.")
+
+        for char in selected_characters:
+            parts.extend(
+                [
+                    char.get("lora_profile", ""),
+                    char.get("ip_adapter_profile", ""),
+                    char.get("wardrobe_lock", ""),
+                ]
+            )
+
+        prompt = " ".join(self._clean_text(part) for part in parts if part)
+        return {
+            "consistency_context": prompt,
+            "scene_group_id": scene.get("scene_group_key") or shot.get("scene_group_id", ""),
+            "scene_reference_images": scene_refs,
+            "character_reference_images": char_refs,
+            "reference_weights": weights,
+            "reference_assets": reference_assets,
+            "continuity_profile": continuity_profile,
+            "continuity_reference_path": previous_reference_path,
+            "pose_reference_path": continuity_profile.get("pose_reference_path", ""),
+            "depth_reference_path": continuity_profile.get("depth_reference_path", ""),
+        }
+
+    def select_characters(self, shot: dict[str, Any], characters: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        selected_ids = {str(item) for item in shot.get("character_asset_ids", []) if item}
+        selected_names = {str(item) for item in shot.get("characters_in_scene", []) if item}
+        selected: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for char in characters:
+            char_id = str(char.get("id") or "")
+            char_name = str(char.get("name") or "")
+            if selected_ids and char_id not in selected_ids:
+                continue
+            if selected_names and not selected_ids and char_name not in selected_names:
+                continue
+            key = char_id or char_name
+            if key and key not in seen:
+                selected.append(char)
+                seen.add(key)
+        return selected or characters[:1]
+
+    def reference_weights(self, shot_type: str) -> dict[str, float]:
+        shot_type = (shot_type or "medium").lower()
+        if shot_type in {"wide", "establishing"}:
+            return {"environment": 0.50, "action": 0.25}
+        if shot_type in {"close-up", "closeup", "extreme_close", "extreme close-up"}:
+            return {"environment": 0.40, "action": 0.35}
+        return {"environment": 0.45, "action": 0.30}
+
+    def project_config(self) -> dict[str, Any]:
+        return {
+            "agent_sop": "enabled",
+            "scene_anchor": True,
+            "character_identity_lock": True,
+            "continuity_frame_lock": True,
+            "pose_lock_for_complex_motion": True,
+            "depth_lock_for_complex_motion": True,
+            "reference_weight_ranges": {"environment": [0.4, 0.5], "action": [0.25, 0.35]},
+            "rules_override_single_shot_customization": True,
+            "manual_storyboard_approval_required_before_video": True,
+        }
+
+    def _build_scene_profile(self, scene: dict[str, Any], group_key: str, time_of_day: str, scene_type: str, index: int) -> dict[str, Any]:
+        indoor = scene_type == "indoor"
+        return {
+            "scene_group_key": group_key,
+            "time_of_day": time_of_day,
+            "scene_type": scene_type,
+            "color_temperature": self._color_temperature(time_of_day, indoor),
+            "light_source_direction": "camera-left 35 degrees, slightly above eye level" if indoor else "sun direction fixed from upper camera-left",
+            "light_intensity": "soft medium" if indoor else ("low blue night ambience" if time_of_day == "night" else "bright soft daylight"),
+            "weather": "locked clear weather unless script explicitly changes weather",
+            "atmosphere": scene.get("emotion") or "neutral narrative atmosphere",
+            "spatial_perspective": f"locked {scene.get('camera_suggestion') or 'medium'} perspective grid, axis line stable",
+            "axis_rule": "180-degree axis locked; keep character standing order and facing direction unless script marks reposition",
+            "transition_same_scene": "hard cut or 0.2s fade only",
+            "transition_cross_scene": "0.3-0.5s white flash or push-pull",
+            "lut": f"project_scene_lut_{index + 1:02d}_{self._slug(time_of_day)}",
+        }
+
+    def _scene_visual_prompt(self, scene: dict[str, Any], profile: dict[str, Any]) -> str:
+        return ", ".join(
+            part
+            for part in [
+                scene.get("location") or scene.get("name"),
+                scene.get("actions") or scene.get("description"),
+                self._scene_profile_sentence(profile),
+                "stable set dressing, locked props, consistent depth and perspective",
+            ]
+            if part
+        )
+
+    def _build_prop_lock(self, scene: dict[str, Any]) -> str:
+        description = scene.get("actions") or scene.get("description") or scene.get("visual_prompt") or "baseline set dressing"
+        return (
+            "Prop lock: preserve all visible set dressing from the baseline image, including position, scale, count and orientation. "
+            f"Script-described baseline props: {self._clean_text(description)[:260]}."
+        )
+
+    def _scene_profile_sentence(self, profile: dict[str, Any]) -> str:
+        if not profile:
+            return ""
+        return (
+            f"Locked scene lighting: {profile.get('color_temperature')}; source {profile.get('light_source_direction')}; "
+            f"intensity {profile.get('light_intensity')}; weather {profile.get('weather')}; "
+            f"perspective {profile.get('spatial_perspective')}; LUT {profile.get('lut')}; {profile.get('axis_rule')}."
+        )
+
+    def _continuity_profile(
+        self,
+        shot: dict[str, Any],
+        scene: dict[str, Any],
+        scene_profile: dict[str, Any],
+        previous_reference_path: str,
+        for_video: bool,
+        character_blocking: dict[str, Any],
+    ) -> dict[str, Any]:
+        complex_motion = self._is_complex_motion(shot)
+        same_scene_transition = scene_profile.get("transition_same_scene") or "hard cut or 0.2s fade only"
+        cross_scene_transition = scene_profile.get("transition_cross_scene") or "0.3-0.5s white flash or push-pull"
+        pose_reference_path = previous_reference_path if complex_motion and previous_reference_path else ""
+        depth_reference_path = previous_reference_path if complex_motion and previous_reference_path else ""
+        return {
+            "editing_logic": ["eye_line_continuity", "match_on_action", "180_degree_axis_lock"],
+            "same_scene_transition": same_scene_transition,
+            "cross_scene_transition": cross_scene_transition,
+            "lut": scene_profile.get("lut", "project_scene_lut_locked"),
+            "saturation": "locked per scene group",
+            "sharpness": "locked per scene group",
+            "ambient_audio_policy": "continuous room tone; do not cut background ambience at shot boundary",
+            "previous_reference_path": previous_reference_path,
+            "complex_motion": complex_motion,
+            "openpose_lock": "enabled" if complex_motion else "not_required",
+            "depth_lock": "enabled" if complex_motion else "not_required",
+            "pose_reference_path": pose_reference_path,
+            "depth_reference_path": depth_reference_path,
+            "control_source": "previous_final_frame" if previous_reference_path else "current_scene_baseline",
+            "video_generation_gate": "approved_storyboard_required" if for_video else "storyboard_reference_generation",
+            "axis_rule": scene_profile.get("axis_rule") or "180-degree axis locked",
+            "scene_group_key": scene.get("scene_group_key") or shot.get("scene_group_id", ""),
+            "character_blocking": character_blocking,
+        }
+
+    def _continuity_sentence(self, profile: dict[str, Any]) -> str:
+        if not profile:
+            return ""
+        blocking = profile.get("character_blocking") or {}
+        parts = [
+            "Continuity profile is locked:",
+            ", ".join(profile.get("editing_logic", [])),
+            f"same-scene transition {profile.get('same_scene_transition')}",
+            f"cross-scene transition {profile.get('cross_scene_transition')}",
+            f"LUT {profile.get('lut')}",
+            f"OpenPose control {profile.get('openpose_lock')}",
+            f"Depth control {profile.get('depth_lock')}",
+            self._blocking_sentence(blocking),
+            profile.get("ambient_audio_policy", ""),
+        ]
+        return "; ".join(part for part in parts if part)
+
+    def _character_blocking_profile(
+        self,
+        shot: dict[str, Any],
+        scene: dict[str, Any],
+        selected_characters: list[dict[str, Any]],
+        scene_profile: dict[str, Any],
+    ) -> dict[str, Any]:
+        names = [str(char.get("name") or char.get("id") or "").strip() for char in selected_characters]
+        names = [name for name in names if name]
+        if not names:
+            names = [str(item) for item in shot.get("characters_in_scene", []) if item]
+        character_order = list(dict.fromkeys(names))
+        allow_reposition = self._allows_reposition(shot)
+        facing_lock = {
+            name: "keep baseline facing direction; no mirror flip or side swap unless explicit reposition/cross-axis cue"
+            for name in character_order
+        }
+        return {
+            "scene_group_key": scene.get("scene_group_key") or shot.get("scene_group_id", ""),
+            "axis_line": scene_profile.get("axis_rule") or "180-degree axis locked",
+            "character_order_left_to_right": character_order,
+            "facing_direction_lock": facing_lock,
+            "eye_line_target": self._eye_line_target(shot, character_order),
+            "match_on_action_policy": "cut during the same action beat; preserve limb direction and motion vector between adjacent shots",
+            "camera_movement_limit": "same-scene camera may only zoom or make small position changes; no axis crossing",
+            "skin_light_integration": (
+                f"shade skin and character shadows with scene light {scene_profile.get('light_source_direction', 'locked source')} "
+                f"and color temperature {scene_profile.get('color_temperature', 'locked palette')}"
+            ),
+            "reposition_override_allowed": allow_reposition,
+        }
+
+    def _blocking_sentence(self, blocking: dict[str, Any]) -> str:
+        if not blocking:
+            return ""
+        order = blocking.get("character_order_left_to_right") or []
+        return (
+            "Character blocking lock: "
+            f"left-to-right order {', '.join(order) if order else 'single subject'}; "
+            f"{blocking.get('axis_line', '180-degree axis locked')}; "
+            f"eye-line target {blocking.get('eye_line_target', 'next core subject')}; "
+            f"{blocking.get('camera_movement_limit', '')}; "
+            f"{blocking.get('skin_light_integration', '')}."
+        )
+
+    def _eye_line_target(self, shot: dict[str, Any], character_order: list[str]) -> str:
+        text = " ".join(str(shot.get(key, "")) for key in ("dialogue", "character_action", "scene_description"))
+        for name in character_order[1:] + character_order[:1]:
+            if name and re.search(rf"\b(?:toward|to|looks at|faces|watching|gazes at)\s+{re.escape(name)}\b", text, re.I):
+                return f"maintain gaze toward {name} when they are the spoken-to or acted-on subject"
+        for name in character_order[1:] + character_order[:1]:
+            if name and name in text:
+                return f"maintain gaze toward {name} when they are the spoken-to or acted-on subject"
+        if len(character_order) >= 2:
+            return f"{character_order[0]} gaze anchors toward {character_order[1]} unless the script names another subject"
+        return "maintain gaze toward the next shot core subject or the established off-screen point"
+
+    def _allows_reposition(self, shot: dict[str, Any]) -> bool:
+        text = " ".join(str(shot.get(key, "")) for key in ("character_action", "scene_description", "visual_notes")).lower()
+        return bool(re.search(r"reposition|switch places|cross axis|crosses the line|turns around|walks past|exit|enter", text))
+
+    def _reference_assets(
+        self,
+        scene_refs: list[str],
+        char_refs: list[str],
+        previous_reference_path: str,
+        weights: dict[str, float],
+        continuity_profile: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        assets: list[dict[str, Any]] = []
+        for path in scene_refs:
+            assets.append({"type": "scene_baseline", "path": path, "role": "environment_props_lighting_perspective", "weight": weights["environment"], "required": True})
+        for path in char_refs:
+            assets.append({"type": "character_three_view", "path": path, "role": "identity_outfit_face_body_hair", "weight": weights["action"], "required": True})
+        if previous_reference_path:
+            assets.append({"type": "continuity_frame", "path": previous_reference_path, "role": "eye_line_axis_pose_depth_motion", "weight": weights["action"], "required": True})
+        if continuity_profile.get("pose_reference_path"):
+            assets.append({"type": "openpose_source_frame", "path": continuity_profile["pose_reference_path"], "role": "complex_motion_body_joint_lock", "weight": weights["action"], "required": True})
+        if continuity_profile.get("depth_reference_path"):
+            assets.append({"type": "depth_source_frame", "path": continuity_profile["depth_reference_path"], "role": "perspective_depth_lock", "weight": weights["environment"], "required": True})
+        return assets
+
+    def _is_complex_motion(self, shot: dict[str, Any]) -> bool:
+        text = " ".join(
+            str(shot.get(key, ""))
+            for key in ("character_action", "camera_movement", "scene_description", "visual_notes")
+        ).lower()
+        return bool(
+            re.search(
+                r"run|running|jump|fight|fall|dance|turn|spin|walk|chase|push|pull|hug|挥手|奔跑|跑|追|跳|摔|跌|打|推|拉|转身|旋转|走|冲|拥抱|拉扯|挥",
+                text,
+            )
+        )
+
+    def _scene_reference_images(self, scene: dict[str, Any]) -> list[str]:
+        refs = []
+        if scene.get("baseline_image_path"):
+            refs.append(scene["baseline_image_path"])
+        raw_refs = scene.get("reference_images") or []
+        if isinstance(raw_refs, str):
+            try:
+                raw_refs = json.loads(raw_refs)
+            except Exception:
+                raw_refs = []
+        refs.extend(ref for ref in raw_refs if ref)
+        return list(dict.fromkeys(refs))
+
+    def _profile(self, value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                data = json.loads(value)
+                return data if isinstance(data, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    def _guess_time_of_day(self, text: str) -> str:
+        text = text.lower()
+        if re.search(r"night|深夜|夜晚|晚上|夜色|moon", text):
+            return "night"
+        if re.search(r"dusk|sunset|黄昏|傍晚|夕阳", text):
+            return "dusk"
+        if re.search(r"morning|清晨|早晨|上午", text):
+            return "morning"
+        return "day"
+
+    def _guess_scene_type(self, location: str) -> str:
+        if re.search(r"室内|房间|教室|办公室|家|屋|indoor|room|office|classroom", location, re.I):
+            return "indoor"
+        return "outdoor"
+
+    def _color_temperature(self, time_of_day: str, indoor: bool) -> str:
+        if time_of_day == "night":
+            return "cool blue 4200K night palette" if not indoor else "warm practical 3000K indoor night palette"
+        if time_of_day == "dusk":
+            return "warm amber 3600K dusk palette"
+        if time_of_day == "morning":
+            return "soft neutral 4800K morning palette"
+        return "neutral daylight 5200K palette" if not indoor else "soft indoor daylight 4300K palette"
+
+    def _slug(self, value: str) -> str:
+        text = re.sub(r"\s+", "-", str(value or "").strip().lower())
+        text = re.sub(r"[^a-z0-9\u4e00-\u9fff_-]+", "", text)
+        return text[:36] or "locked"
+
+    def _digest(self, value: str) -> str:
+        return hashlib.sha1(value.encode("utf-8", errors="ignore")).hexdigest()
+
+    def _clean_text(self, value: Any) -> str:
+        text = str(value or "").strip()
+        text = text.replace("{", "").replace("}", "")
+        return " ".join(text.split())

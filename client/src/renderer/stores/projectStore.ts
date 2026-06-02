@@ -3,6 +3,7 @@
 interface ProjectState {
   projectId: string | null
   parentProjectId: string
+  parentProjectTitle: string
   projectType: 'series' | 'episode'
   episodeNumber: number
   title: string
@@ -21,6 +22,7 @@ interface ProjectState {
 const DEFAULT_PROJECT: Omit<ProjectState, 'setProject' | 'reset'> = {
   projectId: null,
   parentProjectId: '',
+  parentProjectTitle: '',
   projectType: 'series',
   episodeNumber: 0,
   title: '未命名项目',

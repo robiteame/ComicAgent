@@ -22,6 +22,7 @@ class Project(Base):
     output_format = Column(String, default="9:16")
     resolution = Column(String, default="1080p")
     platform = Column(String, default="douyin")
+    consistency_config = Column(Text, default="{}")
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

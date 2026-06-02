@@ -2,19 +2,19 @@ import React, { useEffect, useMemo, useRef, useState } from 'react'
 import {
   CaretDownOutlined,
   CaretRightOutlined,
-  ExportOutlined,
+  DeleteOutlined,
+  FileOutlined,
+  FolderOutlined,
   ImportOutlined,
-  MenuFoldOutlined,
-  MenuUnfoldOutlined,
+  LeftOutlined,
   PlusOutlined,
-  ThunderboltOutlined,
+  RightOutlined,
 } from '@ant-design/icons'
-import { message, Tooltip } from 'antd'
-import { characterApi, projectApi, renderApi, scriptApi, shotApi } from '../services/api'
+import { message, Modal, Tooltip } from 'antd'
+import { characterApi, projectApi, shotApi } from '../services/api'
 import { useProjectStore } from '../stores/projectStore'
 import { useShotStore } from '../stores/shotStore'
 
-const PARSE_SCRIPT_EVENT = 'pipeline:parse-script'
 const OPEN_CREATE_PROJECT_EVENT = 'workspace:open-create-project'
 
 interface ProjectItem {
@@ -27,6 +27,7 @@ interface ProjectItem {
   style?: string
   genre?: string
   updated_at?: string
+  video_path?: string
 }
 
 interface LeftSidebarProps {
@@ -52,7 +53,7 @@ function cleanTitle(value?: string) {
 }
 
 const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed }) => {
-  const { projectId, parentProjectId, projectType, style, outputFormat, resolution, platform, setProject } = useProjectStore()
+  const { projectId, parentProjectId, projectType, style, outputFormat, resolution, platform, setProject, reset } = useProjectStore()
   const {
     setShots,
     selectShot,
@@ -60,14 +61,14 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
     setProgress,
     setAwaitingStoryboardConfirm,
     setVideoPath,
-    clearLogs,
     appendLog,
+    clearLogs,
   } = useShotStore()
 
   const [projects, setProjects] = useState<ProjectItem[]>([])
   const [expandedSeriesIds, setExpandedSeriesIds] = useState<Set<string>>(new Set())
   const [loadingProjectId, setLoadingProjectId] = useState<string | null>(null)
-  const fileInputRef = useRef<HTMLInputElement | null>(null)
+  const finalVideoInputRef = useRef<HTMLInputElement | null>(null)
 
   const refreshProjects = () => {
     projectApi.list().then(setProjects).catch(() => undefined)
@@ -111,6 +112,15 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
 
   const handleSelectProject = async (id: string) => {
     try {
+      const localProject = projects.find((item) => item.id === id)
+      if (localProject && (localProject.project_type || 'series') !== 'episode') {
+        const firstEpisode = (projectTree.episodesByParent.get(id) || [])[0]
+        if (firstEpisode) {
+          setExpandedSeriesIds((prev) => new Set(prev).add(id))
+          await handleSelectProject(firstEpisode.id)
+          return
+        }
+      }
       setLoadingProjectId(id)
       const [projectDetail, shotList, characters] = await Promise.all([
         projectApi.get(id),
@@ -121,6 +131,7 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
       setProject({
         projectId: projectDetail.id,
         parentProjectId: projectDetail.parent_project_id || '',
+        parentProjectTitle: projectDetail.parent_project_title || '',
         projectType: projectDetail.project_type || 'series',
         episodeNumber: projectDetail.episode_number || 0,
         title: projectDetail.title,
@@ -136,7 +147,7 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
       setShots(shotList || [])
       selectShot(shotList?.[0]?.id || null)
       setAwaitingStoryboardConfirm(projectDetail.status === 'storyboard_ready')
-      setVideoPath(projectDetail.status === 'completed' ? `/output/projects/${projectDetail.id}/output/final.mp4` : '')
+      setVideoPath(projectDetail.video_path || (projectDetail.status === 'completed' ? `/output/projects/${projectDetail.id}/output/final.mp4` : ''))
     } catch (err: any) {
       message.error('加载项目失败：' + (err.message || '未知错误'))
     } finally {
@@ -144,74 +155,30 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
     }
   }
 
-  const ensureProject = async () => {
-    if (projectId) return projectId
-
-    const project = await projectApi.create({
-      title: '未命名项目',
-      style,
-      genre: '',
-      output_format: outputFormat,
-      resolution,
-      platform,
-    })
-
-    setProject({
-      projectId: project.id,
-      parentProjectId: project.parent_project_id || '',
-      projectType: project.project_type || 'series',
-      episodeNumber: project.episode_number || 0,
-      title: project.title,
-      style,
-      outputFormat,
-      resolution,
-      platform,
-    })
-    refreshProjects()
-    return project.id as string
-  }
-
-  const handleImportScript = async (file: File) => {
-    try {
-      const pid = await ensureProject()
-      setGenerating(true)
-      setAwaitingStoryboardConfirm(false)
-      setVideoPath('')
-      setProgress(0, 'parse_script')
-      clearLogs()
-
-      const formData = new FormData()
-      formData.append('project_id', pid)
-      formData.append('file', file)
-      formData.append('style', style)
-      formData.append('output_format', outputFormat)
-      formData.append('resolution', resolution)
-      formData.append('platform', platform)
-
-      await scriptApi.upload(formData)
-      appendLog(`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] 已导入剧本：${file.name}`)
-      message.success('剧本上传成功，已进入解析流程')
-    } catch (err: any) {
-      setGenerating(false)
-      message.error('导入失败：' + (err.message || '未知错误'))
-    }
-  }
-
-  const handleExport = async () => {
+  const handleImportFinalVideo = async (file: File) => {
     if (!projectId) {
-      message.warning('请先选择或创建一个项目')
+      message.warning('请先选择或创建一个剧集')
+      return
+    }
+    if (projectType !== 'episode') {
+      message.warning('请先选择具体剧集，再导入成片')
       return
     }
 
     try {
-      await renderApi.start({
-        project_id: projectId,
-        output_format: outputFormat,
-        resolution,
-      })
-      message.success('导出任务已提交')
-    } catch {
-      message.error('导出任务提交失败')
+      setGenerating(true)
+      setProgress(95, 'quality_check')
+      const formData = new FormData()
+      formData.append('file', file)
+      const result = await projectApi.importVideo(projectId, formData)
+      setVideoPath(result.video_path || `/output/projects/${projectId}/output/final.mp4`)
+      appendLog(`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] 已导入成片：${file.name}`)
+      refreshProjects()
+      message.success('成片已导入当前剧集')
+    } catch (err: any) {
+      message.error('成片导入失败：' + (err.message || '未知错误'))
+    } finally {
+      setGenerating(false)
     }
   }
 
@@ -248,6 +215,38 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
     }
   }
 
+  const handleDeleteProject = (project: ProjectItem, event: React.MouseEvent) => {
+    event.stopPropagation()
+    const isEpisode = project.project_type === 'episode'
+    const title = cleanTitle(project.title)
+    Modal.confirm({
+      title: `删除${isEpisode ? '单集' : '项目'}：${title}`,
+      content: isEpisode
+        ? '删除后会同步清理该单集下的分镜、故事板、成片和输出资产文件。'
+        : '删除后会同步删除大项目、所有单集，以及绑定的角色板、场景板、分镜、成片和输出资产文件。',
+      okText: '确认删除',
+      cancelText: '取消',
+      okButtonProps: { danger: true },
+      onOk: async () => {
+        await projectApi.delete(project.id)
+        const deletedCurrent =
+          project.id === projectId ||
+          (project.project_type !== 'episode' && (parentProjectId === project.id || projectId === project.id))
+        if (deletedCurrent) {
+          reset()
+          setShots([])
+          selectShot(null)
+          setAwaitingStoryboardConfirm(false)
+          setVideoPath('')
+          setProgress(0, '')
+          clearLogs()
+        }
+        refreshProjects()
+        message.success('项目已删除，关联资产已清理')
+      },
+    })
+  }
+
   const toggleSeries = (id: string) => {
     setExpandedSeriesIds((prev) => {
       const next = new Set(prev)
@@ -268,25 +267,39 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
         className={`project-item linear-project-item${isActive ? ' active' : ''}${isLoading ? ' loading' : ''}${isEpisode ? ' episode-item' : ''}`}
       >
         <button type="button" className="project-main" onClick={() => void handleSelectProject(project.id)}>
-          <div className="project-item-title">{isEpisode ? `第 ${project.episode_number || 1} 集 · ` : ''}{title}</div>
+          <div className="project-item-title">
+            <span className={`project-item-icon${isEpisode ? '' : ' folder'}`}>
+              {isEpisode ? <FileOutlined /> : <FolderOutlined />}
+            </span>
+            <span>{isEpisode ? `第 ${project.episode_number || 1} 集 · ` : ''}{title}</span>
+          </div>
           <div className="project-item-meta">最近编辑：{formatUpdatedAt(project.updated_at)}</div>
         </button>
+        <Tooltip title={isEpisode ? '删除单集' : '删除项目'}>
+          <button
+            type="button"
+            className="project-delete-btn"
+            aria-label={isEpisode ? '删除单集' : '删除项目'}
+            onClick={(event) => handleDeleteProject(project, event)}
+          >
+            <DeleteOutlined />
+          </button>
+        </Tooltip>
       </div>
     )
   }
 
   const actionItems = [
-    { id: 'import', label: '导入剧本', icon: <ImportOutlined />, onClick: () => fileInputRef.current?.click() },
-    { id: 'parse', label: '生成分镜', icon: <ThunderboltOutlined />, onClick: () => window.dispatchEvent(new CustomEvent(PARSE_SCRIPT_EVENT)) },
     { id: 'create', label: '新建项目', icon: <PlusOutlined />, onClick: () => window.dispatchEvent(new CustomEvent(OPEN_CREATE_PROJECT_EVENT)) },
-    { id: 'export', label: '导出成片', icon: <ExportOutlined />, onClick: () => void handleExport() },
+    { id: 'episode', label: '新建剧集', icon: <FileOutlined />, onClick: () => void handleCreateEpisode() },
+    { id: 'import-video', label: '导入成片', icon: <ImportOutlined />, onClick: () => finalVideoInputRef.current?.click() },
   ]
 
   return (
     <aside className={`left-sidebar${collapsed ? ' collapsed' : ''}`} aria-label="左侧导航">
       <div className="sidebar-head">
         <button type="button" className="collapse-switch" onClick={onToggleCollapsed} aria-label="展开或收起左侧栏">
-          {collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
+          {collapsed ? <RightOutlined /> : <LeftOutlined />}
         </button>
         {!collapsed && <div className="sidebar-brand">漫剧工坊</div>}
       </div>
@@ -304,7 +317,7 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
               <div key={item.id} className="linear-row">
                 <button
                   type="button"
-                  className={`linear-action${item.id === 'parse' ? ' primary' : ''}`}
+                  className={`linear-action${item.id === 'create' ? ' primary' : ''}`}
                   onClick={item.onClick}
                 >
                   <span className="linear-action-icon">{item.icon}</span>
@@ -312,15 +325,6 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
                 </button>
               </div>
             ),
-          )}
-
-          {!collapsed && (
-            <div className="linear-row">
-              <button type="button" className="linear-action" onClick={() => void handleCreateEpisode()}>
-                <span className="linear-action-icon"><PlusOutlined /></span>
-                <span>新建单集</span>
-              </button>
-            </div>
           )}
 
           <div className="project-list linear-project-list">
@@ -340,7 +344,7 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
                         onClick={() => void handleSelectProject(series.id)}
                         aria-label={title}
                       >
-                        {title.slice(0, 1)}
+                        <FolderOutlined />
                       </button>
                     </Tooltip>
                   )
@@ -371,14 +375,14 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
       </div>
 
       <input
-        ref={fileInputRef}
+        ref={finalVideoInputRef}
         type="file"
-        accept=".txt,.docx"
+        accept="video/mp4,.mp4,.m4v"
         style={{ display: 'none' }}
         onChange={(e) => {
           const file = e.target.files?.[0]
           if (file) {
-            void handleImportScript(file)
+            void handleImportFinalVideo(file)
           }
           e.target.value = ''
         }}

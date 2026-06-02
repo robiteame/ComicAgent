@@ -17,7 +17,9 @@
       "Bash(powershell *)",
       "Bash(dir D:\\\\WorkSpace\\\\ComicAgent\\\\server\\\\*.log)",
       "Bash(tasklist)",
-      "Bash(findstr python *)"
+      "Bash(findstr python *)",
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(D:/Anaconda3/python.exe *)"
     ]
   }
 }

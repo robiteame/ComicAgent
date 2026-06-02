@@ -104,7 +104,7 @@ def _normalize_characters(raw: list, user_input: str) -> list[dict]:
                 "name": name,
                 "appearance": appearance,
                 "personality": item.get("personality", "性格鲜明，行动目标清晰"),
-                "visual_prompt": item.get("visual_prompt") or f"{name}, expressive comic character, clean line art",
+                "visual_prompt": item.get("visual_prompt") or f"{name}, expressive finished color comic character design",
                 "negative_prompt": item.get("negative_prompt", "low quality, blurry, watermark"),
                 "voice_id": normalize_mimo_voice(item.get("voice_type") or item.get("voice_id") or "少女"),
                 "key_features": features,

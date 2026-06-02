@@ -35,6 +35,14 @@ def _ensure_sqlite_columns() -> None:
                 "storyboard_status": "VARCHAR DEFAULT 'pending'",
                 "video_path": "VARCHAR DEFAULT ''",
                 "visual_notes": "TEXT DEFAULT ''",
+                "scene_group_id": "VARCHAR DEFAULT ''",
+                "consistency_context": "TEXT DEFAULT ''",
+                "reference_weights": "TEXT DEFAULT '{}'",
+                "continuity_profile": "TEXT DEFAULT '{}'",
+                "continuity_reference_path": "VARCHAR DEFAULT ''",
+                "pose_reference_path": "VARCHAR DEFAULT ''",
+                "depth_reference_path": "VARCHAR DEFAULT ''",
+                "last_frame_path": "VARCHAR DEFAULT ''",
             },
         )
     if "projects" in inspector.get_table_names():
@@ -47,6 +55,7 @@ def _ensure_sqlite_columns() -> None:
                 "parent_project_id": "VARCHAR DEFAULT ''",
                 "project_type": "VARCHAR DEFAULT 'series'",
                 "episode_number": "INTEGER DEFAULT 0",
+                "consistency_config": "TEXT DEFAULT '{}'",
             },
         )
     if "characters" in inspector.get_table_names():
@@ -55,6 +64,20 @@ def _ensure_sqlite_columns() -> None:
             {
                 "reference_images": "TEXT DEFAULT '[]'",
                 "default_outfit": "TEXT DEFAULT ''",
+                "lora_profile": "TEXT DEFAULT ''",
+                "ip_adapter_profile": "TEXT DEFAULT ''",
+                "wardrobe_lock": "TEXT DEFAULT ''",
+            },
+        )
+    if "scene_assets" in inspector.get_table_names():
+        _add_missing_columns(
+            "scene_assets",
+            {
+                "scene_group_key": "VARCHAR DEFAULT ''",
+                "time_of_day": "VARCHAR DEFAULT ''",
+                "baseline_image_path": "VARCHAR DEFAULT ''",
+                "consistency_profile": "TEXT DEFAULT '{}'",
+                "prop_lock": "TEXT DEFAULT ''",
             },
         )
 

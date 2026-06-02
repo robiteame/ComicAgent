@@ -1,10 +1,12 @@
 """End-to-end smoke test for the comic Agent pipeline.
 
-This script calls the running FastAPI server, then verifies:
+This script calls the running FastAPI server, then verifies the current
+manual-review pipeline:
 1. Agent script generation.
-2. Script-to-storyboard generation with reference images.
-3. Manual storyboard edit.
-4. Storyboard confirmation and final video composition.
+2. Script parsing creates project assets and shot list.
+3. Storyboard reference images are generated from the asset board.
+4. Each shot is approved and generated individually.
+5. Final render composes existing per-shot videos.
 
 Usage:
     python scripts/full_flow_smoke.py
@@ -143,20 +145,20 @@ def main() -> None:
     )
     assert parse_result["status"] == "started", parse_result
 
-    def storyboard_ready():
+    def assets_ready():
         status = get(f"/api/project/{project_id}").get("status")
         if status == "error":
-            raise RuntimeError("project entered error state during storyboard generation")
+            raise RuntimeError("project entered error state during asset generation")
         shots = get(f"/api/shot/{project_id}/shots")
-        if shots and all(shot.get("image_path") for shot in shots):
+        board = get(f"/api/asset/{project_id}/board")
+        refs_ready = all(item.get("reference_images") for item in board.get("characters", []))
+        if shots and board.get("characters") and refs_ready:
             return shots
         return None
 
-    shots = wait_for(storyboard_ready, timeout=300, label="storyboard generation")
+    shots = wait_for(assets_ready, timeout=300, label="asset generation")
     assert len(shots) >= 1, "no shots generated"
-    for shot in shots:
-        assert_real_image(output_file(shot["image_path"]))
-    print(f"STORYBOARD {len(shots)} shots")
+    print(f"ASSETS {len(shots)} shots")
 
     first_shot = shots[0]
     edit_result = put(
@@ -169,23 +171,80 @@ def main() -> None:
     assert edit_result["needs_render"] is True, edit_result
     print("EDIT ok")
 
+    storyboard_result = post(f"/api/shot/{project_id}/generate-storyboard")
+    assert storyboard_result["status"] == "storyboard_started", storyboard_result
+
+    def storyboard_ready():
+        status = get(f"/api/project/{project_id}").get("status")
+        if status == "error":
+            raise RuntimeError("project entered error state during storyboard generation")
+        next_shots = get(f"/api/shot/{project_id}/shots")
+        if next_shots and all(shot.get("storyboard_path") or shot.get("image_path") for shot in next_shots):
+            return next_shots
+        return None
+
+    shots = wait_for(storyboard_ready, timeout=300, label="storyboard generation")
+    for shot in shots:
+        assert_real_image(output_file(shot.get("storyboard_path") or shot["image_path"]))
+    print(f"STORYBOARD {len(shots)} shots")
+
+    for shot in shots:
+        approve_result = post(f"/api/shot/{shot['id']}/approve-storyboard", {"approved": True})
+        assert approve_result["approved"] is True, approve_result
+
     confirm_result = post(f"/api/shot/{project_id}/confirm-storyboard")
-    assert confirm_result["status"] == "phase2_started", confirm_result
+    assert confirm_result["status"] == "storyboard_approved", confirm_result
     print("CONFIRM ok")
+
+    for shot in shots:
+        video_result = post(f"/api/shot/{shot['id']}/generate-video", {"force": False})
+        assert video_result["status"] == "video_generating", video_result
+
+        def shot_video_ready():
+            next_shots = get(f"/api/shot/{project_id}/shots")
+            current = next((item for item in next_shots if item["id"] == shot["id"]), None)
+            if current and current.get("status") == "failed":
+                raise RuntimeError(f"shot video generation failed: {current}")
+            if current and current.get("video_path"):
+                return current
+            return None
+
+        generated_shot = wait_for(shot_video_ready, timeout=360, label=f"shot video {shot['id']}")
+        video_file = output_file(generated_shot["video_path"])
+        assert video_file.exists() and video_file.stat().st_size > 4096, f"missing or tiny shot video: {video_file}"
+        if generated_shot.get("dialogue"):
+            audio_path = output_file(generated_shot["audio_path"])
+            assert audio_path.exists() and audio_path.stat().st_size > 1024, f"missing or tiny audio: {audio_path}"
+        print(f"SHOT_VIDEO {shot['id']} ok")
+
+    render_result = post(
+        "/api/render",
+        {
+            "project_id": project_id,
+            "output_format": "9:16",
+            "resolution": "720p",
+        },
+    )
+    assert render_result["status"] == "rendering", render_result
 
     final_video = OUTPUT_ROOT / project_id / "output" / "final.mp4"
 
-    def video_ready():
-        status = get(f"/api/project/{project_id}").get("status")
-        if status == "error":
-            raise RuntimeError("project entered error state")
+    def final_video_ready():
+        render_status = get(f"/api/render/{project_id}/status")
+        if render_status.get("status") == "error":
+            raise RuntimeError(f"render entered error state: {render_status}")
         shots_with_audio = get(f"/api/shot/{project_id}/shots")
         has_audio = any(shot.get("audio_path") for shot in shots_with_audio)
-        if final_video.exists() and final_video.stat().st_size > 0 and status == "completed" and has_audio:
-            return {"status": status, "size": final_video.stat().st_size}
+        if (
+            final_video.exists()
+            and final_video.stat().st_size > 4096
+            and render_status.get("status") == "completed"
+            and has_audio
+        ):
+            return {"status": render_status.get("status"), "size": final_video.stat().st_size}
         return None
 
-    video_state = wait_for(video_ready, timeout=240, label="final video generation")
+    video_state = wait_for(final_video_ready, timeout=240, label="final video render")
     final_shots = get(f"/api/shot/{project_id}/shots")
     assert any(shot.get("audio_path") for shot in final_shots), "no audio files generated"
     for shot in final_shots:
