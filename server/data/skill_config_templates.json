@@ -1,0 +1,37 @@
+{
+  "templates": {
+    "default": {
+      "id": "default",
+      "name": "默认 Skill 方案",
+      "script_agent": {
+        "style_template_id": "anime",
+        "custom_style_keywords": "",
+        "filter_tts_instruction_text": true,
+        "camera_composition": "medium shot, vertical 9:16, clear subject staging, readable foreground and background layers",
+        "force_character_scene_references": true,
+        "prompt_auto_assembly": true,
+        "openpose_lock_enabled": true,
+        "style_reference_weight": 0.45,
+        "action_reference_weight": 0.3,
+        "continuity_enabled": true
+      },
+      "storyboard_agent": {
+        "style_template_id": "anime",
+        "custom_style_keywords": "",
+        "filter_tts_instruction_text": true,
+        "camera_composition": "medium shot, vertical 9:16, clear subject staging, readable foreground and background layers",
+        "force_character_scene_references": true,
+        "prompt_auto_assembly": true,
+        "openpose_lock_enabled": true,
+        "style_reference_weight": 0.45,
+        "action_reference_weight": 0.3,
+        "continuity_enabled": true
+      },
+      "created_at": "2026-06-05T05:40:52.548514",
+      "updated_at": "2026-06-05T05:40:52.548514"
+    }
+  },
+  "global_default_template_id": "default",
+  "project_bindings": {},
+  "episode_bindings": {}
+}

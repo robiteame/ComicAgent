@@ -60,6 +60,7 @@ export const scriptApi = {
     resolution?: string
     platform?: string
     target_duration?: number
+    mode?: 'manual' | 'auto'
   }) => api.post('/api/script/parse', data).then((r) => r.data),
 
   upload: (formData: FormData) =>
@@ -77,6 +78,8 @@ export const shotApi = {
 
   regenerate: (shotId: string, data?: Record<string, any>) =>
     api.post(`/api/shot/${shotId}/regenerate`, data || {}).then((r) => r.data),
+
+  generationPrompt: (shotId: string) => api.get(`/api/shot/${shotId}/generation-prompt`).then((r) => r.data),
 
   batchRegenerate: (shotIds: string[], reason?: string) =>
     api.post('/api/shot/batch-regenerate', shotIds, { params: { reason } }).then((r) => r.data),
@@ -130,13 +133,31 @@ export const settingsApi = {
 
   createStyleTemplate: (data: { label: string; keywords: string; negative_prompt?: string }) =>
     api.post('/api/settings/style-templates', data).then((r) => r.data),
+
+  skillConfigs: () => api.get('/api/settings/skill-configs').then((r) => r.data),
+
+  saveSkillConfig: (data: Record<string, any>) => api.post('/api/settings/skill-configs', data).then((r) => r.data),
+
+  updateSkillBindings: (data: Record<string, any>) => api.put('/api/settings/skill-configs/bindings', data).then((r) => r.data),
+
+  modelConfigs: () => api.get('/api/settings/model-configs').then((r) => r.data),
+
+  saveModelConfigs: (data: Record<string, any>) => api.put('/api/settings/model-configs', data).then((r) => r.data),
 }
 
 export function createWebSocket(projectId: string, onMessage: (data: any) => void): WebSocket {
   const ws = new WebSocket(`${WS_BASE}/ws/${projectId}`)
 
   ws.onmessage = (event) => {
-    onMessage(JSON.parse(event.data))
+    let parsed: any
+    try {
+      parsed = JSON.parse(event.data)
+    } catch (err) {
+      // 后端可能发来非 JSON 文本帧（如纯文本心跳），忽略而非中断消息处理
+      console.warn('收到无法解析的 WebSocket 消息，已忽略:', event.data)
+      return
+    }
+    onMessage(parsed)
   }
 
   ws.onerror = (error) => {

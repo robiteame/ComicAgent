@@ -38,23 +38,48 @@ class LLMService:
     def __init__(self):
         self._client: AsyncOpenAI | None = None
         self._fallback_client: AsyncOpenAI | None = None
-        self.provider = (settings.LLM_PROVIDER or "openai").lower()
+        self._sync_config()
+
+    def _sync_config(self) -> None:
+        """实时从 settings 读取配置，保证保存模型/API 配置后新任务即生效。
+
+        当关键连接参数（provider / key / base_url）变化时，丢弃已缓存的客户端，
+        下次调用时按最新配置重新创建。
+        """
+        provider = (settings.LLM_PROVIDER or "openai").lower()
         configs = _provider_config()
-        cfg = configs.get(self.provider, configs["openai"])
+        cfg = configs.get(provider, configs["openai"])
+        api_key = cfg["api_key"] or ""
+        base_url = cfg["base_url"]
+
+        if (
+            getattr(self, "provider", None) != provider
+            or getattr(self, "_api_key", None) != api_key
+            or getattr(self, "_base_url", None) != base_url
+        ):
+            self._client = None
+
+        self.provider = provider
         self.model = cfg["model"] or "gpt-4o-mini"
         self.vision_model = cfg.get("vision_model") or self.model
-        self._api_key = cfg["api_key"] or ""
-        self._base_url = cfg["base_url"]
+        self._api_key = api_key
+        self._base_url = base_url
         self.max_tokens = settings.LLM_MAX_TOKENS
         self.last_provider_used = self.provider
-        self._fallback_cfg = self._build_fallback_config()
+
+        new_fallback = self._build_fallback_config()
+        if new_fallback != getattr(self, "_fallback_cfg", None):
+            self._fallback_client = None
+        self._fallback_cfg = new_fallback
 
     @property
     def available(self) -> bool:
+        self._sync_config()
         return bool(self._api_key or self._fallback_cfg)
 
     @property
     def client(self) -> AsyncOpenAI:
+        self._sync_config()
         if not self.available:
             raise RuntimeError("未配置可用的 LLM API Key")
         if self._client is None:

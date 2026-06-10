@@ -13,6 +13,7 @@ interface ProjectState {
   outputFormat: string
   resolution: string
   platform: string
+  runMode: 'manual' | 'auto'
   characters: any[]
 
   setProject: (data: Partial<ProjectState>) => void
@@ -32,6 +33,7 @@ const DEFAULT_PROJECT: Omit<ProjectState, 'setProject' | 'reset'> = {
   outputFormat: '9:16',
   resolution: '1080p',
   platform: 'douyin',
+  runMode: 'manual',
   characters: [],
 }
 

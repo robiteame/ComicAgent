@@ -17,6 +17,13 @@ from db import init_db  # noqa: E402
 async def lifespan(app: FastAPI):
     init_db()
     print("数据库初始化完成")
+    try:
+        from services.model_config_service import apply_model_config_to_settings
+
+        apply_model_config_to_settings()
+        print("模型与 API 自定义配置已加载")
+    except Exception as exc:  # noqa: BLE001
+        print(f"模型与 API 自定义配置加载失败（沿用默认配置）: {exc}")
     yield
     print("服务关闭")
 
@@ -30,7 +37,13 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    # 桌面客户端的渲染进程来源：开发态为 Vite Dev Server，打包态为 file:// (Origin 为 null)。
+    # 不能与 allow_credentials=True 搭配使用通配符 "*"（浏览器会拒绝），因此显式列出来源。
+    allow_origins=[
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+        "null",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

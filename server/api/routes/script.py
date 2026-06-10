@@ -17,6 +17,7 @@ from models import Project, SceneAsset, Shot as ShotModel
 from services.consistency_service import ConsistencyService
 from services.image_service import ImageService
 from services.llm_service import LLMService
+from services.skill_config_service import agent_prompt_append, agent_style_id, resolve_skill_config
 from services.style_templates import style_prompt_params, style_template
 from services.tts_service import normalize_mimo_voice
 
@@ -51,7 +52,8 @@ class ScriptParseRequest(BaseModel):
 
 @router.post("/generate")
 async def generate_script(data: ScriptGenerateRequest):
-    script = await _generate_script_text(data)
+    skill_config = _resolved_skill_config(data.project_id or "")
+    script = await _generate_script_text(data, skill_config)
     return {
         "project_id": data.project_id,
         "title": _script_title(script),
@@ -68,7 +70,7 @@ async def parse_script(data: ScriptParseRequest):
         raise HTTPException(status_code=400, detail="请输入剧本内容")
     task = _spawn_pipeline(
         data.project_id,
-        _initial_state(data.model_dump()),
+        _initial_state(data.model_dump(), _resolved_skill_config(data.project_id)),
         data.mode,
         data.output_format,
         data.resolution,
@@ -115,23 +117,26 @@ async def upload_script(
         "platform": platform,
         "target_duration": 45,
     }
-    _spawn_pipeline(project_id, _initial_state(payload), mode, output_format, resolution)
+    _spawn_pipeline(project_id, _initial_state(payload, _resolved_skill_config(project_id)), mode, output_format, resolution)
     return {"status": "started", "project_id": project_id, "mode": mode, "file": file.filename, "script": user_input}
 
 
-async def _generate_script_text(data: ScriptGenerateRequest) -> str:
+async def _generate_script_text(data: ScriptGenerateRequest, skill_config: dict | None = None) -> str:
     if not llm_service.available:
         raise RuntimeError("未配置可用的 Mimo/LLM API Key，无法生成真实剧本")
 
+    script_style = agent_style_id(skill_config, "script_agent", data.style)
+    script_append = agent_prompt_append(skill_config, "script_agent")
     try:
         script = await llm_service.call(
             "你是漫剧编剧。请输出完整中文漫剧剧本，包含标题、人物、场景、动作、对白和情绪，不要输出解释。",
             f"""
 创作方向：{data.prompt}
 类型：{data.genre}
-画风：{style_template(data.style)["label"]}（{data.style}）
+画风：{style_template(script_style)["label"]}（{script_style}）
 目标时长：{data.target_duration} 秒
 人物提示：{data.characters_hint or "自行设计 1 到 3 名角色"}
+Skill 配置：{script_append}
 
 请用清晰结构输出：标题、人物、场景一、动作、对白、情绪、场景二……
 """,
@@ -145,8 +150,8 @@ async def _generate_script_text(data: ScriptGenerateRequest) -> str:
     return script
 
 
-def _initial_state(data: dict) -> dict:
-    style = data.get("style", "anime")
+def _initial_state(data: dict, skill_config: dict | None = None) -> dict:
+    style = agent_style_id(skill_config, "script_agent", data.get("style", "anime"))
     return {
         "project_id": data["project_id"],
         "user_input": data.get("user_input", ""),
@@ -163,6 +168,8 @@ def _initial_state(data: dict) -> dict:
         "shots": [],
         "style": style,
         "style_params": style_prompt_params(style),
+        "skill_config": skill_config or {},
+        "skill_prompt_append": agent_prompt_append(skill_config, "script_agent"),
         "output_format": data.get("output_format", "9:16"),
         "resolution": data.get("resolution", "1080p"),
         "platform": data.get("platform", "douyin"),
@@ -177,6 +184,14 @@ def _initial_state(data: dict) -> dict:
         "narrative_context": {},
         "generation_preferences": {},
     }
+
+
+def _resolved_skill_config(project_id: str) -> dict:
+    db = SessionLocal()
+    try:
+        return resolve_skill_config(project_id, db)
+    finally:
+        db.close()
 
 
 def _spawn_pipeline(project_id: str, initial_state: dict, mode: str, output_format: str, resolution: str) -> asyncio.Task:
@@ -292,17 +307,28 @@ def _persist_phase1(db, project_id: str, state: dict, status: str = "assets_read
 
 async def _ensure_character_reference_images(asset_project_id: str, state: dict) -> None:
     style = state.get("style") or state.get("style_suggestion") or "anime"
-    for index, character in enumerate(state.get("characters", [])):
+    skill_append = agent_prompt_append(state.get("skill_config"), "script_agent")
+    characters = state.get("characters", [])
+    semaphore = asyncio.Semaphore(3)
+
+    async def ensure_one(index: int, character: dict) -> None:
+        character.setdefault("id", _character_asset_id(asset_project_id, index))
         refs = character.get("reference_images")
         if isinstance(refs, list) and refs:
-            continue
+            return
         try:
-            ref_path = await image_service.generate_character_reference(
-                character=character,
-                style=style,
-                project_id=asset_project_id,
-                seed=int(character.get("seed") or 42) + 7000 + index,
-            )
+            async with semaphore:
+                character_payload = dict(character)
+                if skill_append:
+                    character_payload["visual_prompt"] = ", ".join(
+                        part for part in [character.get("visual_prompt", ""), skill_append] if part
+                    )
+                ref_path = await image_service.generate_character_reference(
+                    character=character_payload,
+                    style=style,
+                    project_id=asset_project_id,
+                    seed=int(character.get("seed") or 42) + 7000 + index,
+                )
             character["reference_images"] = [ref_path]
         except Exception as exc:
             character["reference_images"] = []
@@ -310,17 +336,24 @@ async def _ensure_character_reference_images(asset_project_id: str, state: dict)
                 part for part in [character.get("visual_prompt", ""), f"three-view reference generation pending: {exc}"] if part
             )
 
+    await asyncio.gather(*(ensure_one(index, character) for index, character in enumerate(characters)))
+
 
 async def _ensure_scene_baseline_images(asset_project_id: str, state: dict) -> None:
     style = state.get("style") or state.get("style_suggestion") or "anime"
+    skill_append = agent_prompt_append(state.get("skill_config"), "script_agent")
     for index, scene in enumerate(state.get("script_scenes", [])):
+        scene.setdefault("id", _scene_asset_id(asset_project_id, index))
         refs = scene.get("reference_images")
         baseline = scene.get("baseline_image_path", "")
         if baseline or (isinstance(refs, list) and refs):
             continue
         try:
+            scene_payload = dict(scene)
+            if skill_append:
+                scene_payload["visual_prompt"] = ", ".join(part for part in [scene.get("visual_prompt", ""), skill_append] if part)
             ref_path = await image_service.generate_scene_baseline_reference(
-                scene=scene,
+                scene=scene_payload,
                 style=style,
                 project_id=asset_project_id,
                 seed=int(scene.get("seed") or 1200) + index,
@@ -344,13 +377,11 @@ def _upsert_characters(db, asset_project_id: str, characters: list[dict]) -> dic
     ids: dict[str, str] = {}
     for index, char in enumerate(characters):
         name = char.get("name") or f"角色{index + 1}"
-        char_id = f"{asset_project_id}_char_{index + 1:04d}"
-        existing = (
-            db.query(CharacterModel)
-            .filter(CharacterModel.project_id == asset_project_id, CharacterModel.name == name)
-            .first()
-        )
+        char_id = char.get("id") or _character_asset_id(asset_project_id, index)
+        char["id"] = char_id
+        existing = db.query(CharacterModel).filter(CharacterModel.project_id == asset_project_id, CharacterModel.id == char_id).first()
         item = existing or CharacterModel(id=char_id, project_id=asset_project_id, name=name)
+        item.name = name
         item.appearance = json.dumps(char.get("appearance", {}), ensure_ascii=False)
         item.personality = char.get("personality", "")
         item.visual_prompt = char.get("visual_prompt", "")
@@ -373,6 +404,10 @@ def _upsert_characters(db, asset_project_id: str, characters: list[dict]) -> dic
     return ids
 
 
+def _character_asset_id(asset_project_id: str, index: int) -> str:
+    return f"{asset_project_id}_char_{index + 1:04d}"
+
+
 def _upsert_scenes(db, asset_project_id: str, scenes: list[dict]) -> list[str]:
     ids: list[str] = []
     for index, scene in enumerate(scenes):
@@ -380,7 +415,8 @@ def _upsert_scenes(db, asset_project_id: str, scenes: list[dict]) -> list[str]:
         time_of_day = scene.get("time_of_day") or "locked"
         scene_group_key = scene.get("scene_group_key", "")
         name = scene.get("name") or f"{location}-{time_of_day}"
-        scene_id = f"{asset_project_id}_scene_{index + 1:04d}"
+        scene_id = scene.get("id") or _scene_asset_id(asset_project_id, index)
+        scene["id"] = scene_id
         base_query = db.query(SceneAsset).filter(SceneAsset.project_id == asset_project_id)
         existing = base_query.filter(SceneAsset.scene_group_key == scene_group_key).first() if scene_group_key else None
         if not existing:
@@ -405,6 +441,10 @@ def _upsert_scenes(db, asset_project_id: str, scenes: list[dict]) -> list[str]:
             db.add(item)
         ids.append(item.id)
     return ids
+
+
+def _scene_asset_id(asset_project_id: str, index: int) -> str:
+    return f"{asset_project_id}_scene_{index + 1:04d}"
 
 
 def _shot_model(

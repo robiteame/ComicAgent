@@ -1,0 +1,29 @@
+{
+  "script": {
+    "provider": "mimo",
+    "api_key": "tp-crgsy330rcduauvmz72i03hc7vw8ebulxgym3a63uzzxm343",
+    "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+    "model": "mimo-v2.5",
+    "max_tokens": 4096
+  },
+  "image": {
+    "provider": " Doubao-Seedream-4.5",
+    "api_key": "ark-a2c26d36-7662-4da8-a44f-007d74482888-3006f",
+    "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+    "model": " Doubao-Seedream-4.5",
+    "image_size": "1440x2560"
+  },
+  "video": {
+    "provider": "Doubao-Seedance-1.5-pro",
+    "api_key": "ark-a2c26d36-7662-4da8-a44f-007d74482888-3006f",
+    "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+    "model": "doubao-seedance-1-5-pro-251215"
+  },
+  "voice": {
+    "api_key": "tp-crgsy330rcduauvmz72i03hc7vw8ebulxgym3a63uzzxm343",
+    "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+    "model": "mimo-v2.5-tts",
+    "voice": "冰糖",
+    "format": "wav"
+  }
+}

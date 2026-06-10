@@ -15,12 +15,22 @@ class SeedanceVideoService:
     """Minimal Seedance client for one-shot connectivity checks."""
 
     def __init__(self):
-        self.api_key = settings.SEEDDANCE_API_KEY or settings.ARK_API_KEY or settings.SEEDREAM_API_KEY
-        self.base_url = self._normalize_base_url(settings.SEEDDANCE_BASE_URL)
-        self.model = settings.SEEDDANCE_MODEL or "doubao-seedance-1-5-pro-251215"
         self.output_dir = settings.OUTPUT_DIR / "projects"
         self.consistency = ConsistencyService()
         self.reference_assets = ReferenceAssetService()
+
+    # 运行时实时读取 settings，保证保存模型/API 配置后新任务即生效。
+    @property
+    def api_key(self) -> str:
+        return settings.SEEDDANCE_API_KEY or settings.ARK_API_KEY or settings.SEEDREAM_API_KEY
+
+    @property
+    def base_url(self) -> str:
+        return self._normalize_base_url(settings.SEEDDANCE_BASE_URL)
+
+    @property
+    def model(self) -> str:
+        return settings.SEEDDANCE_MODEL or "doubao-seedance-1-5-pro-251215"
 
     async def generate_single_shot(
         self,
@@ -77,9 +87,23 @@ class SeedanceVideoService:
             shot_id=shot.get("shot_id", "seedance_shot"),
             duration=self._duration_for_model(),
             ratio=shot.get("output_format", "9:16"),
-            resolution="720p",
+            resolution=self._seedance_resolution(shot.get("resolution")),
             content=content,
         )
+
+    def _seedance_resolution(self, resolution: str | None) -> str:
+        # 项目分辨率可为 720p/1080p/2k/4k；Seedance 1.5 pro 仅支持到 1080p，
+        # 因此 2k/4k 统一降级到 1080p，保证 API 不因不支持的档位报错。
+        value = str(resolution or "").strip().lower()
+        mapping = {
+            "480p": "480p",
+            "720p": "720p",
+            "1080p": "1080p",
+            "1080": "1080p",
+            "2k": "1080p",
+            "4k": "1080p",
+        }
+        return mapping.get(value, "720p")
 
     def _duration_for_model(self) -> int:
         # Seedance pro t2v rejects arbitrary shot durations. Keep generation at
@@ -105,6 +129,7 @@ class SeedanceVideoService:
             shot.get("visual_notes", ""),
             shot.get("scene_description", ""),
             shot.get("character_action", ""),
+            shot.get("skill_prompt_append", ""),
             shot.get("shot_type", ""),
             shot.get("camera_angle", ""),
         ]

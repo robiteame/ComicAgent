@@ -1,5 +1,5 @@
 ﻿import React, { useEffect, useMemo, useRef, useState } from 'react'
-import { Button, Input, Select, message } from 'antd'
+import { Button, Input, Modal, Segmented, Select, Tooltip, message } from 'antd'
 import {
   BulbOutlined,
   CheckCircleOutlined,
@@ -17,11 +17,13 @@ import { useShotStore } from '../stores/shotStore'
 import { useProjectStore } from '../stores/projectStore'
 import { API_OUTPUT_BASE, assetApi, createWebSocket, projectApi, renderApi, scriptApi, settingsApi, shotApi } from '../services/api'
 import { STYLE_DESCRIPTIONS, STYLE_OPTIONS } from '../constants/styleTemplates'
-import { OPEN_SETTINGS_EVENT } from './TopBar'
+import { STYLE_TEMPLATES_UPDATED_EVENT } from './SystemSettingsPage'
 
 const { TextArea } = Input
 const PARSE_SCRIPT_EVENT = 'pipeline:parse-script'
 const OPEN_CREATE_PROJECT_EVENT = 'workspace:open-create-project'
+const OPEN_SHOT_CONFIG_EVENT = 'workspace:open-shot-config'
+const WORKSPACE_NAVIGATE_EVENT = 'workspace:navigate'
 
 type StyleOption = { value: string; label: string; keywords?: string; custom?: boolean }
 
@@ -66,9 +68,11 @@ function normalizeShot(shot: any) {
     character_action: shot.character_action || '',
     dialogue: shot.dialogue || '',
     camera_angle: shot.camera_angle || '正面',
+    camera_movement: shot.camera_movement || '静止',
     duration: Number(shot.duration || 3),
     emotion: shot.emotion || 'neutral',
     transition: shot.transition || 'cut',
+    visual_notes: shot.visual_notes || '',
     image_path: shot.image_path || '',
     storyboard_path: shot.storyboard_path || '',
     video_path: shot.video_path || '',
@@ -125,6 +129,7 @@ const MainWorkspace: React.FC = () => {
     platform,
     outputFormat,
     resolution,
+    runMode,
   } = useProjectStore()
 
   const [script, setScript] = useState('')
@@ -143,30 +148,22 @@ const MainWorkspace: React.FC = () => {
   const [assetBoardReady, setAssetBoardReady] = useState(false)
   const [assetTab, setAssetTab] = useState<'characters' | 'scenes'>('characters')
   const [styleTemplates, setStyleTemplates] = useState<StyleOption[]>(STYLE_OPTIONS)
-  const [showSettingsPanel, setShowSettingsPanel] = useState(false)
-  const [customStyleName, setCustomStyleName] = useState('')
-  const [customStyleKeywords, setCustomStyleKeywords] = useState('')
-  const [customStyleNegative, setCustomStyleNegative] = useState('')
-  const [savingStyleTemplate, setSavingStyleTemplate] = useState(false)
   const [editingAssetId, setEditingAssetId] = useState<string | null>(null)
   const [assetDraft, setAssetDraft] = useState<Record<string, any>>({})
   const [savingAsset, setSavingAsset] = useState(false)
-  const [shotPromptDraft, setShotPromptDraft] = useState('')
-  const [shotSceneDraft, setShotSceneDraft] = useState('')
-  const [shotActionDraft, setShotActionDraft] = useState('')
-  const [shotCameraDraft, setShotCameraDraft] = useState('')
-  const [regeneratingShot, setRegeneratingShot] = useState(false)
   const [workspaceTab, setWorkspaceTab] = useState<WorkspaceTab>('script')
   const [previewMode, setPreviewMode] = useState<'shot' | 'video'>('shot')
   const [previewScale, setPreviewScale] = useState(1)
   const [previewOffset, setPreviewOffset] = useState({ x: 0, y: 0 })
   const [dragStart, setDragStart] = useState<{ x: number; y: number; ox: number; oy: number } | null>(null)
+  const [imagePreview, setImagePreview] = useState<{ url: string; title: string } | null>(null)
   const wsRef = useRef<WebSocket | null>(null)
   const wsProjectIdRef = useRef<string | null>(null)
   const uploadInputRef = useRef<HTMLInputElement | null>(null)
   const generateRef = useRef<() => Promise<void>>(async () => {})
   const awaitingRef = useRef(awaitingStoryboardConfirm)
   const stepRef = useRef(currentStep)
+  const pollingRef = useRef(false)
 
   const selectedShot = useMemo(
     () => shots.find((s) => s.id === selectedShotId) || shots[0],
@@ -188,6 +185,26 @@ const MainWorkspace: React.FC = () => {
     [shots],
   )
 
+  useEffect(() => {
+    const navigateWorkspace = (event: Event) => {
+      const detail = (event as CustomEvent<{ tab?: WorkspaceTab; previewMode?: 'shot' | 'video' }>).detail || {}
+      const nextTab = detail.tab
+      if (nextTab && WORKSPACE_TABS.some((tab) => tab.id === nextTab)) {
+        setWorkspaceTab(nextTab)
+      }
+      if (detail.previewMode) {
+        setPreviewMode(detail.previewMode)
+      } else if (nextTab === 'storyboard' || nextTab === 'review') {
+        setPreviewMode('shot')
+      } else if (nextTab === 'video') {
+        setPreviewMode('video')
+      }
+    }
+
+    window.addEventListener(WORKSPACE_NAVIGATE_EVENT, navigateWorkspace)
+    return () => window.removeEventListener(WORKSPACE_NAVIGATE_EVENT, navigateWorkspace)
+  }, [])
+
   const replaceShots = (nextShots: any[]) => {
     const normalized = nextShots.map(normalizeShot).filter((s) => s.id)
     setShots(normalized)
@@ -206,6 +223,13 @@ const MainWorkspace: React.FC = () => {
     const board = await assetApi.board(pid)
     setAssetBoard({ characters: board.characters || [], scenes: board.scenes || [] })
     return board
+  }
+
+  const refreshWorkspaceData = async (pid: string, includeAssets = false) => {
+    await loadProjectShots(pid)
+    if (includeAssets) {
+      await loadAssetBoard(pid)
+    }
   }
 
   const loadStyleTemplates = async () => {
@@ -248,12 +272,20 @@ const MainWorkspace: React.FC = () => {
     // 单一 WebSocket 入口：统一驱动流程进度、镜头更新和完成态。
     const ws = createWebSocket(pid, (data) => {
       const ts = new Date().toLocaleTimeString('zh-CN', { hour12: false })
+      // 实时读取最新运行模式：全自动模式下后端 LangGraph 不在人工卡点停留，
+      // 前端也不应切到“等待确认”态或关闭生成中状态。
+      const autoMode = useProjectStore.getState().runMode === 'auto'
 
       if (data.type === 'progress') {
         appendLog(`[${ts}] ${getStepLabel(data.step)} | ${data.progress ?? 0}%`)
         setProgress(Number(data.progress || 0), data.step || '')
 
         if (data.step === 'wait_asset_confirm') {
+          if (autoMode) {
+            void loadProjectShots(pid)
+            void loadAssetBoard(pid)
+            return
+          }
           setGenerating(false)
           setLoading(false)
           setAssetBoardReady(true)
@@ -266,6 +298,10 @@ const MainWorkspace: React.FC = () => {
         }
 
         if (data.step === 'wait_storyboard_approval') {
+          if (autoMode) {
+            void loadProjectShots(pid)
+            return
+          }
           setGenerating(false)
           setLoading(false)
           setGeneratingStoryboard(false)
@@ -307,10 +343,14 @@ const MainWorkspace: React.FC = () => {
           last_frame_path: data.last_frame_path || '',
         })
         if (data.video_path) {
-          setGenerating(false)
-          setPreviewMode('video')
-          setWorkspaceTab('video')
-          void loadProjectShots(pid)
+          if (autoMode) {
+            void loadProjectShots(pid)
+          } else {
+            setGenerating(false)
+            setPreviewMode('video')
+            setWorkspaceTab('video')
+            void loadProjectShots(pid)
+          }
         }
         return
       }
@@ -319,6 +359,13 @@ const MainWorkspace: React.FC = () => {
         appendLog(`[${ts}] 流程执行完成`)
 
         if (data.asset_board_ready) {
+          if (autoMode) {
+            if (Array.isArray(data.shots) && data.shots.length > 0) {
+              replaceShots(data.shots)
+            }
+            void loadAssetBoard(pid)
+            return
+          }
           setGenerating(false)
           setLoading(false)
           setAssetBoardReady(true)
@@ -331,7 +378,7 @@ const MainWorkspace: React.FC = () => {
           return
         }
 
-        if (!data.video_path || awaitingRef.current || stepRef.current === 'wait_storyboard_approval') {
+        if (!autoMode && (!data.video_path || awaitingRef.current || stepRef.current === 'wait_storyboard_approval')) {
           setGenerating(false)
           setLoading(false)
           setAwaitingStoryboardConfirm(true)
@@ -341,6 +388,16 @@ const MainWorkspace: React.FC = () => {
             replaceShots(data.shots)
           }
           void loadProjectShots(pid)
+          return
+        }
+
+        if (autoMode && !data.video_path) {
+          // 全自动模式下的中间态 complete（无成片）：仅刷新数据，保持生成中，等待后续节点。
+          if (Array.isArray(data.shots) && data.shots.length > 0) {
+            replaceShots(data.shots)
+          } else {
+            void loadProjectShots(pid)
+          }
           return
         }
 
@@ -366,7 +423,11 @@ const MainWorkspace: React.FC = () => {
       }
 
       if (data.type === 'storyboard_ready') {
-        appendLog(`[${ts}] 故事板生成完成，等待审核`)
+        appendLog(`[${ts}] 故事板生成完成${autoMode ? '（全自动继续生成视频）' : '，等待审核'}`)
+        if (autoMode) {
+          void loadProjectShots(pid)
+          return
+        }
         setGenerating(false)
         setGeneratingStoryboard(false)
         setAwaitingStoryboardConfirm(true)
@@ -426,31 +487,6 @@ const MainWorkspace: React.FC = () => {
       await projectApi.update(projectId, { [field]: value })
     } catch (err: any) {
       message.error('项目配置更新失败：' + (err.message || '未知错误'))
-    }
-  }
-
-  const handleSaveCustomStyle = async () => {
-    if (!customStyleName.trim() || !customStyleKeywords.trim()) {
-      message.warning('请输入模板名称和画风关键词')
-      return
-    }
-    try {
-      setSavingStyleTemplate(true)
-      const template = await settingsApi.createStyleTemplate({
-        label: customStyleName,
-        keywords: customStyleKeywords,
-        negative_prompt: customStyleNegative,
-      })
-      await loadStyleTemplates()
-      await updateProjectField('style', template.value)
-      setCustomStyleName('')
-      setCustomStyleKeywords('')
-      setCustomStyleNegative('')
-      message.success('自定义画风模板已保存')
-    } catch (err: any) {
-      message.error('保存画风模板失败：' + (err.message || '未知错误'))
-    } finally {
-      setSavingStyleTemplate(false)
     }
   }
 
@@ -600,8 +636,11 @@ const MainWorkspace: React.FC = () => {
         resolution,
         platform,
         target_duration: 30,
+        mode: runMode,
       })
-      appendLog(`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] 已提交解析任务`)
+      appendLog(
+        `[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] 已提交解析任务（${runMode === 'auto' ? '全自动生成' : '手动审核'}）`,
+      )
     } catch (err: any) {
       message.error('提交失败：' + (err.message || '未知错误'))
       setGenerating(false)
@@ -669,6 +708,7 @@ const MainWorkspace: React.FC = () => {
       formData.append('output_format', outputFormat)
       formData.append('resolution', resolution)
       formData.append('platform', platform)
+      formData.append('mode', runMode)
 
       const result = await scriptApi.upload(formData)
       if (typeof result.script === 'string') {
@@ -748,48 +788,6 @@ const MainWorkspace: React.FC = () => {
     }
   }
 
-  const handleRegenerateSelectedShot = async () => {
-    if (!projectId || !selectedShot) return
-    if (selectedShot.confirmed) {
-      message.warning('已审批锁定的镜头不可改动或重生成')
-      return
-    }
-    try {
-      setRegeneratingShot(true)
-      setGenerating(true)
-      setPreviewMode('shot')
-      setWorkspaceTab('review')
-      connectWebSocket(projectId)
-      await shotApi.regenerate(selectedShot.id, {
-        prompt: shotPromptDraft,
-        visual_notes: shotPromptDraft,
-        new_scene: shotSceneDraft,
-        new_camera_angle: shotCameraDraft,
-        character_action: shotActionDraft,
-        reason: shotPromptDraft,
-      })
-      updateShot(selectedShot.id, {
-        scene_description: shotSceneDraft,
-        character_action: shotActionDraft,
-        camera_angle: shotCameraDraft,
-        confirmed: false,
-        status: 'pending',
-        storyboard_status: 'queued',
-        storyboard_path: '',
-        image_path: '',
-        video_path: '',
-        audio_path: '',
-      })
-      appendLog(`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] 已提交镜头 ${selectedShot.sequence} 重生成`)
-      message.success('镜头重生成已启动')
-    } catch (err: any) {
-      message.error('镜头重生成失败：' + (err.message || '未知错误'))
-      setGenerating(false)
-    } finally {
-      setRegeneratingShot(false)
-    }
-  }
-
   const changePreviewScale = (delta: number) => {
     setPreviewScale((value) => Math.min(3, Math.max(0.5, Number((value + delta).toFixed(2)))))
   }
@@ -836,7 +834,7 @@ const MainWorkspace: React.FC = () => {
 
   useEffect(() => {
     generateRef.current = handleGenerate
-  }, [script, projectId, style, outputFormat, resolution, platform])
+  }, [script, projectId, style, outputFormat, resolution, platform, runMode])
 
   useEffect(() => {
     awaitingRef.current = awaitingStoryboardConfirm
@@ -857,31 +855,23 @@ const MainWorkspace: React.FC = () => {
       setShowCreatePanel(true)
     }
 
-    const onOpenSettings = () => {
-      setShowSettingsPanel(true)
-      void loadStyleTemplates().catch(() => undefined)
-    }
-
     window.addEventListener(PARSE_SCRIPT_EVENT, onParse)
     window.addEventListener(OPEN_CREATE_PROJECT_EVENT, onOpenCreateProject)
-    window.addEventListener(OPEN_SETTINGS_EVENT, onOpenSettings)
     return () => {
       window.removeEventListener(PARSE_SCRIPT_EVENT, onParse)
       window.removeEventListener(OPEN_CREATE_PROJECT_EVENT, onOpenCreateProject)
-      window.removeEventListener(OPEN_SETTINGS_EVENT, onOpenSettings)
     }
   }, [])
 
   useEffect(() => {
-    void loadStyleTemplates().catch(() => undefined)
-  }, [])
+    const reloadStyleTemplates = () => {
+      void loadStyleTemplates().catch(() => undefined)
+    }
 
-  useEffect(() => {
-    setShotPromptDraft(selectedShot?.consistency_context || selectedShot?.scene_description || '')
-    setShotSceneDraft(selectedShot?.scene_description || '')
-    setShotActionDraft(selectedShot?.character_action || '')
-    setShotCameraDraft(selectedShot?.camera_angle || '')
-  }, [selectedShot?.id])
+    reloadStyleTemplates()
+    window.addEventListener(STYLE_TEMPLATES_UPDATED_EVENT, reloadStyleTemplates)
+    return () => window.removeEventListener(STYLE_TEMPLATES_UPDATED_EVENT, reloadStyleTemplates)
+  }, [])
 
   useEffect(() => {
     if (!projectId) return
@@ -905,6 +895,23 @@ const MainWorkspace: React.FC = () => {
     }
   }, [projectId])
 
+  useEffect(() => {
+    if (!projectId || !isGenerating) return
+
+    const timer = window.setInterval(() => {
+      if (pollingRef.current) return
+      pollingRef.current = true
+      const includeAssets = currentStep === 'wait_asset_confirm' || currentStep === 'generate_storyboard'
+      refreshWorkspaceData(projectId, includeAssets)
+        .catch(() => undefined)
+        .finally(() => {
+          pollingRef.current = false
+        })
+    }, 3200)
+
+    return () => window.clearInterval(timer)
+  }, [projectId, isGenerating, currentStep])
+
   const imageUrl = toOutputUrl(selectedShot?.storyboard_path || selectedShot?.image_path)
   const videoUrl = videoPath
     ? videoPath.startsWith('/output/')
@@ -923,7 +930,14 @@ const MainWorkspace: React.FC = () => {
     const firstImage = Array.isArray(item.reference_images) ? item.reference_images[0] : ''
     const previewUrl = toOutputUrl(firstImage)
     return previewUrl ? (
-      <img src={previewUrl} alt={label} />
+      <button
+        type="button"
+        className="image-preview-trigger"
+        onClick={() => setImagePreview({ url: previewUrl, title: item.name || label })}
+        aria-label="查看高清原图"
+      >
+        <img src={previewUrl} alt={label} />
+      </button>
     ) : (
       <span>{label}</span>
     )
@@ -931,6 +945,13 @@ const MainWorkspace: React.FC = () => {
 
   const selectedShotReady = Boolean(selectedShot && (selectedShot.storyboard_path || selectedShot.image_path))
   const showPreviewSurface = workspaceTab === 'storyboard' || workspaceTab === 'review' || workspaceTab === 'video'
+  const openShotConfig = (shotId: string) => {
+    selectShot(shotId)
+    setWorkspaceTab('review')
+    setPreviewMode('shot')
+    window.dispatchEvent(new CustomEvent(WORKSPACE_NAVIGATE_EVENT, { detail: { tab: 'review', previewMode: 'shot' } }))
+    window.dispatchEvent(new CustomEvent(OPEN_SHOT_CONFIG_EVENT))
+  }
 
   return (
     <section className="main-workspace tabbed-workspace" aria-label="主工作区">
@@ -969,57 +990,6 @@ const MainWorkspace: React.FC = () => {
           )
         })}
       </div>
-
-      {showSettingsPanel && (
-        <div className="system-settings-panel panel-enter" role="region" aria-label="系统设置">
-          <div className="settings-head">
-            <div>
-              <strong>系统设置</strong>
-              <span>画风模板会直接进入素材和分镜生成链路。</span>
-            </div>
-            <Button size="small" onClick={() => setShowSettingsPanel(false)}>收起</Button>
-          </div>
-          <div className="settings-grid">
-            <div className="settings-field">
-              <span>当前画风</span>
-              <Select
-                value={style}
-                size="small"
-                onChange={(value) => void updateProjectField('style', value)}
-                options={styleTemplates.map((item) => ({
-                  value: item.value,
-                  label: item.custom ? `${item.label}（自定义）` : item.label,
-                }))}
-              />
-            </div>
-            <div className="settings-field">
-              <span>模板名称</span>
-              <Input size="small" value={customStyleName} onChange={(event) => setCustomStyleName(event.target.value)} />
-            </div>
-            <div className="settings-field wide">
-              <span>自定义画风关键词</span>
-              <TextArea
-                autoSize={{ minRows: 2, maxRows: 4 }}
-                value={customStyleKeywords}
-                onChange={(event) => setCustomStyleKeywords(event.target.value)}
-                placeholder="例如：柔和水彩、低饱和校园光、干净线稿、统一暖色后期"
-              />
-            </div>
-            <div className="settings-field wide">
-              <span>负向关键词</span>
-              <Input
-                size="small"
-                value={customStyleNegative}
-                onChange={(event) => setCustomStyleNegative(event.target.value)}
-                placeholder="例如：过曝、脏乱笔触、文字、水印"
-              />
-            </div>
-            <Button type="primary" size="small" loading={savingStyleTemplate} onClick={() => void handleSaveCustomStyle()}>
-              保存为模板
-            </Button>
-          </div>
-        </div>
-      )}
 
       <div className="workspace-tab-body">
         {workspaceTab === 'script' && (
@@ -1076,6 +1046,26 @@ const MainWorkspace: React.FC = () => {
                   { value: '4k', label: '超高清 4 千' },
                 ]}
               />
+            </div>
+            <div className="toolbar-field">
+              <span className="toolbar-label">生成模式</span>
+              <Tooltip
+                title={
+                  runMode === 'auto'
+                    ? '全自动：解析剧本后由 LangGraph 一路跑到成片，自动通过故事板与逐镜视频，无需人工审核。'
+                    : '手动审核：每一步生成后暂停，等待你确认素材、逐镜审核故事板再生成视频。'
+                }
+              >
+                <Segmented
+                  size="small"
+                  value={runMode}
+                  onChange={(value) => setProject({ runMode: value as 'manual' | 'auto' })}
+                  options={[
+                    { value: 'manual', label: '手动审核' },
+                    { value: 'auto', label: '全自动生成' },
+                  ]}
+                />
+              </Tooltip>
             </div>
           </div>
         </div>
@@ -1312,38 +1302,6 @@ const MainWorkspace: React.FC = () => {
               </div>
             )}
 
-            {workspaceTab === 'review' && selectedShot && (
-              <div className={`shot-regenerate-panel panel-enter${selectedShot.confirmed ? ' locked' : ''}`}>
-                {selectedShot.confirmed ? (
-                  <div className="shot-lock-note">该镜头已审批锁定，禁止修改 Prompt 或重生成。</div>
-                ) : (
-                  <>
-                    <TextArea
-                      autoSize={{ minRows: 2, maxRows: 4 }}
-                      value={shotPromptDraft}
-                      onChange={(event) => setShotPromptDraft(event.target.value)}
-                      placeholder="单独调整当前镜头 Prompt，不覆盖项目一致性 SOP"
-                    />
-                    <div className="shot-regenerate-grid">
-                      <Input size="small" value={shotSceneDraft} onChange={(event) => setShotSceneDraft(event.target.value)} placeholder="场景描述" />
-                      <Input size="small" value={shotActionDraft} onChange={(event) => setShotActionDraft(event.target.value)} placeholder="人物动作" />
-                      <Input size="small" value={shotCameraDraft} onChange={(event) => setShotCameraDraft(event.target.value)} placeholder="机位角度" />
-                      <Button
-                        type="primary"
-                        size="small"
-                        icon={<ReloadOutlined />}
-                        loading={regeneratingShot}
-                        disabled={!selectedShotReady}
-                        onClick={() => void handleRegenerateSelectedShot()}
-                      >
-                        重生成当前镜头
-                      </Button>
-                    </div>
-                  </>
-                )}
-              </div>
-            )}
-
             <div className="preview-panel panel-enter" role="tabpanel">
         <div
           className={`preview-stage${dragStart ? ' dragging' : ''}`}
@@ -1432,6 +1390,10 @@ const MainWorkspace: React.FC = () => {
                 src={imageUrl}
                 alt="当前镜头预览"
                 draggable={false}
+                onClick={(event) => {
+                  event.stopPropagation()
+                  setImagePreview({ url: imageUrl, title: `镜头 ${selectedShot?.sequence || ''} 高清预览` })
+                }}
                 style={{
                   transform: `translate(${previewOffset.x}px, ${previewOffset.y}px) scale(${previewScale})`,
                 }}
@@ -1476,7 +1438,7 @@ const MainWorkspace: React.FC = () => {
                 <div
                   key={shot.id}
                   className={`thumb-item${isSelected ? ' active' : ''}${shot.confirmed ? ' approved' : ''}`}
-                  onClick={() => selectShot(shot.id)}
+                  onClick={() => openShotConfig(shot.id)}
                 >
                   {thumbUrl ? (
                     <img src={thumbUrl} alt={`镜头 ${i + 1}`} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
@@ -1496,6 +1458,17 @@ const MainWorkspace: React.FC = () => {
           </>
         )}
       </div>
+      <Modal
+        open={Boolean(imagePreview)}
+        title={imagePreview?.title || '高清预览'}
+        footer={null}
+        centered
+        width="min(1120px, 92vw)"
+        className="image-preview-modal"
+        onCancel={() => setImagePreview(null)}
+      >
+        {imagePreview && <img src={imagePreview.url} alt={imagePreview.title} />}
+      </Modal>
     </section>
   )
 }

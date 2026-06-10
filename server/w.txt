@@ -1,0 +1,23 @@
+[
+ [
+  263,
+  "raise HTTPException(status_code=400, detail=\"璇ラ暅澶存晠浜嬫澘灏氭湭鐢熸垚\")",
+  "raise HTTPException(status_code=400, detail=\"该镜头故事板尚未生成\")"
+ ],
+ [
+  279,
+  "raise HTTPException(status_code=400, detail=\"璇峰厛瀹℃牳閫氳繃璇ラ暅澶存晠浜嬫澘\")",
+  "raise HTTPException(status_code=400, detail=\"请先审核通过该镜头故事板\")"
+ ],
+ [
+  505,
+  "await _progress(project_id, \"generate_seedance_video\", 90, f\"姝ｅ湪鐢熸垚闀滃ご {shot.sequence} 鐨?S",
+  "await _progress(project_id, \"generate_seedance_video\", 90, f\"正在生成镜头 {shot.sequence} 鐨?Seed"
+ ],
+ [
+  552,
+  "{\"type\": \"error\", \"message\": f\"闀滃ご {shot.sequence} 瑙嗛鐢熸垚澶辫触: {exc}\\n{traceback.format_exc",
+  "{\"type\": \"error\", \"message\": f\"镜头 {shot.sequence} 瑙嗛鐢熸垚澶辫触: {exc}\\n{traceback.format_exc("
+ ]
+]
+COUNT 4

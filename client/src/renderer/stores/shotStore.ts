@@ -9,9 +9,11 @@ export interface Shot {
   character_action: string
   dialogue: string
   camera_angle: string
+  camera_movement: string
   duration: number
   emotion: string
   transition: string
+  visual_notes: string
   image_path: string
   storyboard_path: string
   video_path: string

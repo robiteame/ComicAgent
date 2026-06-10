@@ -16,7 +16,28 @@
       "Bash(del /f \"D:\\\\WorkSpace\\\\ComicAgent\\\\client\\\\src\\\\renderer\\\\pages\\\\ScriptInput.tsx\" \"D:\\\\WorkSpace\\\\ComicAgent\\\\client\\\\src\\\\renderer\\\\pages\\\\Storyboard.tsx\" \"D:\\\\WorkSpace\\\\ComicAgent\\\\client\\\\src\\\\renderer\\\\pages\\\\ShotEditor.tsx\" \"D:\\\\WorkSpace\\\\ComicAgent\\\\client\\\\src\\\\renderer\\\\pages\\\\Timeline.tsx\" \"D:\\\\WorkSpace\\\\ComicAgent\\\\client\\\\src\\\\renderer\\\\pages\\\\Export.tsx\" \"D:\\\\WorkSpace\\\\ComicAgent\\\\client\\\\src\\\\renderer\\\\components\\\\Sidebar.tsx\")",
       "Bash(gh auth *)",
       "Bash(where git *)",
-      "Bash(where gh *)"
+      "Bash(where gh *)",
+      "Bash(npx tsc *)",
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(/d/Anaconda3/python.exe -c ' *)",
+      "Bash(rm -f server/data/model_api_config.json client/tsc_out.txt client/diag.txt client/diag2.txt client/pytest_out.txt)",
+      "Bash(/d/Anaconda3/python.exe -c \"print\\('cleanup done'\\)\")",
+      "Bash(/d/Anaconda3/python.exe *)",
+      "Read(//tmp/**)",
+      "Bash(dir /s /b \"D:\\\\WorkSpace\\\\ComicAgent\\\\server\\\\*.py\")",
+      "Bash(git rm *)",
+      "Bash(py -3 -c \"import ast; ast.parse\\(open\\('api/routes/script.py',encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('main.py',encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(echo \"py3 failed\")",
+      "Bash(ls /c/Python*/python.exe /c/Users/zhang/AppData/Local/Programs/Python/*/python.exe)",
+      "Bash(ls -d server/.venv server/venv .venv venv)",
+      "Bash(which python.exe python3.exe)",
+      "Bash(ls \"/c/Users/zhang/AppData/Local/Programs/Python\")",
+      "Bash(echo \"---done---\")",
+      "Bash(dir D:\\\\WorkSpace\\\\ComicAgent\\\\client\\\\src\\\\renderer\\\\components *)",
+      "Bash(dir D:\\\\WorkSpace\\\\ComicAgent\\\\server\\\\services *)",
+      "Bash(git clean *)",
+      "Bash(/c/Users/zhang/AppData/Local/Programs/Python/Python313/python.exe -c ' *)",
+      "Bash(true)"
     ]
   }
 }

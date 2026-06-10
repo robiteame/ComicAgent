@@ -1,21 +1,25 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import {
+  AppstoreAddOutlined,
   CaretDownOutlined,
   CaretRightOutlined,
+  CloudUploadOutlined,
+  ControlOutlined,
   DeleteOutlined,
-  FileOutlined,
-  FolderOutlined,
-  ImportOutlined,
+  FolderOpenOutlined,
   LeftOutlined,
-  PlusOutlined,
+  PlaySquareOutlined,
+  ProjectOutlined,
   RightOutlined,
 } from '@ant-design/icons'
 import { message, Modal, Tooltip } from 'antd'
 import { characterApi, projectApi, shotApi } from '../services/api'
 import { useProjectStore } from '../stores/projectStore'
 import { useShotStore } from '../stores/shotStore'
+import { OPEN_SETTINGS_EVENT } from './TopBar'
 
 const OPEN_CREATE_PROJECT_EVENT = 'workspace:open-create-project'
+const WORKSPACE_NAVIGATE_EVENT = 'workspace:navigate'
 
 interface ProjectItem {
   id: string
@@ -148,6 +152,7 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
       selectShot(shotList?.[0]?.id || null)
       setAwaitingStoryboardConfirm(projectDetail.status === 'storyboard_ready')
       setVideoPath(projectDetail.video_path || (projectDetail.status === 'completed' ? `/output/projects/${projectDetail.id}/output/final.mp4` : ''))
+      window.dispatchEvent(new CustomEvent(WORKSPACE_NAVIGATE_EVENT, { detail: { tab: 'script' } }))
     } catch (err: any) {
       message.error('加载项目失败：' + (err.message || '未知错误'))
     } finally {
@@ -216,6 +221,7 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
   }
 
   const handleDeleteProject = (project: ProjectItem, event: React.MouseEvent) => {
+    event.preventDefault()
     event.stopPropagation()
     const isEpisode = project.project_type === 'episode'
     const title = cleanTitle(project.title)
@@ -228,21 +234,26 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
       cancelText: '取消',
       okButtonProps: { danger: true },
       onOk: async () => {
-        await projectApi.delete(project.id)
-        const deletedCurrent =
-          project.id === projectId ||
-          (project.project_type !== 'episode' && (parentProjectId === project.id || projectId === project.id))
-        if (deletedCurrent) {
-          reset()
-          setShots([])
-          selectShot(null)
-          setAwaitingStoryboardConfirm(false)
-          setVideoPath('')
-          setProgress(0, '')
-          clearLogs()
+        try {
+          await projectApi.delete(project.id)
+          const deletedCurrent =
+            project.id === projectId ||
+            (project.project_type !== 'episode' && (parentProjectId === project.id || projectId === project.id))
+          if (deletedCurrent) {
+            reset()
+            setShots([])
+            selectShot(null)
+            setAwaitingStoryboardConfirm(false)
+            setVideoPath('')
+            setProgress(0, '')
+            clearLogs()
+          }
+          refreshProjects()
+          message.success('项目已删除，关联资产已清理')
+        } catch (err: any) {
+          message.error('项目删除失败：' + (err.response?.data?.detail || err.message || '未知错误'))
+          throw err
         }
-        refreshProjects()
-        message.success('项目已删除，关联资产已清理')
       },
     })
   }
@@ -269,7 +280,7 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
         <button type="button" className="project-main" onClick={() => void handleSelectProject(project.id)}>
           <div className="project-item-title">
             <span className={`project-item-icon${isEpisode ? '' : ' folder'}`}>
-              {isEpisode ? <FileOutlined /> : <FolderOutlined />}
+              {isEpisode ? <PlaySquareOutlined /> : <FolderOpenOutlined />}
             </span>
             <span>{isEpisode ? `第 ${project.episode_number || 1} 集 · ` : ''}{title}</span>
           </div>
@@ -280,6 +291,11 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
             type="button"
             className="project-delete-btn"
             aria-label={isEpisode ? '删除单集' : '删除项目'}
+            onMouseDown={(event) => {
+              event.preventDefault()
+              event.stopPropagation()
+            }}
+            onPointerDown={(event) => event.stopPropagation()}
             onClick={(event) => handleDeleteProject(project, event)}
           >
             <DeleteOutlined />
@@ -290,10 +306,12 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
   }
 
   const actionItems = [
-    { id: 'create', label: '新建项目', icon: <PlusOutlined />, onClick: () => window.dispatchEvent(new CustomEvent(OPEN_CREATE_PROJECT_EVENT)) },
-    { id: 'episode', label: '新建剧集', icon: <FileOutlined />, onClick: () => void handleCreateEpisode() },
-    { id: 'import-video', label: '导入成片', icon: <ImportOutlined />, onClick: () => finalVideoInputRef.current?.click() },
+    { id: 'create', label: '新建项目', icon: <AppstoreAddOutlined />, onClick: () => window.dispatchEvent(new CustomEvent(OPEN_CREATE_PROJECT_EVENT)) },
+    { id: 'episode', label: '新建剧集', icon: <ProjectOutlined />, onClick: () => void handleCreateEpisode() },
+    { id: 'import-video', label: '导入成片', icon: <CloudUploadOutlined />, onClick: () => finalVideoInputRef.current?.click() },
   ]
+
+  const openSettings = () => window.dispatchEvent(new CustomEvent(OPEN_SETTINGS_EVENT))
 
   return (
     <aside className={`left-sidebar${collapsed ? ' collapsed' : ''}`} aria-label="左侧导航">
@@ -344,7 +362,7 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
                         onClick={() => void handleSelectProject(series.id)}
                         aria-label={title}
                       >
-                        <FolderOutlined />
+                        <FolderOpenOutlined />
                       </button>
                     </Tooltip>
                   )
@@ -372,6 +390,21 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
             )}
           </div>
         </div>
+      </div>
+
+      <div className="sidebar-footer">
+        {collapsed ? (
+          <Tooltip title="系统设置" placement="right">
+            <button type="button" className="collapsed-project-btn sidebar-settings-btn" onClick={openSettings} aria-label="系统设置">
+              <ControlOutlined />
+            </button>
+          </Tooltip>
+        ) : (
+          <button type="button" className="linear-action sidebar-settings-btn" onClick={openSettings}>
+            <span className="linear-action-icon"><ControlOutlined /></span>
+            <span>系统设置</span>
+          </button>
+        )}
       </div>
 
       <input

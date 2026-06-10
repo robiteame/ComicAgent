@@ -1,1 +1,66 @@
-"use strict";const e=require("electron"),t=require("path");let a=null;e.app.setName("ComicAgent");e.app.setPath("userData",t.join(e.app.getPath("appData"),"ComicAgent"));e.app.commandLine.appendSwitch("disable-http-cache");e.app.commandLine.appendSwitch("disable-gpu-shader-disk-cache");function i(){const n={width:1400,height:900,minWidth:1200,minHeight:800,title:"漫剧智能办公台",transparent:!0,backgroundColor:"#00000000",autoHideMenuBar:!0,webPreferences:{preload:t.join(__dirname,"preload.js"),contextIsolation:!0,nodeIntegration:!1}};process.platform==="win32"&&(n.backgroundMaterial="acrylic"),a=new e.BrowserWindow(n),a.setMenuBarVisibility(!1),process.env.NODE_ENV==="development"||!e.app.isPackaged?a.loadURL("http://127.0.0.1:5173"):a.loadFile(t.join(__dirname,"../dist/index.html"))}e.app.whenReady().then(()=>{e.Menu.setApplicationMenu(null),i()});e.app.on("window-all-closed",()=>{process.platform!=="darwin"&&e.app.quit()});e.app.on("activate",()=>{e.BrowserWindow.getAllWindows().length===0&&i()});e.ipcMain.handle("select-file",async()=>{const n=await e.dialog.showOpenDialog(a,{properties:["openFile"],filters:[{name:"文本文件",extensions:["txt"]},{name:"Word文档",extensions:["docx"]},{name:"所有文件",extensions:["*"]}]});return n.canceled?null:n.filePaths[0]});e.ipcMain.handle("select-directory",async()=>{const n=await e.dialog.showOpenDialog(a,{properties:["openDirectory"]});return n.canceled?null:n.filePaths[0]});
+"use strict";
+const electron = require("electron");
+const path = require("path");
+let mainWindow = null;
+electron.app.setName("ComicAgent");
+electron.app.setPath("userData", path.join(electron.app.getPath("appData"), "ComicAgent"));
+electron.app.commandLine.appendSwitch("disable-http-cache");
+electron.app.commandLine.appendSwitch("disable-gpu-shader-disk-cache");
+function createWindow() {
+  const winOpts = {
+    width: 1400,
+    height: 900,
+    minWidth: 1200,
+    minHeight: 800,
+    title: "漫剧智能办公台",
+    transparent: true,
+    backgroundColor: "#00000000",
+    autoHideMenuBar: true,
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false
+    }
+  };
+  if (process.platform === "win32") {
+    winOpts.backgroundMaterial = "acrylic";
+  }
+  mainWindow = new electron.BrowserWindow(winOpts);
+  mainWindow.setMenuBarVisibility(false);
+  if (process.env.NODE_ENV === "development" || !electron.app.isPackaged) {
+    mainWindow.loadURL("http://127.0.0.1:5173");
+  } else {
+    mainWindow.loadFile(path.join(__dirname, "../dist/index.html"));
+  }
+}
+electron.app.whenReady().then(() => {
+  electron.Menu.setApplicationMenu(null);
+  createWindow();
+});
+electron.app.on("window-all-closed", () => {
+  if (process.platform !== "darwin") {
+    electron.app.quit();
+  }
+});
+electron.app.on("activate", () => {
+  if (electron.BrowserWindow.getAllWindows().length === 0) {
+    createWindow();
+  }
+});
+electron.ipcMain.handle("select-file", async () => {
+  const result = await electron.dialog.showOpenDialog(mainWindow, {
+    properties: ["openFile"],
+    filters: [
+      { name: "文本文件", extensions: ["txt"] },
+      { name: "Word文档", extensions: ["docx"] },
+      { name: "所有文件", extensions: ["*"] }
+    ]
+  });
+  return result.canceled ? null : result.filePaths[0];
+});
+electron.ipcMain.handle("select-directory", async () => {
+  const result = await electron.dialog.showOpenDialog(mainWindow, {
+    properties: ["openDirectory"]
+  });
+  return result.canceled ? null : result.filePaths[0];
+});

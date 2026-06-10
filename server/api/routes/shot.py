@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import json
 import traceback
 
@@ -12,6 +12,13 @@ from models import Character, Project, SceneAsset, Shot
 from services.consistency_service import ConsistencyService
 from services.image_service import ImageService
 from services.reference_asset_service import ReferenceAssetService
+from services.skill_config_service import (
+    agent_style_id,
+    apply_agent_config_to_shot,
+    clean_tts_text,
+    resolve_skill_config,
+    should_materialize_openpose,
+)
 from services.style_templates import style_prompt_params
 from services.tts_service import TTSService
 from services.video_service import SeedanceVideoService
@@ -33,9 +40,11 @@ class ShotUpdate(BaseModel):
     character_action: str | None = None
     dialogue: str | None = None
     camera_angle: str | None = None
+    camera_movement: str | None = None
     duration: float | None = None
     emotion: str | None = None
     transition: str | None = None
+    visual_notes: str | None = None
     scene_asset_id: str | None = None
     character_asset_ids: list[str] | None = None
 
@@ -65,6 +74,43 @@ class ShotVideoGenerateRequest(BaseModel):
     force: bool = False
 
 
+@router.get("/{shot_id}/generation-prompt")
+async def get_shot_generation_prompt(shot_id: str, db: Session = Depends(get_db)):
+    shot = db.query(Shot).filter(Shot.id == shot_id).first()
+    if not shot:
+        raise HTTPException(status_code=404, detail="Shot not found")
+
+    project = db.query(Project).filter(Project.id == shot.project_id).first()
+    skill_config = resolve_skill_config(shot.project_id, db)
+    characters = _characters(db, shot.project_id)
+    scenes = _scenes(db, shot.project_id)
+    previous_reference = _previous_reference_for_shot(db, shot)
+    shot_data = _shot_dict(shot)
+    shot_data["storyboard_prompt"] = _storyboard_notes(shot, scenes)
+    shot_data.update(
+        consistency_service.build_generation_context(
+            shot_data,
+            characters,
+            scenes,
+            previous_reference_path=previous_reference,
+            for_video=False,
+        )
+    )
+    apply_agent_config_to_shot(shot_data, skill_config)
+    prompt, negative_prompt = image_service.build_shot_prompt(
+        shot=shot_data,
+        characters=characters,
+        style_params=_storyboard_style_params(project, skill_config),
+    )
+    return {
+        "shot_id": shot.id,
+        "prompt": prompt,
+        "negative_prompt": negative_prompt,
+        "scene_reference_images": shot_data.get("scene_reference_images", []),
+        "character_reference_images": shot_data.get("character_reference_images", []),
+    }
+
+
 @router.get("/{project_id}/shots")
 async def get_project_shots(project_id: str, db: Session = Depends(get_db)):
     shots = db.query(Shot).filter(Shot.project_id == project_id).order_by(Shot.sequence).all()
@@ -75,7 +121,7 @@ async def get_project_shots(project_id: str, db: Session = Depends(get_db)):
 async def update_shot(shot_id: str, data: ShotUpdate, db: Session = Depends(get_db)):
     shot = db.query(Shot).filter(Shot.id == shot_id).first()
     if not shot:
-        raise HTTPException(status_code=404, detail="镜头不存在")
+        raise HTTPException(status_code=404, detail="Shot not found")
 
     _ensure_shot_unlocked(shot)
     previous_scene_key = _shot_scene_key(shot)
@@ -99,7 +145,7 @@ async def update_shot(shot_id: str, data: ShotUpdate, db: Session = Depends(get_
 async def regenerate_shot(shot_id: str, data: RegenerateRequest, db: Session = Depends(get_db)):
     shot = db.query(Shot).filter(Shot.id == shot_id).first()
     if not shot:
-        raise HTTPException(status_code=404, detail="镜头不存在")
+        raise HTTPException(status_code=404, detail="Shot not found")
 
     _ensure_shot_unlocked(shot)
     previous_scene_key = _shot_scene_key(shot)
@@ -138,7 +184,7 @@ async def batch_regenerate(shot_ids: list[str], reason: str = "", db: Session = 
     shots = db.query(Shot).filter(Shot.id.in_(shot_ids)).all()
     locked = [shot.id for shot in shots if shot.confirmed]
     if locked:
-        raise HTTPException(status_code=423, detail=f"已审批镜头禁止重生成: {', '.join(locked)}")
+        raise HTTPException(status_code=423, detail=f"宸插鎵归暅澶寸姝㈤噸鐢熸垚: {', '.join(locked)}")
     for shot in shots:
         previous_scene_key = _shot_scene_key(shot)
         _invalidate_storyboard_outputs(shot)
@@ -159,7 +205,7 @@ async def batch_regenerate(shot_ids: list[str], reason: str = "", db: Session = 
 async def generate_storyboard_images(project_id: str, data: StoryboardGenerateRequest, db: Session = Depends(get_db)):
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
-        raise HTTPException(status_code=404, detail="项目不存在")
+        raise HTTPException(status_code=404, detail="Project not found")
 
     query = db.query(Shot).filter(Shot.project_id == project_id)
     if data.shot_ids:
@@ -168,10 +214,10 @@ async def generate_storyboard_images(project_id: str, data: StoryboardGenerateRe
     locked = [shot.id for shot in shots if shot.confirmed]
     if locked:
         if data.shot_ids:
-            raise HTTPException(status_code=423, detail=f"已审批镜头禁止重生成: {', '.join(locked)}")
+            raise HTTPException(status_code=423, detail=f"宸插鎵归暅澶寸姝㈤噸鐢熸垚: {', '.join(locked)}")
         shots = [shot for shot in shots if not shot.confirmed]
     if not shots:
-        raise HTTPException(status_code=404, detail="暂无可生成故事板的分镜")
+        raise HTTPException(status_code=404, detail="No shots available for storyboard generation")
 
     for shot in shots:
         previous_scene_key = _shot_scene_key(shot)
@@ -192,13 +238,13 @@ async def generate_storyboard_images(project_id: str, data: StoryboardGenerateRe
 async def confirm_storyboard(project_id: str, db: Session = Depends(get_db)):
     shots = db.query(Shot).filter(Shot.project_id == project_id).order_by(Shot.sequence).all()
     if not shots:
-        raise HTTPException(status_code=404, detail="暂无可确认的故事板分镜")
+        raise HTTPException(status_code=404, detail="No storyboard shots available for confirmation")
     unfinished = [shot.id for shot in shots if not shot.storyboard_path and not shot.image_path]
     if unfinished:
-        raise HTTPException(status_code=400, detail="仍有镜头未生成定稿故事板")
+        raise HTTPException(status_code=400, detail="浠嶆湁闀滃ご鏈敓鎴愬畾绋挎晠浜嬫澘")
     unapproved = [shot.id for shot in shots if not shot.confirmed]
     if unapproved:
-        raise HTTPException(status_code=400, detail="仍有镜头未人工审核通过")
+        raise HTTPException(status_code=400, detail="浠嶆湁闀滃ご鏈汉宸ュ鏍搁€氳繃")
 
     project = db.query(Project).filter(Project.id == project_id).first()
     if project:
@@ -212,9 +258,9 @@ async def confirm_storyboard(project_id: str, db: Session = Depends(get_db)):
 async def approve_storyboard(shot_id: str, data: StoryboardApprovalRequest, db: Session = Depends(get_db)):
     shot = db.query(Shot).filter(Shot.id == shot_id).first()
     if not shot:
-        raise HTTPException(status_code=404, detail="镜头不存在")
+        raise HTTPException(status_code=404, detail="Shot not found")
     if data.approved and not (shot.storyboard_path or shot.image_path):
-        raise HTTPException(status_code=400, detail="该镜头故事板尚未生成")
+        raise HTTPException(status_code=400, detail="璇ラ暅澶存晠浜嬫澘灏氭湭鐢熸垚")
     shot.confirmed = bool(data.approved)
     shot.status = "storyboard_approved" if data.approved else "needs_review"
     if not data.approved:
@@ -228,11 +274,11 @@ async def approve_storyboard(shot_id: str, data: StoryboardApprovalRequest, db: 
 async def generate_shot_video(shot_id: str, data: ShotVideoGenerateRequest, db: Session = Depends(get_db)):
     shot = db.query(Shot).filter(Shot.id == shot_id).first()
     if not shot:
-        raise HTTPException(status_code=404, detail="镜头不存在")
+        raise HTTPException(status_code=404, detail="Shot not found")
     if not shot.confirmed:
-        raise HTTPException(status_code=400, detail="请先审核通过该镜头故事板")
+        raise HTTPException(status_code=400, detail="璇峰厛瀹℃牳閫氳繃璇ラ暅澶存晠浜嬫澘")
     if not (shot.storyboard_path or shot.image_path):
-        raise HTTPException(status_code=400, detail="该镜头尚未生成定稿故事板")
+        raise HTTPException(status_code=400, detail="璇ラ暅澶村皻鏈敓鎴愬畾绋挎晠浜嬫澘")
     if _can_reuse_existing_video(shot, data.force):
         return {"id": shot.id, "status": shot.status, "video_path": shot.video_path, "audio_path": shot.audio_path}
 
@@ -249,14 +295,17 @@ async def _run_storyboard_generation(project_id: str, shot_ids: list[str]) -> No
     try:
         shots = db.query(Shot).filter(Shot.project_id == project_id, Shot.id.in_(shot_ids)).order_by(Shot.sequence).all()
         project = db.query(Project).filter(Project.id == project_id).first()
+        skill_config = resolve_skill_config(project_id, db)
         characters = _characters(db, project_id)
         scenes = _scenes(db, project_id)
-        await _ensure_scene_baselines(db, project, scenes)
+        await _ensure_scene_baselines(db, project, scenes, skill_config)
         scenes = _scenes(db, project_id)
         for index, shot in enumerate(shots):
-            await _progress(project_id, "generate_storyboard_images", 48 + min(index * 4, 35), "正在生成定稿故事板参考图")
+            await _progress(project_id, "generate_storyboard_images", 48 + min(index * 4, 35), "姝ｅ湪鐢熸垚瀹氱鏁呬簨鏉垮弬鑰冨浘")
             shot_data = _shot_dict(shot)
             shot_data["visual_notes"] = _storyboard_notes(shot, scenes)
+            if project:
+                shot_data["output_format"] = project.output_format or "9:16"
             previous_reference = _previous_reference_for_shot(db, shot)
             shot_data.update(
                 consistency_service.build_generation_context(
@@ -267,11 +316,12 @@ async def _run_storyboard_generation(project_id: str, shot_ids: list[str]) -> No
                     for_video=False,
                 )
             )
-            _materialize_control_references(project_id, shot_data)
+            apply_agent_config_to_shot(shot_data, skill_config)
+            _materialize_control_references(project_id, shot_data, skill_config)
             image_path = await image_service.generate_shot_image(
                 shot=shot_data,
                 characters=characters,
-                style_params=_storyboard_style_params(project),
+                style_params=_storyboard_style_params(project, skill_config),
                 project_id=project_id,
                 seed=42 + (shot.version or 1) * 100,
             )
@@ -311,7 +361,7 @@ async def _run_storyboard_generation(project_id: str, shot_ids: list[str]) -> No
         if project:
             project.status = "storyboard_ready"
             db.commit()
-        await _progress(project_id, "wait_storyboard_approval", 72, "定稿故事板参考图已生成，等待人工审核")
+        await _progress(project_id, "wait_storyboard_approval", 72, "瀹氱鏁呬簨鏉垮弬鑰冨浘宸茬敓鎴愶紝绛夊緟浜哄伐瀹℃牳")
         await ws_manager.send_to_project(project_id, {"type": "storyboard_ready", "project_id": project_id})
     except Exception as exc:
         db.rollback()
@@ -319,7 +369,7 @@ async def _run_storyboard_generation(project_id: str, shot_ids: list[str]) -> No
         if project:
             project.status = "error"
             db.commit()
-        await ws_manager.send_to_project(project_id, {"type": "error", "message": f"故事板生成失败: {exc}\n{traceback.format_exc()}"})
+        await ws_manager.send_to_project(project_id, {"type": "error", "message": f"鏁呬簨鏉跨敓鎴愬け璐? {exc}\n{traceback.format_exc()}"})
     finally:
         db.close()
 
@@ -332,12 +382,15 @@ async def _regenerate_single_shot(shot_id: str, reason: str = ""):
         if not shot:
             return
         project = db.query(Project).filter(Project.id == shot.project_id).first()
+        skill_config = resolve_skill_config(shot.project_id, db)
         characters = _characters(db, shot.project_id)
         scenes = _scenes(db, shot.project_id)
-        await _ensure_scene_baselines(db, project, scenes)
+        await _ensure_scene_baselines(db, project, scenes, skill_config)
         scenes = _scenes(db, shot.project_id)
         shot_data = _shot_dict(shot)
         shot_data["visual_notes"] = reason or _storyboard_notes(shot, scenes)
+        if project:
+            shot_data["output_format"] = project.output_format or "9:16"
         previous_reference = _previous_reference_for_shot(db, shot)
         shot_data.update(
             consistency_service.build_generation_context(
@@ -348,11 +401,12 @@ async def _regenerate_single_shot(shot_id: str, reason: str = ""):
                 for_video=False,
             )
         )
-        _materialize_control_references(shot.project_id, shot_data)
+        apply_agent_config_to_shot(shot_data, skill_config)
+        _materialize_control_references(shot.project_id, shot_data, skill_config)
         image_path = await image_service.generate_shot_image(
             shot=shot_data,
             characters=characters,
-            style_params=_storyboard_style_params(project),
+            style_params=_storyboard_style_params(project, skill_config),
             project_id=shot.project_id,
             seed=42 + (shot.version or 1) * 100,
         )
@@ -392,7 +446,7 @@ async def _regenerate_single_shot(shot_id: str, reason: str = ""):
         if shot:
             shot.status = "failed"
             shot.storyboard_status = "failed"
-            shot.visual_notes = f"重新生成故事板失败: {exc}"
+            shot.visual_notes = f"閲嶆柊鐢熸垚鏁呬簨鏉垮け璐? {exc}"
             db.commit()
             await ws_manager.send_to_project(shot.project_id, {"type": "error", "message": shot.visual_notes})
     finally:
@@ -411,14 +465,16 @@ async def _run_single_shot_video(shot_id: str, force: bool = False) -> None:
 
         project_id = shot.project_id
         project = db.query(Project).filter(Project.id == project_id).first()
+        skill_config = resolve_skill_config(project_id, db)
         characters = _characters(db, project_id)
         scenes = _scenes(db, project_id)
-        await _ensure_scene_baselines(db, project, scenes)
+        await _ensure_scene_baselines(db, project, scenes, skill_config)
         scenes = _scenes(db, project_id)
         shot_data = _shot_dict(shot)
         shot_data["storyboard_prompt"] = _storyboard_notes(shot, scenes)
         if project:
             shot_data["output_format"] = project.output_format or "9:16"
+            shot_data["resolution"] = project.resolution or "720p"
             shot_data["style"] = project.style or "anime"
         previous_reference = _previous_reference_for_shot(db, shot, prefer_last_frame=True)
         shot_data.update(
@@ -430,14 +486,15 @@ async def _run_single_shot_video(shot_id: str, force: bool = False) -> None:
                 for_video=True,
             )
         )
-        _materialize_control_references(project_id, shot_data)
+        apply_agent_config_to_shot(shot_data, skill_config)
+        _materialize_control_references(project_id, shot_data, skill_config)
 
-        await _progress(project_id, "generate_voice", 82, f"正在生成镜头 {shot.sequence} 的角色配音")
+        await _progress(project_id, "generate_voice", 82, f"Generating voice for shot {shot.sequence}")
         if shot.dialogue:
             speaker = (json.loads(shot.characters_in_scene) if shot.characters_in_scene else [""])[0]
             voice_id = next((item.get("voice_id", "") for item in characters if item.get("name") == speaker), "")
             shot.audio_path = await tts_service.generate_dialogue(
-                text=shot.dialogue,
+                text=clean_tts_text(shot.dialogue, skill_config),
                 voice_id=voice_id,
                 emotion=shot.emotion or "neutral",
                 project_id=project_id,
@@ -445,7 +502,7 @@ async def _run_single_shot_video(shot_id: str, force: bool = False) -> None:
             )
             shot_data["audio_path"] = shot.audio_path
 
-        await _progress(project_id, "generate_seedance_video", 90, f"正在生成镜头 {shot.sequence} 的 Seedance 视频")
+        await _progress(project_id, "generate_seedance_video", 90, f"姝ｅ湪鐢熸垚闀滃ご {shot.sequence} 鐨?Seedance 瑙嗛")
         result = await seedance_service.generate_shot_video(shot_data, characters, scenes, project_id)
         continuity_profile = shot_data.get("continuity_profile", {}) or {}
         if result.get("reference_payload_mode"):
@@ -488,11 +545,11 @@ async def _run_single_shot_video(shot_id: str, force: bool = False) -> None:
         db.rollback()
         if shot:
             shot.status = "failed"
-            shot.visual_notes = f"单镜头视频生成失败: {exc}"
+            shot.visual_notes = f"鍗曢暅澶磋棰戠敓鎴愬け璐? {exc}"
             db.commit()
             await ws_manager.send_to_project(
                 shot.project_id,
-                {"type": "error", "message": f"镜头 {shot.sequence} 视频生成失败: {exc}\n{traceback.format_exc()}"},
+                {"type": "error", "message": f"闀滃ご {shot.sequence} 瑙嗛鐢熸垚澶辫触: {exc}\n{traceback.format_exc()}"},
             )
     finally:
         db.close()
@@ -508,9 +565,11 @@ def _serialize_shot(s: Shot) -> dict:
         "character_action": s.character_action,
         "dialogue": s.dialogue,
         "camera_angle": s.camera_angle,
+        "camera_movement": s.camera_movement or "静止",
         "duration": s.duration,
         "emotion": s.emotion,
         "transition": s.transition,
+        "visual_notes": s.visual_notes or "",
         "image_path": s.image_path,
         "storyboard_path": s.storyboard_path,
         "video_path": s.video_path,
@@ -619,7 +678,7 @@ def _json_dict(raw: str | None) -> dict:
 
 def _ensure_shot_unlocked(shot: Shot) -> None:
     if shot.confirmed:
-        raise HTTPException(status_code=423, detail="已审批锁定的镜头禁止改动或重生成")
+        raise HTTPException(status_code=423, detail="宸插鎵归攣瀹氱殑闀滃ご绂佹鏀瑰姩鎴栭噸鐢熸垚")
 
 
 def _invalidate_storyboard_outputs(shot: Shot) -> None:
@@ -685,14 +744,14 @@ def _shot_scene_keys(shot: Shot, db: Session | None = None) -> set[str]:
     return keys
 
 
-def _materialize_control_references(project_id: str, shot_data: dict) -> None:
+def _materialize_control_references(project_id: str, shot_data: dict, skill_config: dict | None = None) -> None:
     profile = shot_data.get("continuity_profile") or {}
     source_path = profile.get("previous_reference_path") or shot_data.get("continuity_reference_path", "")
     controls = reference_asset_service.materialize_continuity_controls(
         project_id=project_id,
         shot_id=shot_data.get("shot_id", "shot"),
         source_path=source_path,
-        enabled=bool(profile.get("complex_motion")),
+        enabled=bool(profile.get("complex_motion")) and should_materialize_openpose(skill_config),
     )
     if not controls:
         return
@@ -746,8 +805,8 @@ def _storyboard_notes(shot: Shot, scenes: dict[str, dict]) -> str:
     return ", ".join(part for part in parts if part)
 
 
-def _storyboard_style_params(project: Project | None) -> dict:
-    style = (project.style if project else "anime") or "anime"
+def _storyboard_style_params(project: Project | None, skill_config: dict | None = None) -> dict:
+    style = agent_style_id(skill_config, "storyboard_agent", (project.style if project else "anime") or "anime")
     params = style_prompt_params(style)
     params["prompt_prefix"] = (
         f"{params.get('prompt_prefix', '')}, production-ready storyboard reference, "
@@ -756,10 +815,15 @@ def _storyboard_style_params(project: Project | None) -> dict:
     return params
 
 
-async def _ensure_scene_baselines(db: Session, project: Project | None, scenes: dict[str, dict]) -> None:
+async def _ensure_scene_baselines(db: Session, project: Project | None, scenes: dict[str, dict], skill_config: dict | None = None) -> None:
     if not project:
         return
-    style = project.style or "anime"
+    style = agent_style_id(skill_config, "storyboard_agent", project.style or "anime")
+    skill_append = ""
+    if skill_config:
+        from services.skill_config_service import agent_prompt_append
+
+        skill_append = agent_prompt_append(skill_config, "storyboard_agent")
     changed = False
     for scene_id, scene in scenes.items():
         if scene.get("baseline_image_path") or scene.get("reference_images"):
@@ -768,8 +832,11 @@ async def _ensure_scene_baselines(db: Session, project: Project | None, scenes: 
         if not model:
             continue
         try:
+            scene_payload = dict(scene)
+            if skill_append:
+                scene_payload["visual_prompt"] = ", ".join(part for part in [scene.get("visual_prompt", ""), skill_append] if part)
             ref_path = await image_service.generate_scene_baseline_reference(
-                scene=scene,
+                scene=scene_payload,
                 style=style,
                 project_id=_asset_project_id(db, project.id),
                 seed=int(model.seed or 1200),

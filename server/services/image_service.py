@@ -16,14 +16,30 @@ class ImageService:
     """Image generation service backed by real remote image APIs."""
 
     def __init__(self):
-        self.api_key = settings.ARK_API_KEY or settings.SEEDDANCE_API_KEY or settings.SEEDREAM_API_KEY or settings.STABILITY_API_KEY
-        self.api_url = settings.STABILITY_API_URL
-        self.provider = (settings.IMAGE_PROVIDER or "").lower()
         self.output_dir = settings.OUTPUT_DIR / "projects"
-        self.seedream_base_url = settings.SEEDDANCE_BASE_URL.rstrip("/")
-        self.seedream_model = settings.SEEDREAM_MODEL or settings.IMAGE_PROVIDER
         self.consistency = ConsistencyService()
         self.reference_assets = ReferenceAssetService()
+
+    # 运行时实时读取 settings，保证保存模型/API 配置后新任务即生效。
+    @property
+    def api_key(self) -> str:
+        return settings.ARK_API_KEY or settings.SEEDDANCE_API_KEY or settings.SEEDREAM_API_KEY or settings.STABILITY_API_KEY
+
+    @property
+    def api_url(self) -> str:
+        return settings.STABILITY_API_URL
+
+    @property
+    def provider(self) -> str:
+        return (settings.IMAGE_PROVIDER or "").lower()
+
+    @property
+    def seedream_base_url(self) -> str:
+        return settings.SEEDDANCE_BASE_URL.rstrip("/")
+
+    @property
+    def seedream_model(self) -> str:
+        return settings.SEEDREAM_MODEL or settings.IMAGE_PROVIDER
 
     async def generate_shot_image(
         self,
@@ -40,12 +56,14 @@ class ImageService:
         shot_dir.mkdir(parents=True, exist_ok=True)
         image_path = shot_dir / f"{shot['shot_id']}_v{shot.get('version', 1)}.png"
 
+        preferred_size = self._size_for_ratio(shot.get("output_format"))
+
         if self.provider == "stability" and self.api_key:
             image_data = await self._call_stability(prompt, negative_prompt, seed)
         elif self._is_seedream_provider() and self.api_key:
-            image_data = await self._call_seedream(prompt, negative_prompt, seed, reference_images)
+            image_data = await self._call_seedream(prompt, negative_prompt, seed, reference_images, preferred_size=preferred_size)
         else:
-            image_data = self._generate_placeholder("SHOT PLACEHOLDER", prompt, self._placeholder_size())
+            image_data = self._generate_placeholder("SHOT PLACEHOLDER", prompt, self._placeholder_size(preferred_size))
 
         if not image_data:
             raise RuntimeError("图像生成接口未返回图片数据")
@@ -68,15 +86,19 @@ class ImageService:
 
         ref_dir = self.output_dir / project_id / "scenes"
         ref_dir.mkdir(parents=True, exist_ok=True)
-        safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", scene.get("scene_group_key") or scene.get("location") or scene.get("name", "scene")).strip("_") or "scene"
-        image_path = ref_dir / f"{safe_name}_baseline.png"
+        safe_key = scene.get("id") or scene.get("scene_group_key") or scene.get("location") or scene.get("name", "scene")
+        safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(safe_key)).strip("_") or "scene"
+        scene_dir = ref_dir / safe_name
+        scene_dir.mkdir(parents=True, exist_ok=True)
+        image_path = scene_dir / "baseline_original.png"
+        preferred_size = settings.SEEDREAM_IMAGE_SIZE or "1440x2560"
 
         if self.provider == "stability" and self.api_key:
             image_data = await self._call_stability(prompt, negative_prompt, seed)
         elif self._is_seedream_provider() and self.api_key:
-            image_data = await self._call_seedream(prompt, negative_prompt, seed)
+            image_data = await self._call_seedream(prompt, negative_prompt, seed, preferred_size=preferred_size)
         else:
-            image_data = self._generate_placeholder("SCENE BASELINE", prompt, self._placeholder_size())
+            image_data = self._generate_placeholder("SCENE BASELINE", prompt, self._placeholder_size(preferred_size))
 
         self._validate_image(image_data)
         image_path.write_bytes(image_data)
@@ -93,15 +115,19 @@ class ImageService:
 
         ref_dir = self.output_dir / project_id / "characters"
         ref_dir.mkdir(parents=True, exist_ok=True)
-        safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", character.get("name", "character")).strip("_") or "character"
-        image_path = ref_dir / f"{safe_name}_three_view.png"
+        identity_key = character.get("id") or character.get("asset_id") or character.get("name", "character")
+        safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(identity_key)).strip("_") or "character"
+        character_dir = ref_dir / safe_name
+        character_dir.mkdir(parents=True, exist_ok=True)
+        image_path = character_dir / "three_view_original.png"
+        preferred_size = "2048x2048"
 
         if self.provider == "stability" and self.api_key:
             image_data = await self._call_stability(prompt, negative_prompt, seed)
         elif self._is_seedream_provider() and self.api_key:
-            image_data = await self._call_seedream(prompt, negative_prompt, seed)
+            image_data = await self._call_seedream(prompt, negative_prompt, seed, preferred_size=preferred_size)
         else:
-            image_data = self._generate_placeholder("CHARACTER REF", prompt, self._placeholder_size())
+            image_data = self._generate_placeholder("CHARACTER REF", prompt, self._placeholder_size(preferred_size))
 
         self._validate_image(image_data)
         image_path.write_bytes(image_data)
@@ -111,11 +137,27 @@ class ImageService:
         provider = self.provider.replace("_", "-")
         return provider.startswith("doubao-seedream") or provider in {"seedream", "volcengine", "ark"}
 
-    def _placeholder_size(self) -> tuple[int, int]:
-        match = re.match(r"\s*(\d+)\s*[xX]\s*(\d+)", settings.SEEDREAM_IMAGE_SIZE or "")
+    def _size_for_ratio(self, output_format: str | None) -> str:
+        # 画面比例 -> Seedream 出图尺寸。未识别的比例回退到 settings 配置的默认尺寸，
+        # 保证用户在前端切换 9:16 / 16:9 / 1:1 等比例后，定稿故事板真实按比例出图。
+        ratio = str(output_format or "").strip()
+        ratio_size_map = {
+            "9:16": "1440x2560",
+            "3:4": "1536x2048",
+            "1:1": "2048x2048",
+            "4:3": "2048x1536",
+            "16:9": "2560x1440",
+        }
+        return ratio_size_map.get(ratio, settings.SEEDREAM_IMAGE_SIZE or "1440x2560")
+
+    def build_shot_prompt(self, shot: dict, characters: list, style_params: dict) -> tuple[str, str]:
+        return self._build_prompt(shot, characters, style_params)
+
+    def _placeholder_size(self, preferred_size: str | None = None) -> tuple[int, int]:
+        match = re.match(r"\s*(\d+)\s*[xX]\s*(\d+)", preferred_size or settings.SEEDREAM_IMAGE_SIZE or "")
         if match:
             return int(match.group(1)), int(match.group(2))
-        return 1024, 1024
+        return 1440, 2560
 
     def _placeholder_font(self, size: int):
         for name in ("msyh.ttc", "arial.ttf", "DejaVuSans.ttf"):
@@ -147,10 +189,17 @@ class ImageService:
         self._validate_image(data)
         return data
 
-    async def _call_seedream(self, prompt: str, negative_prompt: str, seed: int, reference_images: list[str] | None = None) -> bytes:
+    async def _call_seedream(
+        self,
+        prompt: str,
+        negative_prompt: str,
+        seed: int,
+        reference_images: list[str] | None = None,
+        preferred_size: str | None = None,
+    ) -> bytes:
         errors: list[str] = []
         models = self._seedream_model_candidates()
-        sizes = [settings.SEEDREAM_IMAGE_SIZE, "1440x2560", "2K"]
+        sizes = [preferred_size, settings.SEEDREAM_IMAGE_SIZE, "2048x2048", "1440x2560", "2K"]
 
         async with httpx.AsyncClient(timeout=180) as client:
             for model in models:
@@ -307,6 +356,8 @@ class ImageService:
                 )
         if shot.get("consistency_context"):
             prompt_parts.append(shot["consistency_context"])
+        if shot.get("skill_prompt_append"):
+            prompt_parts.append(shot["skill_prompt_append"])
 
         for char_card in self._select_character_cards(shot, characters):
             prompt_parts.append(char_card.get("visual_prompt", ""))
@@ -428,8 +479,10 @@ class ImageService:
         style_prompt = style_params.get("character_reference_prompt", "")
         prompt_parts = [
             style_prompt,
+            "high-resolution original character asset, no thumbnail, production reference quality",
             "standard three-view reference sheet, front view, side view, back view",
             "same character identity across all views, neutral pose, full body, plain background",
+            character.get("id", "") and f"unique character asset id: {character.get('id')}",
             character.get("name", ""),
             character.get("visual_prompt", ""),
             character.get("personality", ""),
