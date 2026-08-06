@@ -314,7 +314,7 @@ def main() -> None:
     scene_model = (PROJECT_ROOT / "server/models/scene_asset.py").read_text(encoding="utf-8")
     checks.append(
         _assert(
-            "一致性规则" in right_sidebar
+            "一致性规划" in right_sidebar
             and "blockingRows" in right_sidebar
             and "character_blocking" in right_sidebar
             and "consistency-blocking-list" in right_sidebar
