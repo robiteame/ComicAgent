@@ -12,8 +12,11 @@ import {
   ProjectOutlined,
   RightOutlined,
 } from '@ant-design/icons'
-import { message, Modal, Tooltip } from 'antd'
+import message from 'antd/es/message'
+import Modal from 'antd/es/modal'
+import Tooltip from 'antd/es/tooltip'
 import { characterApi, projectApi, shotApi } from '../services/api'
+import { beginProjectNavigationIntent, requestProjectNavigation } from '../services/projectNavigationGuard'
 import { useProjectStore } from '../stores/projectStore'
 import { useShotStore } from '../stores/shotStore'
 import { OPEN_SETTINGS_EVENT } from './TopBar'
@@ -73,13 +76,36 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
   const [expandedSeriesIds, setExpandedSeriesIds] = useState<Set<string>>(new Set())
   const [loadingProjectId, setLoadingProjectId] = useState<string | null>(null)
   const finalVideoInputRef = useRef<HTMLInputElement | null>(null)
+  const projectSelectionRequestRef = useRef(0)
+  const projectListRequestRef = useRef(0)
+  const importVideoRequestRef = useRef(0)
+  const createEpisodeRequestRef = useRef(0)
+  const projectContextEpochRef = useRef(0)
+  const mountedRef = useRef(false)
 
   const refreshProjects = () => {
-    projectApi.list().then(setProjects).catch(() => undefined)
+    const requestId = ++projectListRequestRef.current
+    projectApi.list()
+      .then((nextProjects) => {
+        if (mountedRef.current && requestId === projectListRequestRef.current) setProjects(nextProjects)
+      })
+      .catch(() => undefined)
   }
 
   useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      projectSelectionRequestRef.current += 1
+      projectListRequestRef.current += 1
+      importVideoRequestRef.current += 1
+      createEpisodeRequestRef.current += 1
+    }
+  }, [])
+
+  useEffect(() => {
     refreshProjects()
+    projectContextEpochRef.current += 1
   }, [projectId])
 
   const visibleProjects = useMemo(() => {
@@ -115,6 +141,8 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
   }, [parentProjectId, projectId, projectType])
 
   const handleSelectProject = async (id: string) => {
+    beginProjectNavigationIntent()
+    const requestId = ++projectSelectionRequestRef.current
     try {
       const localProject = projects.find((item) => item.id === id)
       if (localProject && (localProject.project_type || 'series') !== 'episode') {
@@ -126,11 +154,55 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
         }
       }
       setLoadingProjectId(id)
+
+      const currentProjectId = useProjectStore.getState().projectId
+      if (id !== currentProjectId) {
+        const canNavigate = await requestProjectNavigation(currentProjectId, id)
+        if (
+          !canNavigate ||
+          requestId !== projectSelectionRequestRef.current ||
+          useProjectStore.getState().projectId !== currentProjectId
+        ) {
+          return
+        }
+      }
+
+      // Hide the previous project's data immediately. The workspace performs
+      // the same reset when the project store changes; doing it here avoids a
+      // stale frame during the request gap.
+      if (id !== useProjectStore.getState().projectId) {
+        // Invalidate the current workspace before requests for the next
+        // project resolve. This also closes the old project's WebSocket.
+        setProject({
+          projectId: null,
+          parentProjectId: '',
+          parentProjectTitle: '',
+          projectType: 'series',
+          episodeNumber: 0,
+          title: '未命名项目',
+          status: 'draft',
+          characters: [],
+        })
+        setShots([])
+        selectShot(null)
+        setGenerating(false)
+        setAwaitingStoryboardConfirm(false)
+        setVideoPath('')
+        setProgress(0, '')
+        clearLogs()
+      }
+
       const [projectDetail, shotList, characters] = await Promise.all([
         projectApi.get(id),
         shotApi.list(id),
         characterApi.list(id),
       ])
+
+      // A later click wins. Ignore all late responses from an earlier
+      // selection so they cannot overwrite the active project's state.
+      if (requestId !== projectSelectionRequestRef.current) return
+      const expectedProjectId = id === currentProjectId ? currentProjectId : null
+      if (useProjectStore.getState().projectId !== expectedProjectId) return
 
       setProject({
         projectId: projectDetail.id,
@@ -154,9 +226,10 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
       setVideoPath(projectDetail.video_path || (projectDetail.status === 'completed' ? `/output/projects/${projectDetail.id}/output/final.mp4` : ''))
       window.dispatchEvent(new CustomEvent(WORKSPACE_NAVIGATE_EVENT, { detail: { tab: 'script' } }))
     } catch (err: any) {
+      if (requestId !== projectSelectionRequestRef.current) return
       message.error('加载项目失败：' + (err.message || '未知错误'))
     } finally {
-      setLoadingProjectId(null)
+      if (requestId === projectSelectionRequestRef.current) setLoadingProjectId(null)
     }
   }
 
@@ -170,24 +243,45 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
       return
     }
 
+    const entryProjectId = projectId
+    const requestId = ++importVideoRequestRef.current
+    const projectEpoch = projectContextEpochRef.current
+
     try {
       setGenerating(true)
       setProgress(95, 'quality_check')
       const formData = new FormData()
       formData.append('file', file)
-      const result = await projectApi.importVideo(projectId, formData)
-      setVideoPath(result.video_path || `/output/projects/${projectId}/output/final.mp4`)
+      const result = await projectApi.importVideo(entryProjectId, formData)
+      if (
+        requestId !== importVideoRequestRef.current ||
+        projectEpoch !== projectContextEpochRef.current ||
+        useProjectStore.getState().projectId !== entryProjectId
+      ) return
+      setVideoPath(result.video_path || `/output/projects/${entryProjectId}/output/final.mp4`)
       appendLog(`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] 已导入成片：${file.name}`)
       refreshProjects()
       message.success('成片已导入当前剧集')
     } catch (err: any) {
+      if (
+        requestId !== importVideoRequestRef.current ||
+        projectEpoch !== projectContextEpochRef.current ||
+        useProjectStore.getState().projectId !== entryProjectId
+      ) return
       message.error('成片导入失败：' + (err.message || '未知错误'))
     } finally {
-      setGenerating(false)
+      if (
+        requestId === importVideoRequestRef.current &&
+        projectEpoch === projectContextEpochRef.current &&
+        useProjectStore.getState().projectId === entryProjectId
+      ) {
+        setGenerating(false)
+      }
     }
   }
 
   const handleCreateEpisode = async () => {
+    beginProjectNavigationIntent()
     if (!projectId) {
       message.warning('请先选择一个大项目')
       return
@@ -198,8 +292,22 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
       return
     }
 
+    const sourceProjectId = projectId
+    const requestId = ++createEpisodeRequestRef.current
+    const projectEpoch = projectContextEpochRef.current
+
     try {
+      const canNavigate = await requestProjectNavigation(sourceProjectId, null)
+      if (
+        !canNavigate ||
+        requestId !== createEpisodeRequestRef.current ||
+        projectEpoch !== projectContextEpochRef.current ||
+        useProjectStore.getState().projectId !== sourceProjectId
+      ) {
+        return
+      }
       const nextNumber = visibleProjects.filter((item) => item.parent_project_id === rootId).length + 1
+      projectListRequestRef.current += 1
       const episode = await projectApi.create({
         title: `第 ${nextNumber} 集`,
         parent_project_id: rootId,
@@ -213,9 +321,21 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
       })
       setExpandedSeriesIds((prev) => new Set(prev).add(rootId))
       refreshProjects()
+      if (
+        requestId !== createEpisodeRequestRef.current ||
+        projectEpoch !== projectContextEpochRef.current ||
+        useProjectStore.getState().projectId !== sourceProjectId
+      ) return
       await handleSelectProject(episode.id)
-      message.success('单集已创建')
+      if (useProjectStore.getState().projectId === episode.id) {
+        message.success('单集已创建')
+      }
     } catch (err: any) {
+      if (
+        requestId !== createEpisodeRequestRef.current ||
+        projectEpoch !== projectContextEpochRef.current ||
+        useProjectStore.getState().projectId !== sourceProjectId
+      ) return
       message.error('创建单集失败：' + (err.message || '未知错误'))
     }
   }
@@ -235,14 +355,30 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
       okButtonProps: { danger: true },
       onOk: async () => {
         try {
+          beginProjectNavigationIntent()
+          projectSelectionRequestRef.current += 1
+          const currentBeforeDelete = useProjectStore.getState()
+          const deletingCurrent =
+            currentBeforeDelete.projectId === project.id ||
+            (project.project_type !== 'episode' && currentBeforeDelete.parentProjectId === project.id)
+          if (
+            deletingCurrent &&
+            !(await requestProjectNavigation(currentBeforeDelete.projectId, null))
+          ) {
+            return
+          }
+          projectListRequestRef.current += 1
           await projectApi.delete(project.id)
+          const currentProject = useProjectStore.getState()
           const deletedCurrent =
-            project.id === projectId ||
-            (project.project_type !== 'episode' && (parentProjectId === project.id || projectId === project.id))
+            project.id === currentProject.projectId ||
+            (project.project_type !== 'episode' && currentProject.parentProjectId === project.id)
           if (deletedCurrent) {
+            projectSelectionRequestRef.current += 1
             reset()
             setShots([])
             selectShot(null)
+            setGenerating(false)
             setAwaitingStoryboardConfirm(false)
             setVideoPath('')
             setProgress(0, '')

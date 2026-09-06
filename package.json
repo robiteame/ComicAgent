@@ -1,5 +1,14 @@
 {
-  "dependencies": {
-    "pnpm": "^11.15.1"
+  "name": "comic-agent",
+  "private": true,
+  "engines": {
+    "node": ">=22.13.0",
+    "pnpm": ">=11.15.1"
+  },
+  "packageManager": "pnpm@11.15.1",
+  "scripts": {
+    "typecheck": "pnpm --dir client run typecheck",
+    "test": "pnpm --dir client run test:all",
+    "build": "pnpm --dir client run build"
   }
 }

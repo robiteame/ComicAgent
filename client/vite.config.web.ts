@@ -12,4 +12,16 @@ export default defineConfig({
   server: {
     port: 5173,
   },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes('node_modules')) return
+          if (id.includes('antd') || id.includes('@ant-design/icons') || id.includes('@rc-component') || id.includes('/rc-')) return 'antd'
+          if (id.includes('/react/') || id.includes('/react-dom/')) return 'react'
+          if (id.includes('/axios/')) return 'axios'
+        },
+      },
+    },
+  },
 })

@@ -2,6 +2,8 @@ import asyncio
 import json
 import os
 import traceback
+import uuid
+from pathlib import Path
 from typing import Literal
 
 import aiofiles
@@ -20,6 +22,8 @@ from services.llm_service import LLMService
 from services.skill_config_service import agent_prompt_append, agent_style_id, resolve_skill_config
 from services.style_templates import style_prompt_params, style_template
 from services.tts_service import normalize_mimo_voice
+from services.security import UploadLimitExceeded, safe_filename, save_upload_stream, validate_identifier, validate_script_upload
+from services.task_registry import claim as claim_task, start as start_task, update_progress as update_job_progress
 
 router = APIRouter(prefix="/api/script", tags=["script"])
 
@@ -68,6 +72,9 @@ async def generate_script(data: ScriptGenerateRequest):
 async def parse_script(data: ScriptParseRequest):
     if not data.user_input.strip():
         raise HTTPException(status_code=400, detail="请输入剧本内容")
+    if len(data.user_input) > settings.MAX_SCRIPT_TEXT_CHARS:
+        raise HTTPException(status_code=413, detail="剧本文本超过长度限制")
+    _require_project(data.project_id)
     task = _spawn_pipeline(
         data.project_id,
         _initial_state(data.model_dump(), _resolved_skill_config(data.project_id)),
@@ -75,6 +82,8 @@ async def parse_script(data: ScriptParseRequest):
         data.output_format,
         data.resolution,
     )
+    if task is None:
+        return {"status": "already_running", "project_id": data.project_id, "mode": data.mode, "deduplicated": True}
     return {"status": "started", "project_id": data.project_id, "mode": data.mode}
 
 
@@ -88,13 +97,30 @@ async def upload_script(
     platform: str = Form("douyin"),
     mode: Literal["manual", "auto"] = Form("manual"),
 ):
-    upload_dir = settings.DATA_DIR / "uploads"
-    upload_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        safe_project_id = validate_identifier(project_id, "项目 ID")
+        _require_project(safe_project_id)
+        _, file_ext = safe_filename(file.filename or "script.txt", {".txt", ".md", ".markdown", ".docx"})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    file_ext = os.path.splitext(file.filename or "script.txt")[1] or ".txt"
-    file_path = upload_dir / f"{project_id}{file_ext}"
-    async with aiofiles.open(file_path, "wb") as f:
-        await f.write(await file.read())
+    # Store each upload under a project-scoped directory with a server-generated
+    # name.  This avoids traversal, filename collisions and symlink surprises.
+    upload_dir = settings.DATA_DIR / "uploads" / safe_project_id
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    file_path = upload_dir / f"script_{uuid.uuid4().hex}{file_ext or '.txt'}"
+    try:
+        await save_upload_stream(file, file_path, settings.MAX_SCRIPT_UPLOAD_BYTES)
+    except UploadLimitExceeded as exc:
+        raise HTTPException(status_code=413, detail="上传剧本超过大小限制") from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail="保存上传文件失败") from exc
+
+    try:
+        validate_script_upload(file_path, file_ext, getattr(file, "content_type", None))
+    except (OSError, ValueError) as exc:
+        file_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     if file_ext.lower() == ".docx":
         from docx import Document
@@ -103,10 +129,14 @@ async def upload_script(
         user_input = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
     else:
         async with aiofiles.open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-            user_input = await f.read()
+            user_input = await f.read(settings.MAX_SCRIPT_TEXT_CHARS + 1)
+
+    if len(user_input) > settings.MAX_SCRIPT_TEXT_CHARS:
+        file_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=413, detail="剧本文本超过长度限制")
 
     payload = {
-        "project_id": project_id,
+        "project_id": safe_project_id,
         "user_input": user_input,
         "input_type": "file",
         "uploaded_file_path": str(file_path),
@@ -117,8 +147,10 @@ async def upload_script(
         "platform": platform,
         "target_duration": 45,
     }
-    _spawn_pipeline(project_id, _initial_state(payload, _resolved_skill_config(project_id)), mode, output_format, resolution)
-    return {"status": "started", "project_id": project_id, "mode": mode, "file": file.filename, "script": user_input}
+    task = _spawn_pipeline(safe_project_id, _initial_state(payload, _resolved_skill_config(safe_project_id)), mode, output_format, resolution)
+    if task is None:
+        return {"status": "already_running", "project_id": safe_project_id, "mode": mode, "deduplicated": True}
+    return {"status": "started", "project_id": safe_project_id, "mode": mode, "file": file.filename, "script": user_input}
 
 
 async def _generate_script_text(data: ScriptGenerateRequest, skill_config: dict | None = None) -> str:
@@ -194,13 +226,33 @@ def _resolved_skill_config(project_id: str) -> dict:
         db.close()
 
 
-def _spawn_pipeline(project_id: str, initial_state: dict, mode: str, output_format: str, resolution: str) -> asyncio.Task:
+def _require_project(project_id: str) -> Project:
+    """Validate a project before creating files or background work."""
+
+    try:
+        safe_id = validate_identifier(project_id, "项目 ID")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    db = SessionLocal()
+    try:
+        project = db.query(Project).filter(Project.id == safe_id).first()
+        if not project:
+            raise HTTPException(status_code=404, detail="项目不存在")
+        return project
+    finally:
+        db.close()
+
+
+def _spawn_pipeline(project_id: str, initial_state: dict, mode: str, output_format: str, resolution: str) -> asyncio.Task | None:
     """根据 mode 启动手动(逐步)或自动(LangGraph 端到端)流水线,均后台异步执行。"""
+    task_key = f"project:{project_id}:pipeline:{mode}"
+    if not claim_task(task_key, f"project:{project_id}"):
+        return None
     if mode == "auto":
         coro = _run_auto_pipeline(project_id, initial_state, output_format, resolution)
     else:
         coro = _run_storyboard_phase(project_id, initial_state)
-    task = asyncio.create_task(coro)
+    task = start_task(task_key, coro)
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
     return task
@@ -211,7 +263,7 @@ async def _run_auto_pipeline(project_id: str, initial_state: dict, output_format
     from agent.graph import get_graph
 
     try:
-        await get_graph().ainvoke(
+        result = await get_graph().ainvoke(
             {
                 "project_id": project_id,
                 "mode": "auto",
@@ -222,15 +274,27 @@ async def _run_auto_pipeline(project_id: str, initial_state: dict, output_format
                 "errors": [],
             }
         )
+        if result.get("errors"):
+            db = SessionLocal()
+            try:
+                _mark_project_error(db, project_id)
+            finally:
+                db.close()
+            raise RuntimeError("自动流程失败: " + "\n".join(result["errors"]))
     except Exception as exc:
+        db = SessionLocal()
+        try:
+            _mark_project_error(db, project_id)
+        finally:
+            db.close()
         await ws_manager.send_to_project(
             project_id,
             {"type": "error", "message": f"自动流程失败: {exc}\n{traceback.format_exc()}"},
         )
+        raise
 
 
 async def _run_storyboard_phase(project_id: str, state: dict):
-    db = SessionLocal()
     try:
         await _progress(project_id, "parse_script", 10, "正在解析剧本")
         state.update(await script_parser.run(state))
@@ -247,11 +311,19 @@ async def _run_storyboard_phase(project_id: str, state: dict):
         state.update(await storyboard_gen.run(state))
 
         await _progress(project_id, "wait_asset_confirm", 40, "正在生成角色三视图与项目素材板")
-        asset_project_id = _resolve_asset_project_id(db, project_id)
+        db = SessionLocal()
+        try:
+            asset_project_id = _resolve_asset_project_id(db, project_id)
+        finally:
+            db.close()
         await _ensure_character_reference_images(asset_project_id, state)
         await _ensure_scene_baseline_images(asset_project_id, state)
 
-        _persist_phase1(db, project_id, state, status="assets_ready")
+        db = SessionLocal()
+        try:
+            _persist_phase1(db, project_id, state, status="assets_ready")
+        finally:
+            db.close()
         await _progress(project_id, "wait_asset_confirm", 45, "角色板、场景板与分镜已生成，请确认素材后生成故事板")
         await ws_manager.send_to_project(
             project_id,
@@ -264,14 +336,17 @@ async def _run_storyboard_phase(project_id: str, state: dict):
             },
         )
     except Exception as exc:
-        db.rollback()
-        _mark_project_error(db, project_id)
+        db = SessionLocal()
+        try:
+            db.rollback()
+            _mark_project_error(db, project_id)
+        finally:
+            db.close()
         await ws_manager.send_to_project(
             project_id,
             {"type": "error", "message": f"剧本与分镜生成失败: {exc}\n{traceback.format_exc()}"},
         )
-    finally:
-        db.close()
+        raise
 
 
 def _persist_phase1(db, project_id: str, state: dict, status: str = "assets_ready") -> None:
@@ -553,6 +628,8 @@ async def _persist_shot_update(project_id: str, shot: dict) -> None:
 
 
 async def _progress(project_id: str, step: str, progress: int, message: str) -> None:
+    update_job_progress(f"project:{project_id}:pipeline:auto", progress)
+    update_job_progress(f"project:{project_id}:pipeline:manual", progress)
     await ws_manager.send_to_project(project_id, {"type": "progress", "step": step, "progress": progress, "message": message})
 
 

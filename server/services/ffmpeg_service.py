@@ -1,8 +1,13 @@
 import asyncio
 import hashlib
+import os
+import shutil
+import uuid
 from pathlib import Path
 
 from config import settings
+from services.security import existing_file, safe_path, validate_identifier
+from services.storage_service import StorageQuotaExceeded, StorageService
 
 
 class FFmpegService:
@@ -11,6 +16,7 @@ class FFmpegService:
     def __init__(self):
         self.output_dir = settings.OUTPUT_DIR / "projects"
         self.fps = settings.DEFAULT_FPS
+        self.storage = StorageService()
 
     async def compose_video(
         self,
@@ -18,40 +24,65 @@ class FFmpegService:
         output_format: str = "9:16",
         resolution: str = "1080p",
         project_id: str = "",
+        publish: bool = True,
     ) -> str:
-        video_dir = self.output_dir / project_id / "output"
-        video_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            safe_project_id = validate_identifier(project_id, "项目 ID")
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        video_dir = safe_path(self.output_dir, safe_project_id, "output", create_parent=True)
+        try:
+            self.storage.ensure_project_capacity(safe_project_id, settings.FFMPEG_WORKSPACE_RESERVE_BYTES)
+        except StorageQuotaExceeded as exc:
+            raise RuntimeError("项目媒体存储空间不足，无法开始渲染") from exc
+        work_dir = video_dir / f".render-{uuid.uuid4().hex}"
+        work_dir.mkdir(parents=True, exist_ok=False)
         width, height = self._get_resolution(resolution, output_format)
 
-        clip_paths: list[Path] = []
-        for index, shot in enumerate(shots):
-            if shot.get("video_path"):
-                clip_paths.append(await self._normalize_video_clip(shot, width, height, index, video_dir))
-                continue
-            if not shot.get("image_path"):
-                continue
-            clip_paths.append(await self._render_shot_clip(shot, width, height, index, video_dir))
+        try:
+            clip_paths: list[Path] = []
+            media_roots = (settings.OUTPUT_DIR, settings.ASSETS_DIR, settings.DATA_DIR)
+            for index, shot in enumerate(shots):
+                if shot.get("video_path"):
+                    if existing_file(shot["video_path"], minimum_size=4096, allowed_roots=media_roots) is None:
+                        raise ValueError(f"镜头视频文件不存在或无效: {shot.get('shot_id', index)}")
+                    clip_paths.append(await self._normalize_video_clip(shot, width, height, index, work_dir))
+                    continue
+                if not shot.get("image_path"):
+                    continue
+                if existing_file(shot["image_path"], minimum_size=1, allowed_roots=media_roots) is None:
+                    raise ValueError(f"镜头图片文件不存在或无效: {shot.get('shot_id', index)}")
+                clip_paths.append(await self._render_shot_clip(shot, width, height, index, work_dir))
 
-        if not clip_paths:
-            raise ValueError("没有可渲染的镜头图片")
+            if not clip_paths:
+                raise ValueError("没有可渲染的镜头图片")
 
-        final_path = await self._concat_clips(clip_paths, video_dir)
-        final_path = await self._add_continuous_ambient_bed(final_path, video_dir)
-        return str(final_path)
+            rendered = await self._concat_clips(clip_paths, work_dir)
+            rendered = await self._add_continuous_ambient_bed(rendered, work_dir)
+            final_path = video_dir / ("final.mp4" if publish else f".final-{uuid.uuid4().hex}.candidate")
+            os.replace(rendered, final_path)
+            if not final_path.exists() or final_path.stat().st_size <= 1024:
+                raise RuntimeError("FFmpeg 未生成有效的成片文件")
+            return str(final_path)
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
     async def _render_shot_clip(self, shot: dict, width: int, height: int, index: int, output_dir: Path) -> Path:
         clip_path = output_dir / f"clip_{index:04d}.mp4"
         duration = max(0.5, float(shot.get("duration") or 3.0))
         frames = max(1, int(duration * self.fps))
-        image_path = str(shot["image_path"])
+        image_obj = self._media_path(shot.get("image_path"), minimum_size=1)
+        if image_obj is None:
+            raise ValueError("镜头图片文件不存在或无效")
+        image_path = str(image_obj)
         video_filter = self._clip_filter(
             self._zoom_filter(shot.get("shot_type", "medium"), width, height, frames),
             shot,
             duration,
         )
 
-        audio_path = Path(shot["audio_path"]) if shot.get("audio_path") else None
-        if audio_path and audio_path.exists():
+        audio_path = self._media_path(shot.get("audio_path"), minimum_size=1)
+        if audio_path:
             audio_input = ["-i", str(audio_path)]
             audio_filter = ["-af", f"apad=pad_dur={duration}"]
         else:
@@ -91,9 +122,12 @@ class FFmpegService:
     async def _normalize_video_clip(self, shot: dict, width: int, height: int, index: int, output_dir: Path) -> Path:
         clip_path = output_dir / f"clip_{index:04d}.mp4"
         duration = max(0.5, float(shot.get("duration") or 3.0))
-        video_path = str(shot["video_path"])
-        audio_path = Path(shot["audio_path"]) if shot.get("audio_path") else None
-        if audio_path and audio_path.exists():
+        video_path_obj = self._media_path(shot.get("video_path"), minimum_size=4096)
+        if video_path_obj is None:
+            raise ValueError("镜头视频文件不存在或无效")
+        video_path = str(video_path_obj)
+        audio_path = self._media_path(shot.get("audio_path"), minimum_size=1)
+        if audio_path:
             audio_input = ["-i", str(audio_path)]
             map_audio = ["-map", "1:a:0"]
             audio_codec = ["-c:a", "aac", "-af", f"apad=pad_dur={duration}"]
@@ -263,7 +297,36 @@ class FFmpegService:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr = await proc.communicate()
+        try:
+            _, stderr = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=max(30, int(settings.FFMPEG_TIMEOUT_SECONDS)),
+            )
+        except asyncio.CancelledError:
+            # Cancelling the coroutine does not automatically terminate an
+            # asyncio subprocess. Reap it before propagating cancellation so
+            # project deletion cannot leave an encoder writing in the background.
+            if proc.returncode is None:
+                proc.kill()
+            await proc.communicate()
+            raise
+        except asyncio.TimeoutError as exc:
+            proc.kill()
+            await proc.communicate()
+            raise TimeoutError("FFmpeg 执行超时") from exc
+        except asyncio.CancelledError:
+            proc.kill()
+            await proc.communicate()
+            raise
         if proc.returncode != 0:
             message = stderr.decode("utf-8", errors="ignore")[-2000:]
             raise RuntimeError(f"FFmpeg 执行失败: {message}")
+
+    def _media_path(self, value: str | None, minimum_size: int = 1) -> Path | None:
+        if not value:
+            return None
+        return existing_file(
+            value,
+            minimum_size=minimum_size,
+            allowed_roots=(settings.OUTPUT_DIR, settings.ASSETS_DIR, settings.DATA_DIR),
+        )

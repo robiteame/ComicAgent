@@ -146,6 +146,13 @@ async def _compose(state: AgentState) -> dict:
         await _render_task(project_id, state.get("output_format") or "9:16", state.get("resolution") or "1080p")
     except Exception as exc:
         return _abort("compose", exc)
+    # A route may report a non-throwing status for compatibility with older
+    # callers. Treat anything except completed as a failed graph node.
+    from api.routes.render import _render_status
+
+    render_status = _render_status.get(project_id, {})
+    if render_status.get("status") != "completed":
+        return _abort("compose", render_status.get("message") or "成片导出未完成")
     return {"current_step": "compose"}
 
 

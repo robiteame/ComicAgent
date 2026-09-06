@@ -1,4 +1,5 @@
 import base64
+import json
 import re
 import textwrap
 from io import BytesIO
@@ -10,6 +11,8 @@ from config import settings
 from services.consistency_service import ConsistencyService
 from services.reference_asset_service import ReferenceAssetService
 from services.style_templates import style_prompt_params
+from services.security import atomic_write_bytes, download_remote_bytes, safe_path, validate_identifier
+from services.storage_service import StorageQuotaExceeded, StorageService
 
 
 class ImageService:
@@ -19,6 +22,7 @@ class ImageService:
         self.output_dir = settings.OUTPUT_DIR / "projects"
         self.consistency = ConsistencyService()
         self.reference_assets = ReferenceAssetService()
+        self.storage = StorageService()
 
     # 运行时实时读取 settings，保证保存模型/API 配置后新任务即生效。
     @property
@@ -52,9 +56,13 @@ class ImageService:
         prompt, negative_prompt = self._build_prompt(shot, characters, style_params)
         reference_images = self._reference_images_for_request(shot)
 
-        shot_dir = self.output_dir / project_id / "shots"
-        shot_dir.mkdir(parents=True, exist_ok=True)
-        image_path = shot_dir / f"{shot['shot_id']}_v{shot.get('version', 1)}.png"
+        try:
+            safe_project_id = validate_identifier(project_id, "项目 ID")
+            safe_shot_id = validate_identifier(str(shot["shot_id"]), "镜头 ID")
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+        shot_dir = safe_path(self.output_dir, safe_project_id, "shots", create_parent=True)
+        image_path = shot_dir / f"{safe_shot_id}_v{int(shot.get('version', 1) or 1)}.png"
 
         preferred_size = self._size_for_ratio(shot.get("output_format"))
 
@@ -69,7 +77,7 @@ class ImageService:
             raise RuntimeError("图像生成接口未返回图片数据")
 
         self._validate_image(image_data)
-        image_path.write_bytes(image_data)
+        self._write_image(project_id, image_path, image_data)
         return str(image_path)
 
     async def generate_scene_baseline_reference(
@@ -84,8 +92,11 @@ class ImageService:
         prompt = ", ".join(part for part in [style_params.get("scene_baseline_prompt", ""), prompt] if part)
         negative_prompt = ", ".join(part for part in [negative_prompt, style_params.get("negative_prompt", "")] if part)
 
-        ref_dir = self.output_dir / project_id / "scenes"
-        ref_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            safe_project_id = validate_identifier(project_id, "项目 ID")
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+        ref_dir = safe_path(self.output_dir, safe_project_id, "scenes", create_parent=True)
         safe_key = scene.get("id") or scene.get("scene_group_key") or scene.get("location") or scene.get("name", "scene")
         safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(safe_key)).strip("_") or "scene"
         scene_dir = ref_dir / safe_name
@@ -101,7 +112,7 @@ class ImageService:
             image_data = self._generate_placeholder("SCENE BASELINE", prompt, self._placeholder_size(preferred_size))
 
         self._validate_image(image_data)
-        image_path.write_bytes(image_data)
+        self._write_image(project_id, image_path, image_data)
         return str(image_path)
 
     async def generate_character_reference(
@@ -113,8 +124,11 @@ class ImageService:
     ) -> str:
         prompt, negative_prompt = self._build_character_reference_prompt(character, style)
 
-        ref_dir = self.output_dir / project_id / "characters"
-        ref_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            safe_project_id = validate_identifier(project_id, "项目 ID")
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+        ref_dir = safe_path(self.output_dir, safe_project_id, "characters", create_parent=True)
         identity_key = character.get("id") or character.get("asset_id") or character.get("name", "character")
         safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(identity_key)).strip("_") or "character"
         character_dir = ref_dir / safe_name
@@ -130,7 +144,7 @@ class ImageService:
             image_data = self._generate_placeholder("CHARACTER REF", prompt, self._placeholder_size(preferred_size))
 
         self._validate_image(image_data)
-        image_path.write_bytes(image_data)
+        self._write_image(project_id, image_path, image_data)
         return str(image_path)
 
     def _is_seedream_provider(self) -> bool:
@@ -206,20 +220,20 @@ class ImageService:
                 for size in list(dict.fromkeys(size for size in sizes if size)):
                     payload = self._seedream_payload(model, prompt, negative_prompt, seed, size, reference_images)
                     try:
-                        response = await client.post(
+                        request = client.build_request(
+                            "POST",
                             f"{self.seedream_base_url}/images/generations",
-                            headers={
-                                "Authorization": f"Bearer {self.api_key}",
-                                "Content-Type": "application/json",
-                            },
+                            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
                             json=payload,
                         )
+                        response = await client.send(request, stream=True)
+                        response_bytes = await self._read_bounded_response(response)
                         if response.status_code in {401, 403}:
-                            raise PermissionError(response.text[:600])
+                            raise PermissionError(response_bytes.decode("utf-8", errors="replace")[:600])
                         if response.status_code >= 400:
-                            errors.append(f"{model} {size}: {response.status_code} {response.text[:400]}")
+                            errors.append(f"{model} {size}: {response.status_code} {response_bytes.decode('utf-8', errors='replace')[:400]}")
                             continue
-                        return await self._extract_image_bytes(client, response)
+                        return await self._extract_image_bytes(client, response, response_bytes)
                     except PermissionError as exc:
                         raise RuntimeError(f"火山方舟鉴权失败，请确认 API Key 和模型权限: {exc}") from exc
                     except Exception as exc:
@@ -272,12 +286,17 @@ class ImageService:
         )
         return list(dict.fromkeys(candidates))
 
-    async def _extract_image_bytes(self, client: httpx.AsyncClient, response: httpx.Response) -> bytes:
+    async def _extract_image_bytes(self, client: httpx.AsyncClient, response: httpx.Response, response_bytes: bytes) -> bytes:
         content_type = response.headers.get("content-type", "")
         if content_type.startswith("image/"):
-            return response.content
+            if len(response_bytes) > settings.MAX_IMAGE_GENERATION_BYTES:
+                raise RuntimeError("图像数据超过大小限制")
+            return response_bytes
 
-        data = response.json()
+        try:
+            data = json.loads(response_bytes)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("图像接口返回不是有效 JSON") from exc
         items = data.get("data") if isinstance(data, dict) else None
         if not items:
             raise RuntimeError(f"图像接口返回缺少 data: {data}")
@@ -287,17 +306,50 @@ class ImageService:
         if b64_data:
             if "," in b64_data and b64_data.startswith("data:"):
                 b64_data = b64_data.split(",", 1)[1]
-            return base64.b64decode(b64_data)
+            if len(b64_data) > int(settings.MAX_IMAGE_GENERATION_BYTES * 4 / 3) + 16:
+                raise RuntimeError("图像数据超过大小限制")
+            decoded = base64.b64decode(b64_data, validate=True)
+            if len(decoded) > settings.MAX_IMAGE_GENERATION_BYTES:
+                raise RuntimeError("图像数据超过大小限制")
+            return decoded
 
         image_url = item.get("url") or item.get("image_url")
         if isinstance(image_url, dict):
             image_url = image_url.get("url")
         if image_url:
-            image_response = await client.get(image_url)
-            image_response.raise_for_status()
-            return image_response.content
+            try:
+                return await download_remote_bytes(
+                    image_url,
+                    max_bytes=settings.MAX_IMAGE_GENERATION_BYTES,
+                    timeout=180,
+                )
+            except Exception as exc:
+                raise RuntimeError(f"图像 URL 下载失败: {exc}") from exc
 
         raise RuntimeError(f"无法解析图像接口返回: {data}")
+
+    async def _read_bounded_response(self, response: httpx.Response) -> bytes:
+        limit = max(1024, int(settings.MAX_IMAGE_GENERATION_BYTES * 4 / 3) + 16)
+        length = response.headers.get("content-length")
+        if length and int(length) > limit:
+            await response.aclose()
+            raise RuntimeError("图像接口响应超过大小限制")
+        body = bytearray()
+        try:
+            async for chunk in response.aiter_bytes(1024 * 1024):
+                body.extend(chunk)
+                if len(body) > limit:
+                    raise RuntimeError("图像接口响应超过大小限制")
+            return bytes(body)
+        finally:
+            await response.aclose()
+
+    def _write_image(self, project_id: str, image_path, image_data: bytes) -> None:
+        try:
+            self.storage.ensure_project_capacity(project_id, len(image_data), replacing=image_path)
+        except StorageQuotaExceeded as exc:
+            raise RuntimeError("项目媒体存储空间不足") from exc
+        atomic_write_bytes(image_path, image_data, minimum_size=1024)
 
     def _validate_image(self, image_data: bytes) -> None:
         try:
@@ -498,7 +550,8 @@ class ImageService:
 
     async def _call_stability(self, prompt: str, negative_prompt: str, seed: int) -> bytes:
         async with httpx.AsyncClient(timeout=45) as client:
-            response = await client.post(
+            request = client.build_request(
+                "POST",
                 f"{self.api_url}/stable-image/generate/core",
                 headers={
                     "Authorization": f"Bearer {self.api_key}",
@@ -511,8 +564,15 @@ class ImageService:
                     "output_format": "png",
                 },
             )
-            response.raise_for_status()
-            return response.content
+            response = await client.send(request, stream=True)
+            try:
+                response.raise_for_status()
+                data = await self._read_bounded_response(response)
+                if len(data) > settings.MAX_IMAGE_GENERATION_BYTES:
+                    raise RuntimeError("图像数据超过大小限制")
+                return data
+            finally:
+                await response.aclose()
 
     def _camera_prompt(self, shot_type: str) -> str:
         return {

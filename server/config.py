@@ -61,6 +61,20 @@ class Settings(BaseSettings):
     # 渲染配置
     DEFAULT_FPS: int = 24
     DEFAULT_RESOLUTION: str = "1080p"
+    # 请求与媒体资源限制。限制放在配置中，便于桌面版/服务端按机器容量调整。
+    MAX_SCRIPT_UPLOAD_BYTES: int = 10 * 1024 * 1024
+    MAX_VIDEO_UPLOAD_BYTES: int = 1024 * 1024 * 1024
+    MAX_SCRIPT_TEXT_CHARS: int = 1_000_000
+    MAX_REMOTE_MEDIA_BYTES: int = 512 * 1024 * 1024
+    MAX_IMAGE_GENERATION_BYTES: int = 32 * 1024 * 1024
+    MAX_INLINE_REFERENCE_BYTES: int = 12 * 1024 * 1024
+    MAX_TTS_AUDIO_BYTES: int = 64 * 1024 * 1024
+    PROJECT_STORAGE_QUOTA_BYTES: int = 5 * 1024 * 1024 * 1024
+    PROJECT_TEMP_FILE_TTL_SECONDS: int = 24 * 60 * 60
+    PROJECT_VERSION_RETENTION_COUNT: int = 3
+    FFMPEG_WORKSPACE_RESERVE_BYTES: int = 1024 * 1024 * 1024
+    FFMPEG_TIMEOUT_SECONDS: int = 900
+    BACKGROUND_TASK_CANCEL_TIMEOUT_SECONDS: int = 30
 
     class Config:
         env_file = (

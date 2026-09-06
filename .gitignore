@@ -60,11 +60,16 @@ pnpm-debug.yaml
 .env
 .env.local
 .env.*.local
+# Runtime model/API configuration may contain credentials. Keep only the
+# sanitized example in version control.
+server/data/model_api_config.json
 
 # ---- Project Runtime Data ----
 # Server output (generated images, audio, video)
 output/
 server/output/
+# Uploaded scripts and imported media
+server/data/uploads/
 # ChromaDB vector store
 server/data/chromadb/
 # LangGraph checkpoints

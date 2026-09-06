@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main, 'codex/**']
+  pull_request:
+
+jobs:
+  server:
+    name: Server checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          # Test the documented minimum runtime; newer versions remain covered
+          # by the universal hashed lock resolution.
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: server/requirements-dev.lock
+      - name: Install server dependencies
+        run: python -m pip install --require-hashes -r server/requirements-dev.lock
+      - name: Compile Python modules
+        run: python -m compileall -q server
+      - name: Run regression tests
+        env:
+          PYTHONPATH: server
+        run: python -m unittest discover -s server/tests -p 'test_*.py' -v
+      - name: Run pytest collection
+        run: python -m pytest -q
+
+  client:
+    name: Client checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.15.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.13.0'
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Audit production dependencies
+        run: pnpm audit --prod --audit-level=high
+      - name: Typecheck
+        run: pnpm --dir client run typecheck
+      - name: Run client tests
+        run: pnpm --dir client run test
+      - name: Build web bundle
+        run: pnpm --dir client run build:web
+      - name: Build unpacked Electron app
+        run: pnpm --dir client run build:electron:dir

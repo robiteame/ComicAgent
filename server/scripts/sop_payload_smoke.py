@@ -21,6 +21,7 @@ from api.routes.shot import (
     _invalidate_video_outputs,
     _previous_reference_for_shot,
 )
+from config import settings
 from services.consistency_service import ConsistencyService
 from services.ffmpeg_service import FFmpegService
 from services.image_service import ImageService
@@ -91,7 +92,12 @@ def main() -> None:
     if TMP_ROOT.exists():
         shutil.rmtree(TMP_ROOT)
     TMP_ROOT.mkdir(parents=True)
+    original_output_dir = settings.OUTPUT_DIR
     try:
+        # Reuse checks now validate that the media exists under an approved
+        # root. Point the smoke fixture at its isolated temporary root instead
+        # of using the old placeholder path.
+        settings.OUTPUT_DIR = TMP_ROOT
         shot_route.reference_asset_service.output_dir = TMP_ROOT
         frame = _png(TMP_ROOT / "prev_frame.png", "prev", (90, 120, 180))
         storyboard = _png(TMP_ROOT / "storyboard.png", "story", (180, 120, 90))
@@ -207,7 +213,9 @@ def main() -> None:
         assert stale.reference_weights == "{}"
         assert stale.consistency_context == ""
 
-        video_stale = _stale_shot(sequence=2)
+        valid_video = TMP_ROOT / "video.mp4"
+        valid_video.write_bytes(b"\x00" * 4096)
+        video_stale = _stale_shot(sequence=2, video_path=str(valid_video))
         assert _can_reuse_existing_video(video_stale, force=False)
         assert not _can_reuse_existing_video(video_stale, force=True)
         video_stale.status = "storyboard_approved"
@@ -269,6 +277,7 @@ def main() -> None:
         )
         print("SOP_PAYLOAD_SMOKE_OK")
     finally:
+        settings.OUTPUT_DIR = original_output_dir
         if TMP_ROOT.exists():
             shutil.rmtree(TMP_ROOT)
 

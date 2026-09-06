@@ -3,6 +3,8 @@ import base64
 import httpx
 
 from config import settings
+from services.security import atomic_write_bytes, safe_path, validate_identifier
+from services.storage_service import StorageQuotaExceeded, StorageService
 
 
 MIMO_TTS_VOICES = {"mimo_default", "冰糖", "茉莉", "苏打", "白桦", "Mia", "Chloe", "Milo", "Dean"}
@@ -51,6 +53,7 @@ class TTSService:
 
     def __init__(self):
         self.output_dir = settings.OUTPUT_DIR / "projects"
+        self.storage = StorageService()
 
     async def generate_dialogue(
         self,
@@ -60,10 +63,14 @@ class TTSService:
         project_id: str = "",
         shot_id: str = "",
     ) -> str:
-        audio_dir = self.output_dir / project_id / "audio"
-        audio_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            safe_project_id = validate_identifier(project_id, "项目 ID")
+            safe_shot_id = validate_identifier(shot_id, "镜头 ID")
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+        audio_dir = safe_path(self.output_dir, safe_project_id, "audio", create_parent=True)
         suffix = (settings.MIMO_TTS_FORMAT or "wav").lstrip(".")
-        audio_path = audio_dir / f"{shot_id}.{suffix}"
+        audio_path = audio_dir / f"{safe_shot_id}.{suffix}"
         return await self._generate_mimo_tts(text, voice_id, emotion, audio_path)
 
     async def _generate_mimo_tts(self, text: str, voice_id: str, emotion: str, audio_path) -> str:
@@ -71,6 +78,8 @@ class TTSService:
             raise RuntimeError("未配置 MIMO_API_KEY，无法调用 Mimo 内置 TTS")
         if not text.strip():
             raise RuntimeError("配音文本为空，无法调用 Mimo 内置 TTS")
+        if len(text) > settings.MAX_SCRIPT_TEXT_CHARS:
+            raise RuntimeError("配音文本超过长度限制")
 
         payload = {
             "model": settings.MIMO_TTS_MODEL,
@@ -100,7 +109,11 @@ class TTSService:
             raise RuntimeError(f"Mimo TTS 调用失败: {response.status_code} {response.text[:600]}")
 
         audio_data = self._extract_mimo_audio(response.json())
-        audio_path.write_bytes(audio_data)
+        try:
+            self.storage.ensure_project_capacity(project_id=audio_path.parents[1].name, incoming_bytes=len(audio_data), replacing=audio_path)
+        except StorageQuotaExceeded as exc:
+            raise RuntimeError("项目媒体存储空间不足") from exc
+        atomic_write_bytes(audio_path, audio_data, minimum_size=1024)
         if not audio_path.exists() or audio_path.stat().st_size <= 1024:
             raise RuntimeError("Mimo TTS 返回音频为空或过小")
         return str(audio_path)
@@ -117,7 +130,16 @@ class TTSService:
             raise RuntimeError(f"Mimo TTS 返回缺少 audio.data: {data}")
         if "," in b64_data and b64_data.startswith("data:"):
             b64_data = b64_data.split(",", 1)[1]
-        return base64.b64decode(b64_data)
+        limit = int(settings.MAX_TTS_AUDIO_BYTES)
+        if len(b64_data) > int(limit * 4 / 3) + 16:
+            raise RuntimeError("音频数据超过大小限制")
+        try:
+            decoded = base64.b64decode(b64_data, validate=True)
+        except Exception as exc:
+            raise RuntimeError("音频数据编码无效") from exc
+        if len(decoded) > limit:
+            raise RuntimeError("音频数据超过大小限制")
+        return decoded
 
     def _emotion_hint(self, emotion: str) -> str:
         return {

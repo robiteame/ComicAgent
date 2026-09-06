@@ -1,6 +1,9 @@
+import asyncio
+import hashlib
 import re
 from pathlib import Path
 from config import settings
+from services.security import validate_identifier
 
 try:
     import chromadb
@@ -36,39 +39,27 @@ class RAGService:
     ) -> dict:
         """导入文档到 RAG"""
 
-        # 解析文档
-        if file_type == "txt":
-            raw_text = self._parse_txt(file_path)
-        elif file_type == "docx":
-            raw_text = self._parse_docx(file_path)
-        else:
-            raw_text = self._parse_txt(file_path)
+        try:
+            safe_project_id = validate_identifier(project_id, "项目 ID")
+        except ValueError:
+            # RAG collection names must be safe even when called by an older
+            # integration that did not validate the route parameter.
+            safe_project_id = hashlib.sha1(str(project_id).encode("utf-8")).hexdigest()[:24]
+
+        # Parsing docx/txt and embedding are synchronous libraries. Keep them
+        # off the event loop so a large import cannot stall WebSocket progress.
+        parser = self._parse_docx if file_type.lower() == "docx" else self._parse_txt
+        raw_text = await asyncio.to_thread(parser, file_path)
+        if len(raw_text) > settings.MAX_SCRIPT_TEXT_CHARS:
+            raise ValueError("RAG 文档超过长度限制")
 
         # 智能分块
         chunks = self._smart_chunk(raw_text, doc_type)
 
-        # 存储到 ChromaDB
-        collection = self.chroma_client.get_or_create_collection(
-            name=f"project_{project_id}",
-            metadata={"doc_type": doc_type},
-        )
-
-        for i, chunk in enumerate(chunks):
-            doc_id = f"chunk_{i:04d}"
-            # ChromaDB 会自动用默认 embedding function
-            collection.add(
-                ids=[doc_id],
-                documents=[chunk["text"]],
-                metadatas=[
-                    {
-                        "chunk_type": chunk.get("type", "narrative"),
-                        "chapter": chunk.get("chapter", ""),
-                        "characters": ",".join(chunk.get("characters", [])),
-                        "location": chunk.get("location", ""),
-                        "position": i,
-                    }
-                ],
-            )
+        stored = False
+        if self.chroma_client is not None and chunks:
+            await asyncio.to_thread(self._store_chunks, safe_project_id, doc_type, chunks)
+            stored = True
 
         # 提取角色和场景
         all_characters = set()
@@ -82,7 +73,37 @@ class RAGService:
             "total_chunks": len(chunks),
             "characters_extracted": list(all_characters),
             "scenes_extracted": list(all_scenes),
+            "stored": stored,
         }
+
+    def _store_chunks(self, project_id: str, doc_type: str, chunks: list[dict]) -> None:
+        collection = self.chroma_client.get_or_create_collection(
+            name=f"project_{project_id}",
+            metadata={"doc_type": doc_type},
+        )
+        ids: list[str] = []
+        documents: list[str] = []
+        metadatas: list[dict] = []
+        for index, chunk in enumerate(chunks):
+            text = str(chunk.get("text") or "")
+            digest = hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()[:12]
+            ids.append(f"chunk_{index:04d}_{digest}")
+            documents.append(text)
+            metadatas.append(
+                {
+                    "chunk_type": str(chunk.get("type", "narrative")),
+                    "chapter": str(chunk.get("chapter", "")),
+                    "characters": ",".join(str(item) for item in chunk.get("characters", [])),
+                    "location": str(chunk.get("location", "")),
+                    "position": index,
+                }
+            )
+        # upsert makes repeated imports idempotent instead of failing on fixed
+        # chunk IDs. Batch writes also reduce Chroma overhead.
+        if hasattr(collection, "upsert"):
+            collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
+        else:  # pragma: no cover - compatibility with very old Chroma clients
+            collection.add(ids=ids, documents=documents, metadatas=metadatas)
 
     async def query_context(
         self,
@@ -93,6 +114,8 @@ class RAGService:
     ) -> list[str]:
         """查询相关上下文"""
 
+        if self.chroma_client is None:
+            return []
         try:
             collection = self.chroma_client.get_collection(f"project_{project_id}")
         except Exception:
@@ -102,7 +125,7 @@ class RAGService:
 
         results = collection.query(
             query_texts=[query],
-            n_results=n_results,
+            n_results=max(1, min(int(n_results or 3), 20)),
             where=where_filter,
         )
 
@@ -115,6 +138,8 @@ class RAGService:
     ) -> list[str]:
         """查询角色相关上下文"""
 
+        if self.chroma_client is None:
+            return []
         try:
             collection = self.chroma_client.get_collection(f"project_{project_id}")
         except Exception:
@@ -148,34 +173,32 @@ class RAGService:
 
     def _chunk_script(self, text: str) -> list[dict]:
         """剧本分块：按场景分割"""
-        chunks = []
-        scene_pattern = r"(?:\[场景\s*(\d+)\]|SCENE\s*(\d+)|第([一二三四五六七八九十]+)幕)"
-        parts = re.split(f"({scene_pattern})", text)
+        chunks: list[dict] = []
+        # Keep this pattern entirely non-capturing. The previous nested
+        # captures made re.split insert None values for ordinary scene input.
+        scene_pattern = r"(?:\[场景\s*\d+\]|SCENE\s*\d+|第[一二三四五六七八九十\d]+幕)"
+        markers = list(re.finditer(scene_pattern, text or "", flags=re.IGNORECASE))
+        segments: list[str] = []
+        if markers:
+            if text[: markers[0].start()].strip():
+                segments.append(text[: markers[0].start()])
+            for index, marker in enumerate(markers):
+                end = markers[index + 1].start() if index + 1 < len(markers) else len(text)
+                segments.append(text[marker.start() : end])
+        else:
+            segments = [text or ""]
 
-        current_chunk = ""
-        for part in parts:
-            if re.match(scene_pattern, part):
-                if current_chunk.strip():
-                    chunks.append(
-                        {
-                            "text": current_chunk.strip(),
-                            "type": "scene",
-                            "characters": self._extract_characters(current_chunk),
-                        }
-                    )
-                current_chunk = ""
-            else:
-                current_chunk += part
-
-        if current_chunk.strip():
+        for segment in segments:
+            clean = segment.strip()
+            if not clean:
+                continue
             chunks.append(
                 {
-                    "text": current_chunk.strip(),
+                    "text": clean,
                     "type": "scene",
-                    "characters": self._extract_characters(current_chunk),
+                    "characters": self._extract_characters(clean),
                 }
             )
-
         return chunks
 
     def _chunk_novel(self, text: str) -> list[dict]:

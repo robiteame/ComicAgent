@@ -121,7 +121,10 @@ ComicAgent/
 ├── server/                              # FastAPI 后端
 │   ├── main.py                          # 应用入口、CORS、静态输出目录挂载
 │   ├── config.py                        # Pydantic Settings 配置管理
-│   ├── requirements.txt                 # Python 依赖
+│   ├── requirements.txt                 # Python 直接运行依赖
+│   ├── requirements.lock                # 带哈希的锁定运行依赖
+│   ├── requirements-dev.txt             # 开发与测试直接依赖
+│   ├── requirements-dev.lock            # 带哈希的锁定开发依赖
 │   ├── .env.example                     # 环境变量模板
 │   ├── agent/                           # LangGraph 自动模式
 │   │   ├── state.py                     # AgentState TypedDict 定义
@@ -327,9 +330,9 @@ ComicAgent/
 | 依赖 | 版本要求 | 验证命令 |
 |------|---------|---------|
 | Python | ≥ 3.11 | `python3 --version` |
-| Node.js | ≥ 18（建议 22+） | `node --version` |
-| pnpm | 最新版 | `pnpm --version` |
-| FFmpeg | 任意版本 | `ffmpeg -version` |
+| Node.js | ≥ 22.13 | `node --version` |
+| pnpm | 11.15.1 | `pnpm --version` |
+| FFmpeg | 可用的系统版本 | `ffmpeg -version` |
 
 > **FFmpeg 安装**：macOS 推荐 `brew install ffmpeg`；Windows 从 [ffmpeg.org](https://ffmpeg.org/download.html) 下载并添加到 PATH；Linux 使用包管理器安装。
 
@@ -342,8 +345,8 @@ cd server
 python3 -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 
-# 2. 安装依赖
-pip install -r requirements.txt
+# 2. 按锁文件安装可复现的运行依赖
+python -m pip install --require-hashes -r requirements.lock
 
 # 3. 配置环境变量（可选，无 API Key 时图像阶段使用 PIL 占位图）
 cp .env.example .env
@@ -364,9 +367,9 @@ python main.py
 **纯 Web 开发模式**（推荐，无需 Electron）：
 
 ```bash
-cd client
-pnpm install
-npx vite --config vite.config.web.ts --host 127.0.0.1 --port 5173
+# 在仓库根目录统一安装 workspace 依赖
+pnpm install --frozen-lockfile
+pnpm --dir client exec vite --config vite.config.web.ts --host 127.0.0.1 --port 5173
 ```
 
 打开 http://127.0.0.1:5173 即可使用。
@@ -376,12 +379,24 @@ npx vite --config vite.config.web.ts --host 127.0.0.1 --port 5173
 **完整 Electron 桌面端开发**：
 
 ```bash
-cd client
-pnpm install
-pnpm run electron:dev    # 自动启动后端 + Vite + Electron 窗口
+# 在仓库根目录执行
+pnpm install --frozen-lockfile
+pnpm --dir client run electron:dev    # 自动启动后端 + Vite + Electron 窗口
 ```
 
 > 如遇 Electron 二进制下载超时，项目 `.npmrc` 已配置国内镜像源。也可先使用纯 Web 模式开发。
+
+### Electron 发布包
+
+`pnpm --dir client run build` 使用 `client/electron-builder.yml`，仅将 Vite 产物和经过过滤的
+`server/` 源码放入安装包；本地 API Key、SQLite 数据库、上传文件和缓存不会被打包。
+当前发布包不内置 Python、Python site-packages 或 FFmpeg。目标机器仍需提供 Python
+3.11+、按 `server/requirements.lock` 安装的锁定运行依赖，以及 PATH 中可执行的
+FFmpeg。主进程会将后端运行数据写入 Electron `userData` 目录；发布前请确认它能启动
+`resources/server/main.py`，而不是依赖开发机工作区中的 `server/` 路径。
+
+开发与 CI 的完整依赖使用 `server/requirements-dev.lock` 安装；两个锁文件均要求
+`python -m pip install --require-hashes -r <lockfile>`，更新直接依赖后需要重新生成锁文件。
 
 ---
 
@@ -510,7 +525,7 @@ pnpm run electron:dev    # 自动启动后端 + Vite + Electron 窗口
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | `POST` | `/api/render` | 触发成片合成（需 body: `{project_id, output_format, resolution}`） |
-| `GET` | `/api/render/{project_id}/status` | 查询渲染状态（内存态，服务重启后回到空闲） |
+| `GET` | `/api/render/{project_id}/status` | 查询持久化的渲染任务状态 |
 
 ### 设置与系统
 
@@ -575,8 +590,14 @@ Project (series) ──parent_project_id──▶ Project (episode)
 ```bash
 cd server
 
+# 首次准备开发环境
+python -m pip install --require-hashes -r requirements-dev.lock
+
 # 语法检查
 python -m compileall .
+
+# 回归测试
+python -m pytest -q
 
 # 离线流程审计
 python scripts/iteration_flow_audit.py      # 迭代流程审计
@@ -595,13 +616,14 @@ python scripts/full_flow_smoke.py
 ### 前端检查
 
 ```bash
-cd client
+# 在仓库根目录执行
+pnpm install --frozen-lockfile
 
 # TypeScript 类型检查
-pnpm exec tsc --noEmit
+pnpm --dir client run typecheck
 
 # 构建检查
-pnpm exec vite build
+pnpm --dir client run build:web
 ```
 
 ---
@@ -621,7 +643,6 @@ pnpm exec vite build
 ## 已知限制
 
 - **端口固定使用 `127.0.0.1`**：避免 Windows / Electron 下 `localhost` 解析异常。后端 `8011`，前端 `5173`
-- **渲染状态为内存态**：服务重启后 `GET /api/render/{id}/status` 回到空闲态，不持久化渲染进度
 - **自动模式进度跳变**：自动模式复用手动模式的 WebSocket 进度百分比，数值可能出现跳变，属已知外观问题
 - **SeedDance 单次 5 秒**：SeedDance 1.5 pro 单次生成固定 5 秒时长视频
 - **分辨率降级**：2K / 4K 项目分辨率在视频生成时会降级为 1080p 调用，最终剪辑时由 FFmpeg 按镜头时长归一化

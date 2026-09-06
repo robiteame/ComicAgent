@@ -88,7 +88,10 @@ async def get_model_configs():
 
 @router.put("/model-configs")
 async def update_model_configs(data: ModelConfigSave):
-    return save_model_config(data.model_dump(exclude_none=True))
+    try:
+        return save_model_config(data.model_dump(exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _template_key(label: str) -> str:

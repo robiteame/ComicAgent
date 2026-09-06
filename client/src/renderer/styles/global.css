@@ -17,8 +17,9 @@
   --glass-strong: rgba(255, 255, 255, 0.84);
   --text: #27313a;
   --text-secondary: #647385;
-  --text-tertiary: #8a98a9;
-  --text-quaternary: #a0acbb;
+  /* Auxiliary text remains readable on paper surfaces at WCAG AA contrast. */
+  --text-tertiary: #647385;
+  --text-quaternary: #5d6e80;
   --line: #d7e1ec;
   --line-soft: #e5edf5;
   --cool-gray: #7f8e9f;
@@ -245,6 +246,18 @@ button {
 
 .bottom-bar > span:last-child {
   margin-left: auto;
+}
+
+.lazy-page-status,
+.lazy-panel-status {
+  display: grid;
+  place-items: center;
+  color: var(--text-secondary);
+  font-size: var(--font-label);
+}
+
+.lazy-page-status {
+  min-height: 0;
 }
 
 .bottom-progress {

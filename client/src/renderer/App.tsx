@@ -4,12 +4,14 @@ import GlobalPlayfulMotion from './components/GlobalPlayfulMotion'
 import LeftSidebar from './components/LeftSidebar'
 import MainWorkspace from './components/MainWorkspace'
 import RightSidebar from './components/RightSidebar'
-import SystemSettingsPage from './components/SystemSettingsPage'
 import TopBar from './components/TopBar'
 import { OPEN_SETTINGS_EVENT } from './components/TopBar'
+import { beginProjectNavigationIntent, requestProjectNavigation } from './services/projectNavigationGuard'
+import { useProjectStore } from './stores/projectStore'
 
 const OPEN_CREATE_PROJECT_EVENT = 'workspace:open-create-project'
 const WORKSPACE_NAVIGATE_EVENT = 'workspace:navigate'
+const SystemSettingsPage = React.lazy(() => import('./components/SystemSettingsPage'))
 
 type WorkspaceNavigateDetail = {
   tab?: string
@@ -22,6 +24,7 @@ const App: React.FC = () => {
   const [settingsPageOpen, setSettingsPageOpen] = useState(false)
   const settingsPageOpenRef = useRef(settingsPageOpen)
   const pendingWorkspaceNavigationRef = useRef<WorkspaceNavigateDetail | null>(null)
+  const settingsNavigationRequestRef = useRef(0)
 
   useEffect(() => {
     settingsPageOpenRef.current = settingsPageOpen
@@ -34,7 +37,15 @@ const App: React.FC = () => {
   }, [])
 
   useEffect(() => {
-    const openSettings = () => setSettingsPageOpen(true)
+    const openSettings = () => {
+      const requestId = ++settingsNavigationRequestRef.current
+      beginProjectNavigationIntent()
+      const activeProjectId = useProjectStore.getState().projectId
+      void requestProjectNavigation(activeProjectId, null).then((canNavigate) => {
+        if (requestId !== settingsNavigationRequestRef.current || !canNavigate) return
+        setSettingsPageOpen(true)
+      })
+    }
     window.addEventListener(OPEN_SETTINGS_EVENT, openSettings)
     return () => window.removeEventListener(OPEN_SETTINGS_EVENT, openSettings)
   }, [])
@@ -87,7 +98,9 @@ const App: React.FC = () => {
           onToggleCollapsed={() => setSidebarCollapsed((prev) => !prev)}
         />
         {settingsPageOpen ? (
-          <SystemSettingsPage onBack={() => setSettingsPageOpen(false)} />
+          <React.Suspense fallback={<section className="main-workspace lazy-page-status" role="status">正在加载系统设置...</section>}>
+            <SystemSettingsPage onBack={() => setSettingsPageOpen(false)} />
+          </React.Suspense>
         ) : (
           <MainWorkspace />
         )}

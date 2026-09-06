@@ -1,6 +1,1 @@
-"use strict";
-const electron = require("electron");
-electron.contextBridge.exposeInMainWorld("electronAPI", {
-  selectFile: () => electron.ipcRenderer.invoke("select-file"),
-  selectDirectory: () => electron.ipcRenderer.invoke("select-directory")
-});
+"use strict";const e=require("electron");e.contextBridge.exposeInMainWorld("electronAPI",{getLocalAuthToken:()=>e.ipcRenderer.sendSync("get-local-auth-token"),selectFile:()=>e.ipcRenderer.invoke("select-file"),selectDirectory:()=>e.ipcRenderer.invoke("select-directory")});

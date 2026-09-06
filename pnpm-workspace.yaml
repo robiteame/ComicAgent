@@ -1,3 +1,6 @@
+packages:
+  - client
+
 allowBuilds:
   electron: true
   esbuild: true

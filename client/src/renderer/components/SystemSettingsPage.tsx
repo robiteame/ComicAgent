@@ -9,8 +9,16 @@ import {
   SaveOutlined,
   UploadOutlined,
 } from '@ant-design/icons'
-import { Button, Input, InputNumber, Segmented, Select, Slider, Switch, message } from 'antd'
+import Button from 'antd/es/button'
+import Input from 'antd/es/input'
+import InputNumber from 'antd/es/input-number'
+import message from 'antd/es/message'
+import Segmented from 'antd/es/segmented'
+import Select from 'antd/es/select'
+import Slider from 'antd/es/slider'
+import Switch from 'antd/es/switch'
 import { projectApi, settingsApi } from '../services/api'
+import { STYLE_TEMPLATES_UPDATED_EVENT } from '../constants/events'
 import { STYLE_DESCRIPTIONS, STYLE_OPTIONS } from '../constants/styleTemplates'
 import { useProjectStore } from '../stores/projectStore'
 import {
@@ -23,7 +31,6 @@ import {
 
 const { TextArea } = Input
 const { Password } = Input
-const STYLE_TEMPLATES_UPDATED_EVENT = 'settings:style-templates-updated'
 
 type StyleOption = { value: string; label: string; keywords?: string; custom?: boolean }
 
@@ -781,5 +788,4 @@ function cloneTemplate(template: SkillTemplate): SkillTemplate {
   }
 }
 
-export { STYLE_TEMPLATES_UPDATED_EVENT }
 export default SystemSettingsPage

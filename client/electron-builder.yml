@@ -1,0 +1,36 @@
+# Keep the application archive small and deterministic. Vite bundles the
+# renderer and Electron entry points, so source files and node_modules are not
+# needed at runtime.
+appId: com.comicagent.desktop
+productName: ComicAgent
+asar: true
+compression: normal
+directories:
+  output: release
+files:
+  - dist/**/*
+  - dist-electron/**/*
+  - package.json
+  - '!node_modules/**/*'
+extraResources:
+  # The desktop main process starts this source tree with the user's Python
+  # runtime. Runtime data is redirected to Electron's userData directory.
+  - from: ../server
+    to: server
+    filter:
+      - '**/*'
+      - '!data/model_api_config.json'
+      - '!data/*.db'
+      - '!data/*.db-*'
+      - '!data/chromadb/**'
+      - '!data/checkpoints/**'
+      - '!data/uploads/**'
+      - '!**/.env'
+      - '!**/.env.*'
+      - '!**/__pycache__/**'
+      - '!**/*.py[cod]'
+      - '!**/.claude/**'
+      - '!**/test_*.py'
+      - '!**/simple_test.py'
+      - '!**/start_test.py'
+      - '!scripts/**'

@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import relationship
 
 from .base import Base
@@ -8,6 +8,7 @@ from .base import Base
 
 class Shot(Base):
     __tablename__ = "shots"
+    __table_args__ = (Index("ix_shots_project_sequence", "project_id", "sequence"),)
 
     id = Column(String, primary_key=True)
     project_id = Column(String, ForeignKey("projects.id"), nullable=False, index=True)

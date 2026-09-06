@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import {
   ApartmentOutlined,
   CodeOutlined,
@@ -11,19 +11,24 @@ import {
   SlidersOutlined,
   VideoCameraOutlined,
 } from '@ant-design/icons'
-import { Button, Input, InputNumber, message, Select } from 'antd'
-import FlowGraph from './FlowGraph'
-import { API_OUTPUT_BASE, assetApi, shotApi } from '../services/api'
+import Button from 'antd/es/button'
+import Input from 'antd/es/input'
+import InputNumber from 'antd/es/input-number'
+import message from 'antd/es/message'
+import Select from 'antd/es/select'
+import { assetApi, shotApi, toOutputUrl } from '../services/api'
+import {
+  drainPendingSaves,
+  hasPendingChanges,
+  retirePendingSaveAfterFlush,
+  type PendingSaveEntry,
+} from '../services/shotSaveQueue'
+import { registerProjectNavigationGuard } from '../services/projectNavigationGuard'
 import { useProjectStore } from '../stores/projectStore'
 import { useShotStore } from '../stores/shotStore'
 
 const { TextArea } = Input
-
-function toOutputUrl(imagePath?: string) {
-  if (!imagePath) return null
-  const relative = imagePath.replace(/^.*output[\\/]/, '').replace(/\\/g, '/')
-  return `${API_OUTPUT_BASE}${relative}`
-}
+const FlowGraph = React.lazy(() => import('./FlowGraph'))
 
 const stepLabels: Record<string, string> = {
   generate_script: '剧本生成',
@@ -45,6 +50,14 @@ interface RightSidebarProps {
   onToggleCollapsed: () => void
 }
 
+type ShotSaveEntry = PendingSaveEntry<Record<string, any>> & {
+  timer: number | null
+  projectId: string
+  shotId: string
+}
+
+const shotSaveKey = (projectId: string, shotId: string) => `${projectId}:${shotId}`
+
 const RightSidebar: React.FC<RightSidebarProps> = ({ collapsed, onToggleCollapsed }) => {
   const { updateShot, logs, isGenerating, currentStep, shots, videoPath, setGenerating, setProgress, appendLog } = useShotStore()
   const { projectId, runMode, setProject } = useProjectStore()
@@ -56,7 +69,24 @@ const RightSidebar: React.FC<RightSidebarProps> = ({ collapsed, onToggleCollapse
   const [logsExpanded, setLogsExpanded] = useState(true)
   const [regeneratingShot, setRegeneratingShot] = useState(false)
   const [loadingPrompt, setLoadingPrompt] = useState(false)
-  const [promptDraft, setPromptDraft] = useState('')
+  const [shotDraft, setShotDraft] = useState<Record<string, any>>({})
+  const [shotDirty, setShotDirty] = useState(false)
+  const [shotSaveState, setShotSaveState] = useState<'idle' | 'dirty' | 'saving' | 'error'>('idle')
+  const shotDraftRef = useRef<Record<string, any>>({})
+  const shotSaveEntriesRef = useRef(new Map<string, ShotSaveEntry>())
+  const flushShotDraftRef = useRef<(projectId: string, shotId: string) => Promise<boolean>>(async () => true)
+  const assetRequestRef = useRef(0)
+  const promptRequestRef = useRef(0)
+  const regenerateRequestRef = useRef(0)
+  const navigationFlushRef = useRef(new Map<string, Promise<boolean>>())
+  const mountedRef = useRef(false)
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
 
   const selectedShot = useShotStore((state) => {
     const id = state.selectedShotId
@@ -86,38 +116,297 @@ const RightSidebar: React.FC<RightSidebarProps> = ({ collapsed, onToggleCollapse
     : ''
 
   useEffect(() => {
+    const requestId = ++assetRequestRef.current
     if (!projectId) {
       setAssetBoard({ characters: [], scenes: [] })
       return
     }
     assetApi.board(projectId)
-      .then((board) => setAssetBoard({ characters: board.characters || [], scenes: board.scenes || [] }))
+      .then((board) => {
+        if (requestId !== assetRequestRef.current || useProjectStore.getState().projectId !== projectId) return
+        setAssetBoard({ characters: board.characters || [], scenes: board.scenes || [] })
+      })
       .catch(() => undefined)
   }, [projectId])
 
   useEffect(() => {
-    setPromptDraft(selectedShot?.visual_notes || '')
-  }, [selectedShot?.id, selectedShot?.visual_notes])
+    promptRequestRef.current += 1
+    regenerateRequestRef.current += 1
+    setLoadingPrompt(false)
+    setRegeneratingShot(false)
+  }, [projectId, selectedShot?.id])
 
-  const updateCurrentShot = async (changes: Record<string, any>) => {
-    if (!selectedShot) return
-    if (selectedShot.confirmed) {
-      message.warning('已审核锁定的镜头不可修改')
-      return
+  const getShotSaveEntry = (entryProjectId: string, shotId: string) => {
+    const key = shotSaveKey(entryProjectId, shotId)
+    let entry = shotSaveEntriesRef.current.get(key)
+    if (!entry) {
+      entry = {
+        pending: {},
+        timer: null,
+        inFlight: false,
+        failed: false,
+        projectId: entryProjectId,
+        shotId,
+        promise: null,
+        retired: false,
+      }
+      shotSaveEntriesRef.current.set(key, entry)
+    }
+    return entry
+  }
+
+  const isActiveShot = (shotId: string) => {
+    const state = useShotStore.getState()
+    const activeId = state.selectedShotId || state.shots[0]?.id || null
+    return activeId === shotId
+  }
+
+  const canUpdateSaveState = (shotId: string, entryProjectId: string) =>
+    mountedRef.current && entryProjectId === useProjectStore.getState().projectId && isActiveShot(shotId)
+
+  const isCurrentShotContext = (entryProjectId: string, shotId: string) =>
+    mountedRef.current && entryProjectId === useProjectStore.getState().projectId && isActiveShot(shotId)
+
+  const scheduleShotFlush = (entryProjectId: string, shotId: string, delay = 650) => {
+    const entry = getShotSaveEntry(entryProjectId, shotId)
+    if (entry.retired) return
+    if (entry.timer != null) window.clearTimeout(entry.timer)
+    entry.timer = window.setTimeout(() => {
+      entry.timer = null
+      void flushShotDraftRef.current(entryProjectId, shotId)
+    }, delay)
+  }
+
+  const flushShotDraft = async (entryProjectId: string, shotId: string) => {
+    const key = shotSaveKey(entryProjectId, shotId)
+    const entry = shotSaveEntriesRef.current.get(key)
+    if (!entry) return true
+    if (entry.timer != null) {
+      window.clearTimeout(entry.timer)
+      entry.timer = null
     }
 
-    updateShot(selectedShot.id, {
-      ...changes,
+    const saved = await drainPendingSaves(entry, async (changes) => {
+      let shotSaved = false
+      const assetChanges: Record<string, any> = {}
+      const shotChanges: Record<string, any> = {}
+      Object.entries(changes).forEach(([field, value]) => {
+        if (field === 'scene_asset_id' || field === 'character_asset_ids') {
+          assetChanges[field] = value
+        } else {
+          shotChanges[field] = value
+        }
+      })
+      if (canUpdateSaveState(shotId, entry.projectId)) setShotSaveState('saving')
+
+      try {
+        if (Object.keys(shotChanges).length > 0) {
+          await shotApi.update(shotId, shotChanges)
+          shotSaved = true
+        }
+        if (Object.keys(assetChanges).length > 0) {
+          if (!entry.projectId) throw new Error('缺少项目上下文，无法保存资产绑定')
+          await assetApi.updateShotAssets(shotId, { ...assetChanges, project_id: entry.projectId })
+        }
+        return !entry.retired
+      } catch (err: any) {
+        // Keep failed changes queued so a later explicit save/retry cannot lose
+        // edits made while the request was in flight. If ordinary fields were
+        // persisted but asset validation failed, retry only the asset portion.
+        // The queue restores this batch after the callback returns false.
+        // Keep only the asset fields if ordinary fields were already saved.
+        if (shotSaved) Object.keys(shotChanges).forEach((field) => delete changes[field])
+        if (canUpdateSaveState(shotId, entry.projectId)) {
+          setShotSaveState('error')
+          message.error('镜头更新失败：' + (err?.message || '未知错误'))
+        }
+        return false
+      }
+    })
+
+    if (saved && !hasPendingChanges(entry)) {
+      if (canUpdateSaveState(shotId, entry.projectId)) {
+        setShotDirty(false)
+        setShotSaveState('idle')
+      }
+      if (shotSaveEntriesRef.current.get(key) === entry) shotSaveEntriesRef.current.delete(key)
+    } else if (!saved && canUpdateSaveState(shotId, entry.projectId)) {
+      setShotDirty(true)
+    }
+    return saved
+  }
+
+  // Keep the ref current so effect cleanups can flush the latest queue even
+  // though the component callback itself is recreated on each render.
+  flushShotDraftRef.current = flushShotDraft
+
+  const flushAndRetireShotSave = async (entry: ShotSaveEntry) => {
+    if (entry.timer != null) {
+      window.clearTimeout(entry.timer)
+      entry.timer = null
+    }
+    const saved = await retirePendingSaveAfterFlush(entry, () =>
+      flushShotDraftRef.current(entry.projectId, entry.shotId),
+    )
+    const key = shotSaveKey(entry.projectId, entry.shotId)
+    if (saved && shotSaveEntriesRef.current.get(key) === entry) {
+      shotSaveEntriesRef.current.delete(key)
+    }
+    return saved
+  }
+
+  const flushProjectBeforeNavigation = (entryProjectId: string) => {
+    const existing = navigationFlushRef.current.get(entryProjectId)
+    if (existing) return existing
+
+    const operation = (async () => {
+      const entries = [...shotSaveEntriesRef.current.values()].filter(
+        (entry) => entry.projectId === entryProjectId,
+      )
+      const results = await Promise.all(entries.map((entry) => flushAndRetireShotSave(entry)))
+      const saved = results.every(Boolean)
+      if (!saved && mountedRef.current && useProjectStore.getState().projectId === entryProjectId) {
+        setShotDirty(true)
+        setShotSaveState('error')
+        message.error('镜头修改保存失败，已阻止切换。请点击“保存修改”后重试。')
+      }
+      return saved
+    })().finally(() => {
+      navigationFlushRef.current.delete(entryProjectId)
+    })
+    navigationFlushRef.current.set(entryProjectId, operation)
+    return operation
+  }
+
+  useEffect(() => registerProjectNavigationGuard((fromProjectId) =>
+    flushProjectBeforeNavigation(fromProjectId),
+  ), [])
+
+  useEffect(() => {
+    const preventUnsavedUnload = (event: BeforeUnloadEvent) => {
+      const hasUnsavedChanges = [...shotSaveEntriesRef.current.values()].some(
+        (entry) => entry.inFlight || hasPendingChanges(entry),
+      )
+      if (!hasUnsavedChanges) return
+      event.preventDefault()
+      event.returnValue = ''
+    }
+    window.addEventListener('beforeunload', preventUnsavedUnload)
+    return () => window.removeEventListener('beforeunload', preventUnsavedUnload)
+  }, [])
+
+  const queueShotChange = (entryProjectId: string, shotId: string, field: string, value: any) => {
+    const currentProjectId = useProjectStore.getState().projectId
+    const currentShot = useShotStore.getState().shots.find((shot) => shot.id === shotId)
+    if (currentProjectId !== entryProjectId || !currentShot || currentShot.confirmed) {
+      if (currentShot?.confirmed && isActiveShot(shotId)) message.warning('已审核锁定的镜头不可修改')
+      return false
+    }
+
+    if (isActiveShot(shotId)) {
+      setShotDraft((draft) => {
+        const next = { ...draft, [field]: value }
+        shotDraftRef.current = next
+        return next
+      })
+      setShotDirty(true)
+      setShotSaveState('dirty')
+    }
+    // A changed parameter invalidates all generated media immediately. This
+    // prevents a stale image/video from remaining visible while the debounced
+    // request is pending.
+    updateShot(shotId, {
+      [field]: value,
       status: 'pending',
+      storyboard_status: 'pending',
+      image_path: '',
+      storyboard_path: '',
       audio_path: '',
       video_path: '',
       confirmed: false,
     })
-    try {
-      await shotApi.update(selectedShot.id, changes)
-    } catch (err: any) {
-      message.error('镜头更新失败：' + (err.message || '未知错误'))
+
+    const entry = getShotSaveEntry(entryProjectId, shotId)
+    entry.retired = false
+    entry.failed = false
+    entry.pending = { ...entry.pending, [field]: value }
+    scheduleShotFlush(entryProjectId, shotId)
+    return true
+  }
+
+  const draftFromShot = (shot: any) => ({
+    visual_notes: shot.visual_notes || '',
+    shot_type: shot.shot_type || 'medium',
+    emotion: shot.emotion || 'neutral',
+    camera_angle: shot.camera_angle || '正面',
+    camera_movement: shot.camera_movement || '静止',
+    transition: shot.transition || 'cut',
+    duration: shot.duration || 3,
+    character_asset_ids: shot.character_asset_ids || [],
+    scene_asset_id: shot.scene_asset_id || '',
+    scene_description: shot.scene_description || '',
+    character_action: shot.character_action || '',
+    dialogue: shot.dialogue || '',
+  })
+
+  useEffect(() => {
+    return () => {
+      shotSaveEntriesRef.current.forEach((entry) => {
+        if (entry.projectId !== projectId) return
+        void flushAndRetireShotSave(entry)
+      })
     }
+  }, [projectId])
+
+  useEffect(() => {
+    const nextDraft = selectedShot ? draftFromShot(selectedShot) : {}
+    const entry = selectedShot && projectId
+      ? shotSaveEntriesRef.current.get(shotSaveKey(projectId, selectedShot.id))
+      : undefined
+    const hasPendingSave = Boolean(entry && (entry.inFlight || hasPendingChanges(entry)))
+
+    shotDraftRef.current = nextDraft
+    setShotDraft(nextDraft)
+    setShotDirty(hasPendingSave)
+    setShotSaveState(
+      entry?.inFlight
+        ? 'saving'
+        : entry && hasPendingChanges(entry)
+          ? entry.failed
+            ? 'error'
+            : 'dirty'
+          : 'idle',
+    )
+
+    const shotId = selectedShot?.id
+    const entryProjectId = projectId
+    return () => {
+      if (shotId && entryProjectId) void flushShotDraftRef.current(entryProjectId, shotId)
+    }
+  }, [selectedShot?.id, projectId])
+
+  useEffect(() => {
+    if (!selectedShot || shotDirty) return
+    const entry = projectId
+      ? shotSaveEntriesRef.current.get(shotSaveKey(projectId, selectedShot.id))
+      : undefined
+    if (entry?.inFlight || (entry && hasPendingChanges(entry))) return
+    const nextDraft = draftFromShot(selectedShot)
+    shotDraftRef.current = nextDraft
+    setShotDraft(nextDraft)
+  }, [selectedShot, shotDirty])
+
+  useEffect(() => {
+    return () => {
+      shotSaveEntriesRef.current.forEach((entry) => {
+        void flushAndRetireShotSave(entry)
+      })
+    }
+  }, [])
+
+  const updateCurrentShot = (changes: Record<string, any>) => {
+    const [field, value] = Object.entries(changes)[0] || []
+    if (field && projectId && selectedShot) queueShotChange(projectId, selectedShot.id, field, value)
   }
 
   const buildCurrentShotPrompt = () => {
@@ -126,10 +415,10 @@ const RightSidebar: React.FC<RightSidebarProps> = ({ collapsed, onToggleCollapse
     const sceneName = selectedScene?.name || ''
     const parts = [
       `镜头 ${selectedShot.sequence || 1}`,
-      `镜头类型：${selectedShot.shot_type || 'medium'}`,
-      `情绪：${selectedShot.emotion || 'neutral'}`,
-      `机位角度：${selectedShot.camera_angle || '正面'}`,
-      `时长：${selectedShot.duration || 3} 秒`,
+      `镜头类型：${shotDraft.shot_type ?? selectedShot.shot_type ?? 'medium'}`,
+      `情绪：${shotDraft.emotion ?? selectedShot.emotion ?? 'neutral'}`,
+      `机位角度：${shotDraft.camera_angle ?? selectedShot.camera_angle ?? '正面'}`,
+      `时长：${shotDraft.duration ?? selectedShot.duration ?? 3} 秒`,
       sceneName ? `绑定场景：${sceneName}` : '',
       selectedScene?.visual_prompt ? `场景基准：${selectedScene.visual_prompt}` : '',
       selectedScene?.prop_lock ? `道具锁定：${selectedScene.prop_lock}` : '',
@@ -138,35 +427,38 @@ const RightSidebar: React.FC<RightSidebarProps> = ({ collapsed, onToggleCollapse
         `角色 ${item.name}：${item.visual_prompt || ''}`,
         item.wardrobe_lock || item.default_outfit ? `服装锁定：${item.wardrobe_lock || item.default_outfit}` : '',
       ]),
-      `场景描述：${selectedShot.scene_description || '未填写'}`,
-      selectedShot.character_action ? `人物动作：${selectedShot.character_action}` : '',
-      selectedShot.dialogue ? `对白：${selectedShot.dialogue}` : '',
+      `场景描述：${(shotDraft.scene_description ?? selectedShot.scene_description) || '未填写'}`,
+      (shotDraft.character_action ?? selectedShot.character_action) ? `人物动作：${shotDraft.character_action ?? selectedShot.character_action}` : '',
+      (shotDraft.dialogue ?? selectedShot.dialogue) ? `对白：${shotDraft.dialogue ?? selectedShot.dialogue}` : '',
       selectedShot.consistency_context ? `一致性约束：${selectedShot.consistency_context}` : '',
-      selectedShot.visual_notes ? `用户补充：${selectedShot.visual_notes}` : '',
+      (shotDraft.visual_notes ?? selectedShot.visual_notes) ? `用户补充：${shotDraft.visual_notes ?? selectedShot.visual_notes}` : '',
     ]
     return parts.filter(Boolean).join('\n')
   }
 
   const fillGenerationPrompt = async () => {
-    if (!selectedShot) return ''
+    if (!selectedShot || !projectId) return ''
+    const entryProjectId = projectId
+    const shotId = selectedShot.id
+    const requestId = ++promptRequestRef.current
+    const fallback = buildCurrentShotPrompt()
     try {
       setLoadingPrompt(true)
-      const result = await shotApi.generationPrompt(selectedShot.id)
+      const result = await shotApi.generationPrompt(shotId)
+      if (requestId !== promptRequestRef.current || !isCurrentShotContext(entryProjectId, shotId)) return ''
       const prompt = [
-        result.prompt || buildCurrentShotPrompt(),
+        result.prompt || fallback,
         result.negative_prompt ? `Negative prompt:\n${result.negative_prompt}` : '',
       ].filter(Boolean).join('\n\n')
-      setPromptDraft(prompt)
-      updateShot(selectedShot.id, { visual_notes: prompt })
+      queueShotChange(entryProjectId, shotId, 'visual_notes', prompt)
       return prompt
     } catch {
-      const fallback = buildCurrentShotPrompt()
-      setPromptDraft(fallback)
-      updateShot(selectedShot.id, { visual_notes: fallback })
+      if (requestId !== promptRequestRef.current || !isCurrentShotContext(entryProjectId, shotId)) return ''
+      queueShotChange(entryProjectId, shotId, 'visual_notes', fallback)
       message.warning('完整 Prompt 拉取失败，已回填本地组装版本')
       return fallback
     } finally {
-      setLoadingPrompt(false)
+      if (requestId === promptRequestRef.current && mountedRef.current) setLoadingPrompt(false)
     }
   }
 
@@ -177,38 +469,53 @@ const RightSidebar: React.FC<RightSidebarProps> = ({ collapsed, onToggleCollapse
       return
     }
 
+    const entryProjectId = projectId
+    const shot = selectedShot
+    const draft = { ...shotDraft }
+    const requestId = ++regenerateRequestRef.current
+
     const shouldOnlyFillPrompt =
       selectedShot.status === 'needs_review' &&
-      !promptDraft.includes('NON-NEGOTIABLE AGENT CONSISTENCY SOP') &&
-      !promptDraft.includes('locked visual style preset')
+      !String(shotDraft.visual_notes || '').includes('NON-NEGOTIABLE AGENT CONSISTENCY SOP') &&
+      !String(shotDraft.visual_notes || '').includes('locked visual style preset')
 
     if (shouldOnlyFillPrompt) {
-      await fillGenerationPrompt()
+      const prompt = await fillGenerationPrompt()
+      if (!prompt || requestId !== regenerateRequestRef.current || !isCurrentShotContext(entryProjectId, shot.id)) return
       message.info('已回填完整生成 Prompt，可编辑后再次点击重新生成')
       return
     }
 
-    const fullPrompt = promptDraft.trim() || await fillGenerationPrompt()
-    updateShot(selectedShot.id, { visual_notes: fullPrompt })
+    const fullPrompt = String(draft.visual_notes || '').trim() || await fillGenerationPrompt()
+    if (!fullPrompt || requestId !== regenerateRequestRef.current || !isCurrentShotContext(entryProjectId, shot.id)) return
 
     try {
       setRegeneratingShot(true)
       setGenerating(true)
       setProgress(48, 'generate_storyboard_images')
-      await shotApi.update(selectedShot.id, { visual_notes: fullPrompt })
-      await shotApi.regenerate(selectedShot.id, {
+      // Flush the debounced editor queue before starting regeneration so the
+      // generation request observes the same values shown in the form.
+      queueShotChange(entryProjectId, shot.id, 'visual_notes', fullPrompt)
+      const saved = await flushShotDraftRef.current(entryProjectId, shot.id)
+      if (requestId !== regenerateRequestRef.current || !isCurrentShotContext(entryProjectId, shot.id)) return
+      if (!saved) {
+        setGenerating(false)
+        return
+      }
+      await shotApi.regenerate(shot.id, {
         prompt: fullPrompt,
         visual_notes: fullPrompt,
-        new_scene: selectedShot.scene_description,
-        new_camera_angle: selectedShot.camera_angle,
-        new_emotion: selectedShot.emotion,
-        shot_type: selectedShot.shot_type,
-        character_action: selectedShot.character_action,
-        dialogue: selectedShot.dialogue,
-        duration: selectedShot.duration,
+        new_scene: draft.scene_description ?? shot.scene_description,
+        new_camera_angle: draft.camera_angle ?? shot.camera_angle,
+        new_emotion: draft.emotion ?? shot.emotion,
+        shot_type: draft.shot_type ?? shot.shot_type,
+        character_action: draft.character_action ?? shot.character_action,
+        dialogue: draft.dialogue ?? shot.dialogue,
+        duration: draft.duration ?? shot.duration,
         reason: fullPrompt,
       })
-      updateShot(selectedShot.id, {
+      if (requestId !== regenerateRequestRef.current || !isCurrentShotContext(entryProjectId, shot.id)) return
+      updateShot(shot.id, {
         confirmed: false,
         status: 'pending',
         storyboard_status: 'queued',
@@ -217,13 +524,16 @@ const RightSidebar: React.FC<RightSidebarProps> = ({ collapsed, onToggleCollapse
         video_path: '',
         audio_path: '',
       })
-      appendLog(`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] Shot ${selectedShot.sequence} regeneration submitted`)
+      setShotDirty(false)
+      setShotSaveState('idle')
+      appendLog(`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] Shot ${shot.sequence} regeneration submitted`)
       message.success('当前镜头重生成已启动')
     } catch (err: any) {
+      if (requestId !== regenerateRequestRef.current || !isCurrentShotContext(entryProjectId, shot.id)) return
       message.error('镜头重生成失败：' + (err.message || '未知错误'))
       setGenerating(false)
     } finally {
-      setRegeneratingShot(false)
+      if (requestId === regenerateRequestRef.current && mountedRef.current) setRegeneratingShot(false)
     }
   }
 
@@ -273,68 +583,84 @@ const RightSidebar: React.FC<RightSidebarProps> = ({ collapsed, onToggleCollapse
             </div>
 
             <div className="side-panel">
-              <button type="button" className="side-panel-head" onClick={() => setShotExpanded((prev) => !prev)}>
+              <button
+                type="button"
+                className="side-panel-head"
+                aria-expanded={shotExpanded}
+                aria-controls="right-panel-shot"
+                onClick={() => setShotExpanded((prev) => !prev)}
+              >
                 <span className="side-panel-title"><VideoCameraOutlined /> 镜头属性</span>
                 <DownOutlined className={`aux-arrow${shotExpanded ? ' expanded' : ''}`} />
               </button>
-              <div className={`side-panel-body${shotExpanded ? ' expanded' : ''}`}>
+              <div id="right-panel-shot" className={`side-panel-body${shotExpanded ? ' expanded' : ''}`}>
                 {!selectedShot && <div className="empty-hint">选择一个镜头后可在这里微调。</div>}
 
                 {selectedShot && (
                   <>
                     {selectedShot.confirmed && <div className="locked-shot-note">该镜头已审核锁定，禁止修改参数或重生成。</div>}
                     <div className="form-block">
-                      <label className="form-label">镜头 Prompt</label>
+                      <label className="form-label" htmlFor="shot-visual-notes">镜头 Prompt</label>
                       <TextArea
+                        id="shot-visual-notes"
+                        aria-label="镜头 Prompt"
                         autoSize={{ minRows: 3, maxRows: 7 }}
-                        value={promptDraft}
+                        value={shotDraft.visual_notes || ''}
                         disabled={selectedShot.confirmed}
                         placeholder="补充当前镜头的画面重点、构图、光线或风格细节"
-                        onChange={(e) => setPromptDraft(e.target.value)}
+                        onChange={(e) => updateCurrentShot({ visual_notes: e.target.value })}
                       />
                     </div>
 
                     <div className="form-block">
-                      <label className="form-label">镜头类型</label>
+                      <label className="form-label" htmlFor="shot-type">镜头类型</label>
                       <Input
-                        value={selectedShot.shot_type}
+                        id="shot-type"
+                        aria-label="镜头类型"
+                        value={shotDraft.shot_type ?? selectedShot.shot_type}
                         disabled={selectedShot.confirmed}
                         size="small"
                         placeholder="wide / medium / close-up"
-                        onChange={(e) => void updateCurrentShot({ shot_type: e.target.value })}
+                        onChange={(e) => updateCurrentShot({ shot_type: e.target.value })}
                       />
                     </div>
 
                     <div className="form-block">
-                      <label className="form-label">情绪</label>
+                      <label className="form-label" htmlFor="shot-emotion">情绪</label>
                       <Input
-                        value={selectedShot.emotion}
+                        id="shot-emotion"
+                        aria-label="情绪"
+                        value={shotDraft.emotion ?? selectedShot.emotion}
                         disabled={selectedShot.confirmed}
                         size="small"
                         placeholder="neutral / happy / tense"
-                        onChange={(e) => void updateCurrentShot({ emotion: e.target.value })}
+                        onChange={(e) => updateCurrentShot({ emotion: e.target.value })}
                       />
                     </div>
 
                     <div className="form-block">
-                      <label className="form-label">机位角度</label>
+                      <label className="form-label" htmlFor="shot-camera-angle">机位角度</label>
                       <Input
-                        value={selectedShot.camera_angle}
+                        id="shot-camera-angle"
+                        aria-label="机位角度"
+                        value={shotDraft.camera_angle ?? selectedShot.camera_angle}
                         disabled={selectedShot.confirmed}
                         size="small"
                         placeholder="正面 / 侧面 / 低机位"
-                        onChange={(e) => void updateCurrentShot({ camera_angle: e.target.value })}
+                        onChange={(e) => updateCurrentShot({ camera_angle: e.target.value })}
                       />
                     </div>
 
                     <div className="form-block">
-                      <label className="form-label">运镜方式</label>
+                      <label className="form-label" htmlFor="shot-camera-movement">运镜方式</label>
                       <Select
-                        value={selectedShot.camera_movement || '静止'}
+                        id="shot-camera-movement"
+                        aria-label="运镜方式"
+                        value={shotDraft.camera_movement ?? selectedShot.camera_movement ?? '静止'}
                         disabled={selectedShot.confirmed}
                         size="small"
                         style={{ width: '100%' }}
-                        onChange={(value) => void updateCurrentShot({ camera_movement: value })}
+                        onChange={(value) => updateCurrentShot({ camera_movement: value })}
                         options={[
                           { value: '静止', label: '静止固定' },
                           { value: '推', label: '推镜（推近）' },
@@ -349,13 +675,15 @@ const RightSidebar: React.FC<RightSidebarProps> = ({ collapsed, onToggleCollapse
                     </div>
 
                     <div className="form-block">
-                      <label className="form-label">转场方式</label>
+                      <label className="form-label" htmlFor="shot-transition">转场方式</label>
                       <Select
-                        value={selectedShot.transition || 'cut'}
+                        id="shot-transition"
+                        aria-label="转场方式"
+                        value={shotDraft.transition ?? selectedShot.transition ?? 'cut'}
                         disabled={selectedShot.confirmed}
                         size="small"
                         style={{ width: '100%' }}
-                        onChange={(value) => void updateCurrentShot({ transition: value })}
+                        onChange={(value) => updateCurrentShot({ transition: value })}
                         options={[
                           { value: 'cut', label: '硬切 Cut' },
                           { value: 'fade', label: '淡入淡出 Fade' },
@@ -368,31 +696,35 @@ const RightSidebar: React.FC<RightSidebarProps> = ({ collapsed, onToggleCollapse
                     </div>
 
                     <div className="form-block">
-                      <label className="form-label">时长（秒）</label>
+                      <label className="form-label" htmlFor="shot-duration">时长（秒）</label>
                       <InputNumber
+                        id="shot-duration"
+                        aria-label="时长（秒）"
                         min={0.5}
                         step={0.5}
-                        value={selectedShot.duration}
+                        value={shotDraft.duration ?? selectedShot.duration}
                         style={{ width: '100%' }}
                         size="small"
                         disabled={selectedShot.confirmed}
                         onChange={(value) => {
                           if (typeof value === 'number') {
-                            void updateCurrentShot({ duration: value })
+                            updateCurrentShot({ duration: value })
                           }
                         }}
                       />
                     </div>
 
                     <div className="form-block">
-                      <label className="form-label">绑定角色资产</label>
+                      <label className="form-label" htmlFor="shot-character-assets">绑定角色资产</label>
                       <Select
+                        id="shot-character-assets"
+                        aria-label="绑定角色资产"
                         mode="multiple"
-                        value={selectedShot.character_asset_ids || []}
+                        value={shotDraft.character_asset_ids ?? selectedShot.character_asset_ids ?? []}
                         disabled={selectedShot.confirmed}
                         size="small"
                         style={{ width: '100%' }}
-                        onChange={(value) => void updateCurrentShot({ character_asset_ids: value })}
+                        onChange={(value) => updateCurrentShot({ character_asset_ids: value })}
                         options={assetBoard.characters.map((item) => ({ value: item.id, label: item.name }))}
                       />
                     </div>
@@ -404,7 +736,7 @@ const RightSidebar: React.FC<RightSidebarProps> = ({ collapsed, onToggleCollapse
                           return (
                             <div className="bound-asset-card" key={item.id}>
                               <div className="bound-asset-thumb">
-                                {refUrl ? <img src={refUrl} alt={`${item.name} 三视图`} /> : <span>三视图待生成</span>}
+                                {refUrl ? <img src={refUrl} alt={`${item.name} 三视图`} loading="lazy" decoding="async" /> : <span>三视图待生成</span>}
                               </div>
                               <div className="bound-asset-copy">
                                 <strong>{item.name}</strong>
@@ -419,14 +751,16 @@ const RightSidebar: React.FC<RightSidebarProps> = ({ collapsed, onToggleCollapse
                     )}
 
                     <div className="form-block">
-                      <label className="form-label">绑定场景资产</label>
+                      <label className="form-label" htmlFor="shot-scene-asset">绑定场景资产</label>
                       <Select
-                        value={selectedShot.scene_asset_id || undefined}
+                        id="shot-scene-asset"
+                        aria-label="绑定场景资产"
+                        value={(shotDraft.scene_asset_id ?? selectedShot.scene_asset_id) || undefined}
                         size="small"
                         allowClear
                         disabled={selectedShot.confirmed}
                         style={{ width: '100%' }}
-                        onChange={(value) => void updateCurrentShot({ scene_asset_id: value || '' })}
+                        onChange={(value) => updateCurrentShot({ scene_asset_id: value || '' })}
                         options={assetBoard.scenes.map((item) => ({ value: item.id, label: item.name }))}
                       />
                     </div>
@@ -442,43 +776,73 @@ const RightSidebar: React.FC<RightSidebarProps> = ({ collapsed, onToggleCollapse
                     )}
 
                     <div className="form-block">
-                      <label className="form-label">场景描述</label>
+                      <label className="form-label" htmlFor="shot-scene-description">场景描述</label>
                       <TextArea
+                        id="shot-scene-description"
+                        aria-label="场景描述"
                         autoSize={{ minRows: 3, maxRows: 6 }}
-                        value={selectedShot.scene_description}
+                        value={shotDraft.scene_description ?? selectedShot.scene_description}
                         disabled={selectedShot.confirmed}
-                        onChange={(e) => void updateCurrentShot({ scene_description: e.target.value })}
+                        onChange={(e) => updateCurrentShot({ scene_description: e.target.value })}
                       />
                     </div>
 
                     <div className="form-block">
-                      <label className="form-label">人物动作</label>
+                      <label className="form-label" htmlFor="shot-character-action">人物动作</label>
                       <TextArea
+                        id="shot-character-action"
+                        aria-label="人物动作"
                         autoSize={{ minRows: 2, maxRows: 5 }}
-                        value={selectedShot.character_action}
+                        value={shotDraft.character_action ?? selectedShot.character_action}
                         disabled={selectedShot.confirmed}
-                        onChange={(e) => void updateCurrentShot({ character_action: e.target.value })}
+                        onChange={(e) => updateCurrentShot({ character_action: e.target.value })}
                       />
                     </div>
 
                     <div className="form-block">
-                      <label className="form-label">对白</label>
+                      <label className="form-label" htmlFor="shot-dialogue">对白</label>
                       <TextArea
+                        id="shot-dialogue"
+                        aria-label="对白"
                         autoSize={{ minRows: 2, maxRows: 5 }}
-                        value={selectedShot.dialogue}
+                        value={shotDraft.dialogue ?? selectedShot.dialogue}
                         disabled={selectedShot.confirmed}
-                        onChange={(e) => void updateCurrentShot({ dialogue: e.target.value })}
+                        onChange={(e) => updateCurrentShot({ dialogue: e.target.value })}
                       />
+                    </div>
+
+                    <div className="shot-save-row">
+                      <span className="shot-save-state" role="status" aria-live="polite">
+                        {shotSaveState === 'saving'
+                          ? '保存中…'
+                          : shotSaveState === 'error'
+                            ? '保存失败，可重试'
+                            : shotDirty
+                              ? '有未保存修改'
+                              : '已保存'}
+                      </span>
+                      <Button
+                        size="small"
+                        loading={shotSaveState === 'saving'}
+                        disabled={!shotDirty || shotSaveState === 'saving'}
+                        onClick={() => projectId && selectedShot && void flushShotDraftRef.current(projectId, selectedShot.id)}
+                      >
+                        保存修改
+                      </Button>
                     </div>
 
                     <Button
                       type="primary"
                       icon={<ReloadOutlined />}
                       loading={regeneratingShot || loadingPrompt}
-                      disabled={selectedShot.confirmed || !(selectedShot.storyboard_path || selectedShot.image_path)}
+                      // Editing invalidates the previous image by design, but
+                      // that must not make the regenerate action impossible.
+                      // The backend can generate a fresh storyboard from the
+                      // current draft without an existing reference file.
+                      disabled={selectedShot.confirmed}
                       onClick={() => void regenerateCurrentShot()}
                     >
-                      {selectedShot.status === 'needs_review' && !promptDraft.includes('NON-NEGOTIABLE AGENT CONSISTENCY SOP')
+                      {selectedShot.status === 'needs_review' && !String(shotDraft.visual_notes || '').includes('NON-NEGOTIABLE AGENT CONSISTENCY SOP')
                         ? '回填全量 Prompt'
                         : '按 Prompt 重新生成'}
                     </Button>
@@ -488,17 +852,23 @@ const RightSidebar: React.FC<RightSidebarProps> = ({ collapsed, onToggleCollapse
             </div>
 
             <div className="side-panel">
-              <button type="button" className="side-panel-head" onClick={() => setConsistencyExpanded((prev) => !prev)}>
+              <button
+                type="button"
+                className="side-panel-head"
+                aria-expanded={consistencyExpanded}
+                aria-controls="right-panel-consistency"
+                onClick={() => setConsistencyExpanded((prev) => !prev)}
+              >
                 <span className="side-panel-title"><SafetyCertificateOutlined /> 一致性规划</span>
                 <DownOutlined className={`aux-arrow${consistencyExpanded ? ' expanded' : ''}`} />
               </button>
-              <div className={`side-panel-body${consistencyExpanded ? ' expanded' : ''}`}>
+              <div id="right-panel-consistency" className={`side-panel-body${consistencyExpanded ? ' expanded' : ''}`}>
                 {!selectedShot && <div className="empty-hint">选择镜头后查看 Agent 强制规则。</div>}
                 {selectedShot && (
                   <div className="consistency-preview">
                     <div className="consistency-baseline">
                       <div className="consistency-baseline-thumb">
-                        {sceneBaselineUrl ? <img src={sceneBaselineUrl} alt="场景基准图" /> : <span>基准图待生成</span>}
+                        {sceneBaselineUrl ? <img src={sceneBaselineUrl} alt="场景基准图" loading="lazy" decoding="async" /> : <span>基准图待生成</span>}
                       </div>
                       <div className="consistency-baseline-copy">
                         <strong>{selectedScene?.name || '未绑定场景'}</strong>
@@ -544,11 +914,17 @@ const RightSidebar: React.FC<RightSidebarProps> = ({ collapsed, onToggleCollapse
             </div>
 
             <div className="side-panel">
-              <button type="button" className="side-panel-head" onClick={() => setRuntimeExpanded((prev) => !prev)}>
+              <button
+                type="button"
+                className="side-panel-head"
+                aria-expanded={runtimeExpanded}
+                aria-controls="right-panel-runtime"
+                onClick={() => setRuntimeExpanded((prev) => !prev)}
+              >
                 <span className="side-panel-title"><SlidersOutlined /> 运行方式</span>
                 <DownOutlined className={`aux-arrow${runtimeExpanded ? ' expanded' : ''}`} />
               </button>
-              <div className={`side-panel-body${runtimeExpanded ? ' expanded' : ''}`}>
+              <div id="right-panel-runtime" className={`side-panel-body${runtimeExpanded ? ' expanded' : ''}`}>
                 <div className="mode-group">
                   {[
                     { value: 'manual' as const, label: '手动审核' },
@@ -558,6 +934,7 @@ const RightSidebar: React.FC<RightSidebarProps> = ({ collapsed, onToggleCollapse
                       type="button"
                       key={mode.value}
                       className={`mode-chip${runMode === mode.value ? ' active' : ''}`}
+                      aria-pressed={runMode === mode.value}
                       onClick={() => setProject({ runMode: mode.value })}
                     >
                       {mode.label}
@@ -573,21 +950,35 @@ const RightSidebar: React.FC<RightSidebarProps> = ({ collapsed, onToggleCollapse
             </div>
 
             <div className="side-panel">
-              <button type="button" className="side-panel-head" onClick={() => setFlowExpanded((prev) => !prev)}>
+              <button
+                type="button"
+                className="side-panel-head"
+                aria-expanded={flowExpanded}
+                aria-controls="right-panel-flow"
+                onClick={() => setFlowExpanded((prev) => !prev)}
+              >
                 <span className="side-panel-title"><ApartmentOutlined /> 执行流程</span>
                 <DownOutlined className={`aux-arrow${flowExpanded ? ' expanded' : ''}`} />
               </button>
-              <div className={`side-panel-body${flowExpanded ? ' expanded' : ''}`}>
-                <FlowGraph compact />
+              <div id="right-panel-flow" className={`side-panel-body${flowExpanded ? ' expanded' : ''}`}>
+                <React.Suspense fallback={<span className="lazy-panel-status" role="status">正在加载流程...</span>}>
+                  <FlowGraph compact />
+                </React.Suspense>
               </div>
             </div>
 
             <div className="side-panel">
-              <button type="button" className="side-panel-head" onClick={() => setLogsExpanded((prev) => !prev)}>
+              <button
+                type="button"
+                className="side-panel-head"
+                aria-expanded={logsExpanded}
+                aria-controls="right-panel-logs"
+                onClick={() => setLogsExpanded((prev) => !prev)}
+              >
                 <span className="side-panel-title"><CodeOutlined /> 运行日志</span>
                 <DownOutlined className={`aux-arrow${logsExpanded ? ' expanded' : ''}`} />
               </button>
-              <div className={`side-panel-body${logsExpanded ? ' expanded' : ''}`}>
+              <div id="right-panel-logs" className={`side-panel-body${logsExpanded ? ' expanded' : ''}`}>
                 <div className="log-pane">{logText}</div>
               </div>
             </div>

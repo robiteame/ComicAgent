@@ -1,12 +1,100 @@
 import axios from 'axios'
 
-export const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8011'
+export const API_BASE = import.meta.env?.VITE_API_BASE_URL || 'http://127.0.0.1:8011'
 export const WS_BASE = API_BASE.replace(/^http/, 'ws')
 export const API_OUTPUT_BASE = `${API_BASE}/output/`
+
+function getLocalAuthToken(): string {
+  if (typeof window === 'undefined') return ''
+  try {
+    return window.electronAPI?.getLocalAuthToken?.() || ''
+  } catch {
+    return ''
+  }
+}
+
+const LOCAL_AUTH_TOKEN = getLocalAuthToken()
+
+function isLocalApiOrigin(value: string): boolean {
+  try {
+    const url = new URL(value)
+    return (
+      (url.protocol === 'http:' || url.protocol === 'ws:') &&
+      (url.hostname === '127.0.0.1' || url.hostname === 'localhost') &&
+      url.port === '8011'
+    )
+  } catch {
+    return false
+  }
+}
+
+function withLocalAuthQuery(value: string): string {
+  if (!LOCAL_AUTH_TOKEN || !isLocalApiOrigin(API_BASE)) return value
+  try {
+    const url = new URL(value)
+    const apiOrigin = new URL(API_BASE).origin
+    if (url.origin !== apiOrigin) return value
+    url.searchParams.set('token', LOCAL_AUTH_TOKEN)
+    return url.toString()
+  } catch {
+    return value
+  }
+}
+
+/**
+ * Convert a backend output path to a browser URL.
+ *
+ * The backend may return an absolute filesystem path, a path rooted at
+ * `/output/`, a project-relative path, or an already resolved URL.  Do not
+ * use a greedy regular expression here: project output paths themselves can
+ * contain another `output/` segment (for example `projects/p1/output/...`).
+ */
+export function toOutputUrl(outputPath?: string | null): string | null {
+  if (outputPath == null) return null
+  const raw = String(outputPath).trim()
+  if (!raw) return null
+
+  if (/^https?:\/\//i.test(raw)) {
+    return raw
+  }
+
+  const normalized = raw.replace(/\\/g, '/').replace(/^file:\/\//i, '')
+  // Output fields are expected to contain filesystem paths or HTTP URLs. Do
+  // not let an unexpected URI scheme reach an element's src attribute (for
+  // example `javascript:` or `data:` from malformed/stale backend data).
+  // Windows drive-letter paths are still valid local filesystem paths.
+  if (/^[a-z][a-z\d+.-]*:/i.test(normalized) && !/^[a-z]:[\\/]/i.test(normalized)) {
+    return null
+  }
+  const withoutLeadingSlash = normalized.replace(/^\/+/, '')
+  let relative: string
+  if (withoutLeadingSlash.startsWith('output/')) {
+    relative = withoutLeadingSlash.slice('output/'.length)
+  } else if (withoutLeadingSlash.startsWith('projects/')) {
+    // Some API responses are already relative to the server output root.
+    relative = withoutLeadingSlash
+  } else {
+    // For absolute filesystem paths, strip only the first output directory.
+    const markerIndex = normalized.indexOf('/output/')
+    relative = markerIndex >= 0 ? normalized.slice(markerIndex + '/output/'.length) : withoutLeadingSlash
+  }
+  relative = relative.replace(/^\/+/, '')
+
+  if (!relative) return null
+  // URL() gives callers a correctly encoded URL for spaces/non-ASCII names.
+  return withLocalAuthQuery(new URL(relative, API_OUTPUT_BASE).toString())
+}
 
 const api = axios.create({
   baseURL: API_BASE,
   timeout: 30000,
+})
+
+api.interceptors.request.use((config) => {
+  if (LOCAL_AUTH_TOKEN && isLocalApiOrigin(API_BASE)) {
+    config.headers.set('X-Comic-Agent-Token', LOCAL_AUTH_TOKEN)
+  }
+  return config
 })
 
 export const projectApi = {
@@ -99,7 +187,10 @@ export const shotApi = {
 export const assetApi = {
   board: (projectId: string) => api.get(`/api/asset/${projectId}/board`).then((r) => r.data),
 
-  updateShotAssets: (shotId: string, data: { scene_asset_id?: string; character_asset_ids?: string[] }) =>
+  updateShotAssets: (
+    shotId: string,
+    data: { project_id?: string; scene_asset_id?: string; character_asset_ids?: string[] },
+  ) =>
     api.put(`/api/asset/shot/${shotId}`, data).then((r) => r.data),
 
   updateCharacter: (characterId: string, data: Record<string, any>) =>
@@ -145,8 +236,25 @@ export const settingsApi = {
   saveModelConfigs: (data: Record<string, any>) => api.put('/api/settings/model-configs', data).then((r) => r.data),
 }
 
-export function createWebSocket(projectId: string, onMessage: (data: any) => void): WebSocket {
-  const ws = new WebSocket(`${WS_BASE}/ws/${projectId}`)
+export interface WebSocketOptions {
+  onOpen?: (event: Event) => void
+  onClose?: (event: CloseEvent) => void
+  onError?: (event: Event) => void
+}
+
+export function createWebSocket(
+  projectId: string,
+  onMessage: (data: any) => void,
+  options: WebSocketOptions = {},
+): WebSocket {
+  const tokenQuery = LOCAL_AUTH_TOKEN && isLocalApiOrigin(API_BASE)
+    ? `?token=${encodeURIComponent(LOCAL_AUTH_TOKEN)}`
+    : ''
+  const ws = new WebSocket(`${WS_BASE}/ws/${projectId}${tokenQuery}`)
+
+  ws.onopen = (event) => {
+    options.onOpen?.(event)
+  }
 
   ws.onmessage = (event) => {
     let parsed: any
@@ -162,6 +270,7 @@ export function createWebSocket(projectId: string, onMessage: (data: any) => voi
 
   ws.onerror = (error) => {
     console.error('WebSocket error:', error)
+    options.onError?.(error)
   }
 
   const heartbeat = setInterval(() => {
@@ -170,8 +279,9 @@ export function createWebSocket(projectId: string, onMessage: (data: any) => voi
     }
   }, 30000)
 
-  ws.onclose = () => {
+  ws.onclose = (event) => {
     clearInterval(heartbeat)
+    options.onClose?.(event)
   }
 
   return ws

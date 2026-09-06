@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import inspect
 import json
+import atexit
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from api.routes import shot as shot_route
 from api.routes.render import _apply_post_profiles
+from config import settings
 from services.consistency_service import ConsistencyService
 from services.ffmpeg_service import FFmpegService
 from services.image_service import ImageService
@@ -79,6 +83,13 @@ class _FakeDB:
 
 def main() -> None:
     checks: list[dict] = []
+    # The reuse gate now verifies the file is present and large enough. Keep a
+    # disposable fixture under an approved output root instead of using the
+    # historical placeholder path (``video.mp4``).
+    fixture_root = Path(tempfile.mkdtemp(prefix=".sop-completion-", dir=settings.OUTPUT_DIR))
+    fixture_video = fixture_root / "video.mp4"
+    fixture_video.write_bytes(b"\x00" * 4096)
+    atexit.register(shutil.rmtree, fixture_root, ignore_errors=True)
     consistency = ConsistencyService()
 
     morning_scene = consistency.enrich_scene({"location": "classroom", "time_of_day": "morning", "actions": "desks by window"}, 0)
@@ -256,7 +267,7 @@ def main() -> None:
             "generate_shot_video gate checks",
         )
     )
-    reusable = _shot(status="video_done", video_path="video.mp4")
+    reusable = _shot(status="video_done", video_path=str(fixture_video))
     not_reusable = _shot(status="storyboard_approved", video_path="video.mp4")
     checks.append(
         _assert(

@@ -1,24 +1,31 @@
 import json
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from db import get_db
 from models import Character, Project, SceneAsset, Shot
 from services.image_service import ImageService
+from services.invalidation_service import invalidate_asset_consumers
+from services.security import validate_identifier
+from services.task_registry import cancel_scopes
 
 router = APIRouter(prefix="/api/asset", tags=["asset"])
 image_service = ImageService()
 
 
 class ShotAssetUpdate(BaseModel):
+    project_id: str
     scene_asset_id: str = ""
-    character_asset_ids: list[str] = []
+    character_asset_ids: list[str] = Field(default_factory=list)
 
 
 class CharacterAssetUpdate(BaseModel):
+    # Required for direct asset updates so an ID from another project cannot be
+    # edited accidentally (or by a guessed identifier).
+    project_id: str | None = None
     name: str | None = None
     appearance: dict | str | None = None
     personality: str | None = None
@@ -36,6 +43,7 @@ class CharacterAssetUpdate(BaseModel):
 
 
 class SceneAssetUpdate(BaseModel):
+    project_id: str | None = None
     name: str | None = None
     description: str | None = None
     visual_prompt: str | None = None
@@ -62,75 +70,173 @@ async def get_asset_board(project_id: str, db: Session = Depends(get_db)):
 
 @router.put("/shot/{shot_id}")
 async def update_shot_assets(shot_id: str, data: ShotAssetUpdate, db: Session = Depends(get_db)):
-    shot = db.query(Shot).filter(Shot.id == shot_id).first()
+    try:
+        validate_identifier(shot_id, "镜头 ID")
+        validate_identifier(data.project_id, "项目 ID")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Bind the caller's project context directly into the lookup.  A parent
+    # series may own shared assets, but it must not be usable as authority to
+    # mutate a child episode's shot.
+    shot = db.query(Shot).filter(Shot.id == shot_id, Shot.project_id == data.project_id).first()
     if not shot:
         raise HTTPException(status_code=404, detail="镜头不存在")
-    shot.scene_asset_id = data.scene_asset_id
-    shot.character_asset_ids = json.dumps(data.character_asset_ids, ensure_ascii=False)
-    shot.storyboard_status = "pending"
-    shot.storyboard_path = ""
-    shot.image_path = ""
-    shot.status = "pending"
+    if shot.confirmed:
+        raise HTTPException(status_code=423, detail="已审核锁定的镜头不能更换资产")
+    asset_project_id = _asset_project_id(db, shot.project_id)
+
+    scene_asset_id = str(data.scene_asset_id or "").strip()
+    if scene_asset_id:
+        scene = (
+            db.query(SceneAsset)
+            .filter(SceneAsset.id == scene_asset_id, SceneAsset.project_id == asset_project_id)
+            .first()
+        )
+        if not scene:
+            raise HTTPException(status_code=400, detail="场景资产不属于该项目")
+
+    character_ids = list(dict.fromkeys(str(item).strip() for item in (data.character_asset_ids or []) if str(item).strip()))
+    if character_ids:
+        characters = (
+            db.query(Character)
+            .filter(Character.id.in_(character_ids), Character.project_id == asset_project_id)
+            .all()
+        )
+        found = {item.id for item in characters}
+        if found != set(character_ids):
+            raise HTTPException(status_code=400, detail="角色资产不属于该项目")
+
+    changed = shot.scene_asset_id != scene_asset_id or _json_list(shot.character_asset_ids) != character_ids
+    shot_project_id = shot.project_id
+    result_id = shot.id
+    shot.scene_asset_id = scene_asset_id
+    shot.character_asset_ids = json.dumps(character_ids, ensure_ascii=False)
+    if changed:
+        # Asset changes invalidate every downstream artifact, including audio
+        # and the last-frame continuity reference.
+        shot.storyboard_status = "pending"
+        shot.storyboard_path = ""
+        shot.image_path = ""
+        shot.audio_path = ""
+        shot.video_path = ""
+        shot.last_frame_path = ""
+        shot.status = "pending"
+        shot.version = (shot.version or 1) + 1
+        project = db.query(Project).filter(Project.id == shot_project_id).first()
+        if project:
+            project.status = "assets_ready"
     db.commit()
-    return {"id": shot.id, "status": "updated"}
+    if changed:
+        await cancel_scopes(
+            {f"shot:{shot_id}", f"project:{shot_project_id}"},
+            "shot assets were edited",
+        )
+    return {"id": result_id, "status": "updated"}
 
 
 @router.put("/character/{character_id}")
-async def update_character_asset(character_id: str, data: CharacterAssetUpdate, db: Session = Depends(get_db)):
-    item = db.query(Character).filter(Character.id == character_id).first()
+async def update_character_asset(
+    character_id: str,
+    data: CharacterAssetUpdate,
+    db: Session = Depends(get_db),
+    project_id: str | None = Query(default=None),
+):
+    owner_id = _required_asset_project_id(db, data.project_id or project_id)
+    item = db.query(Character).filter(Character.id == character_id, Character.project_id == owner_id).first()
     if not item:
         raise HTTPException(status_code=404, detail="角色资产不存在")
 
     changed = data.model_dump(exclude_unset=True)
+    changed.pop("project_id", None)
     regenerate = bool(changed.pop("regenerate", False))
+    mutation_requested = bool(changed) or regenerate
     _assign_json_field(item, changed, "appearance")
     _assign_json_field(item, changed, "emotion_variants")
     _assign_json_field(item, changed, "key_features")
     for key, value in changed.items():
         setattr(item, key, value)
 
+    mutation_time = datetime.utcnow()
+    item.updated_at = mutation_time
+    affected_scopes = invalidate_asset_consumers(db, owner_id, character_id=character_id) if mutation_requested else set()
+    character_payload = _serialize_character(item)
+    generation_project_id = item.project_id
+    generation_seed = _int_seed(item.seed, 42)
+    style = _project_style(db, generation_project_id) if regenerate else ""
+    db.commit()
+    db.close()
+    if affected_scopes:
+        await cancel_scopes(affected_scopes, "character asset was edited")
+
     if regenerate:
         ref_path = await image_service.generate_character_reference(
-            character=_serialize_character(item),
-            style=_project_style(db, item.project_id),
-            project_id=item.project_id,
-            seed=_int_seed(item.seed, 42),
+            character=character_payload,
+            style=style,
+            project_id=generation_project_id,
+            seed=generation_seed,
         )
-        item.reference_images = json.dumps([ref_path], ensure_ascii=False)
-
-    item.updated_at = datetime.utcnow()
-    db.commit()
-    db.refresh(item)
-    return _serialize_character(item)
+        current = db.query(Character).filter(Character.id == character_id, Character.project_id == owner_id).first()
+        if not current:
+            raise HTTPException(status_code=404, detail="角色资产不存在")
+        if current.updated_at == mutation_time:
+            current.reference_images = json.dumps([ref_path], ensure_ascii=False)
+            current.updated_at = datetime.utcnow()
+            db.commit()
+        return _serialize_character(current)
+    return character_payload
 
 
 @router.put("/scene/{scene_id}")
-async def update_scene_asset(scene_id: str, data: SceneAssetUpdate, db: Session = Depends(get_db)):
-    item = db.query(SceneAsset).filter(SceneAsset.id == scene_id).first()
+async def update_scene_asset(
+    scene_id: str,
+    data: SceneAssetUpdate,
+    db: Session = Depends(get_db),
+    project_id: str | None = Query(default=None),
+):
+    owner_id = _required_asset_project_id(db, data.project_id or project_id)
+    item = db.query(SceneAsset).filter(SceneAsset.id == scene_id, SceneAsset.project_id == owner_id).first()
     if not item:
         raise HTTPException(status_code=404, detail="场景资产不存在")
 
     changed = data.model_dump(exclude_unset=True)
+    changed.pop("project_id", None)
     regenerate = bool(changed.pop("regenerate", False))
+    mutation_requested = bool(changed) or regenerate
     _assign_json_field(item, changed, "key_features")
     _assign_json_field(item, changed, "consistency_profile")
     for key, value in changed.items():
         setattr(item, key, value)
 
+    mutation_time = datetime.utcnow()
+    item.updated_at = mutation_time
+    affected_scopes = invalidate_asset_consumers(db, owner_id, scene_id=scene_id) if mutation_requested else set()
+    scene_payload = _serialize_scene(item)
+    generation_project_id = item.project_id
+    generation_seed = int(item.seed or 1200)
+    style = _project_style(db, generation_project_id) if regenerate else ""
+    db.commit()
+    db.close()
+    if affected_scopes:
+        await cancel_scopes(affected_scopes, "scene asset was edited")
+
     if regenerate:
         ref_path = await image_service.generate_scene_baseline_reference(
-            scene=_serialize_scene(item),
-            style=_project_style(db, item.project_id),
-            project_id=item.project_id,
-            seed=int(item.seed or 1200),
+            scene=scene_payload,
+            style=style,
+            project_id=generation_project_id,
+            seed=generation_seed,
         )
-        item.baseline_image_path = ref_path
-        item.reference_images = json.dumps([ref_path], ensure_ascii=False)
-
-    item.updated_at = datetime.utcnow()
-    db.commit()
-    db.refresh(item)
-    return _serialize_scene(item)
+        current = db.query(SceneAsset).filter(SceneAsset.id == scene_id, SceneAsset.project_id == owner_id).first()
+        if not current:
+            raise HTTPException(status_code=404, detail="场景资产不存在")
+        if current.updated_at == mutation_time:
+            current.baseline_image_path = ref_path
+            current.reference_images = json.dumps([ref_path], ensure_ascii=False)
+            current.updated_at = datetime.utcnow()
+            db.commit()
+        return _serialize_scene(current)
+    return scene_payload
 
 
 def _asset_project_id(db: Session, project_id: str) -> str:
@@ -138,6 +244,18 @@ def _asset_project_id(db: Session, project_id: str) -> str:
     if not project:
         raise HTTPException(status_code=404, detail="项目不存在")
     return project.parent_project_id or project.id
+
+
+def _required_asset_project_id(db: Session, project_id: str | None) -> str:
+    """Resolve and require the project context for direct asset mutations."""
+
+    if not project_id:
+        raise HTTPException(status_code=400, detail="更新资产必须提供 project_id")
+    try:
+        validate_identifier(project_id, "项目 ID")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _asset_project_id(db, project_id)
 
 
 def _assign_json_field(item, data: dict, key: str) -> None:
@@ -148,6 +266,14 @@ def _assign_json_field(item, data: dict, key: str) -> None:
         setattr(item, key, value)
     else:
         setattr(item, key, json.dumps(value, ensure_ascii=False))
+
+
+def _json_list(raw: str | None) -> list:
+    try:
+        value = json.loads(raw or "[]")
+        return list(value) if isinstance(value, list) else []
+    except (TypeError, ValueError):
+        return []
 
 
 def _project_style(db: Session, project_id: str) -> str:

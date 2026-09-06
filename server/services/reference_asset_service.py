@@ -5,6 +5,7 @@ from pathlib import Path
 from PIL import Image, ImageFilter, ImageOps
 
 from config import settings
+from services.security import existing_file
 
 
 class ReferenceAssetService:
@@ -19,10 +20,18 @@ class ReferenceAssetService:
             return ""
         if value.startswith(("http://", "https://", "data:image/")):
             return value
-        path = Path(value)
-        if not path.exists() or not path.is_file():
+        path = existing_file(
+            value,
+            minimum_size=1,
+            allowed_roots=(settings.OUTPUT_DIR, settings.ASSETS_DIR, settings.DATA_DIR),
+        )
+        if path is None:
             return ""
         mime = mimetypes.guess_type(path.name)[0] or "image/png"
+        # These references must be embedded in an API payload, so keep the
+        # unavoidable in-memory base64 conversion tightly bounded.
+        if path.stat().st_size > settings.MAX_INLINE_REFERENCE_BYTES:
+            return ""
         data = base64.b64encode(path.read_bytes()).decode("ascii")
         return f"data:{mime};base64,{data}"
 
@@ -35,8 +44,12 @@ class ReferenceAssetService:
     ) -> dict[str, str]:
         if not enabled or not source_path:
             return {}
-        source = Path(source_path)
-        if not source.exists() or not source.is_file():
+        source = existing_file(
+            source_path,
+            minimum_size=1,
+            allowed_roots=(settings.OUTPUT_DIR, settings.ASSETS_DIR, settings.DATA_DIR),
+        )
+        if source is None:
             return {}
 
         control_dir = self.output_dir / project_id / "controls"

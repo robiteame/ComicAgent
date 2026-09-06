@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import sessionmaker
 
 from config import settings
@@ -9,15 +9,36 @@ from models.base import Base
 db_path = Path(settings.DATABASE_URL.replace("sqlite:///", ""))
 db_path.parent.mkdir(parents=True, exist_ok=True)
 
-engine = create_engine(settings.DATABASE_URL, connect_args={"check_same_thread": False})
+engine = create_engine(
+    settings.DATABASE_URL,
+    connect_args={"check_same_thread": False, "timeout": 30},
+    pool_pre_ping=True,
+)
+
+
+@event.listens_for(engine, "connect")
+def _configure_sqlite(dbapi_connection, _connection_record) -> None:
+    """Enable durability/concurrency pragmas for the local SQLite store."""
+
+    if engine.url.get_backend_name() != "sqlite":
+        return
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+    finally:
+        cursor.close()
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
 def init_db():
-    from models import Character, Project, SceneAsset, Shot  # noqa: F401
+    from models import BackgroundJob, Character, Project, SceneAsset, Shot  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
     _ensure_sqlite_columns()
+    _ensure_sqlite_indexes()
 
 
 def _ensure_sqlite_columns() -> None:
@@ -80,6 +101,13 @@ def _ensure_sqlite_columns() -> None:
                 "prop_lock": "TEXT DEFAULT ''",
             },
         )
+    if "background_jobs" in inspector.get_table_names():
+        _add_missing_columns(
+            "background_jobs",
+            {
+                "run_token": "VARCHAR DEFAULT '' NOT NULL",
+            },
+        )
 
 
 def _add_missing_columns(table: str, columns: dict[str, str]) -> None:
@@ -89,6 +117,17 @@ def _add_missing_columns(table: str, columns: dict[str, str]) -> None:
         for name, ddl in columns.items():
             if name not in existing:
                 conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
+
+
+def _ensure_sqlite_indexes() -> None:
+    """Add indexes missing from databases created by older app versions."""
+
+    with engine.begin() as conn:
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_shots_project_sequence ON shots (project_id, sequence)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_projects_parent_type ON projects (parent_project_id, project_type)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_projects_updated_at ON projects (updated_at DESC)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_background_jobs_scope_status ON background_jobs (scope, status)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_background_jobs_status_updated ON background_jobs (status, updated_at)"))
 
 
 def get_db():

@@ -3,10 +3,22 @@
   "version": "0.1.0",
   "description": "AI 漫剧 Agent Electron 客户端",
   "main": "dist-electron/main.js",
+  "engines": {
+    "node": ">=22.13.0",
+    "pnpm": ">=11.15.1"
+  },
+  "packageManager": "pnpm@11.15.1",
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 5173",
     "backend:dev": "cd ../server && python main.py",
-    "build": "tsc && vite build && electron-builder",
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test 'src/**/*.test.mts'",
+    "test:server": "python3 -m unittest discover -s ../server/tests -p 'test_*.py'",
+    "test:server:pytest": "python3 -m pytest -q",
+    "test:all": "pnpm run test && pnpm run test:server",
+    "build:web": "tsc && vite build --config vite.config.web.ts",
+    "build:electron:dir": "vite build && electron-builder --dir",
+    "build": "pnpm run build:web && vite build && electron-builder",
     "preview": "vite preview",
     "electron:dev": "concurrently \"cd ../server && python main.py\" \"vite --host 127.0.0.1 --port 5173\" \"wait-on http://127.0.0.1:5173 http://127.0.0.1:8011/health && electron .\"",
     "electron:build": "vite build && electron-builder",
@@ -16,7 +28,7 @@
     "@ant-design/icons": "^5.4.0",
     "@gsap/react": "^2.1.2",
     "antd": "^5.20.0",
-    "axios": "^1.7.0",
+    "axios": "^1.20.0",
     "gsap": "^3.15.0",
     "react": "^18.3.0",
     "react-dom": "^18.3.0",
@@ -34,11 +46,5 @@
     "vite-plugin-electron": "^0.28.0",
     "vite-plugin-electron-renderer": "^0.14.0",
     "wait-on": "^8.0.0"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "electron",
-      "esbuild"
-    ]
   }
 }

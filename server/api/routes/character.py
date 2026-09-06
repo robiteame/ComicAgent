@@ -1,16 +1,20 @@
 import json
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from db import get_db
 from models import Character, Project
+from services.invalidation_service import invalidate_asset_consumers
+from services.security import validate_identifier
+from services.task_registry import cancel_scopes
 
 router = APIRouter(prefix="/api/character", tags=["character"])
 
 
 class CharacterUpdate(BaseModel):
+    project_id: str | None = None
     name: str | None = None
     appearance: str | None = None
     personality: str | None = None
@@ -54,14 +58,36 @@ async def get_project_characters(project_id: str, db: Session = Depends(get_db))
 
 
 @router.put("/{character_id}")
-async def update_character(character_id: str, data: CharacterUpdate, db: Session = Depends(get_db)):
-    char = db.query(Character).filter(Character.id == character_id).first()
+async def update_character(
+    character_id: str,
+    data: CharacterUpdate,
+    db: Session = Depends(get_db),
+    project_id: str | None = Query(default=None),
+):
+    owner_id = data.project_id or project_id
+    if not owner_id:
+        raise HTTPException(status_code=400, detail="更新角色必须提供 project_id")
+    try:
+        validate_identifier(owner_id, "项目 ID")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    owner = db.query(Project).filter(Project.id == owner_id).first()
+    if not owner:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    asset_project_id = owner.parent_project_id or owner.id
+    char = db.query(Character).filter(Character.id == character_id, Character.project_id == asset_project_id).first()
     if not char:
         raise HTTPException(status_code=404, detail="角色不存在")
-    for key, value in data.model_dump(exclude_unset=True).items():
+    changed = data.model_dump(exclude_unset=True)
+    changed.pop("project_id", None)
+    result_id = char.id
+    for key, value in changed.items():
         setattr(char, key, value)
+    affected_scopes = invalidate_asset_consumers(db, asset_project_id, character_id=character_id) if changed else set()
     db.commit()
-    return {"id": char.id, "status": "updated"}
+    if affected_scopes:
+        await cancel_scopes(affected_scopes, "character was edited")
+    return {"id": result_id, "status": "updated"}
 
 
 def _asset_project_id(db: Session, project_id: str) -> str:

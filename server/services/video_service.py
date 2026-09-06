@@ -9,6 +9,15 @@ from config import settings
 from services.consistency_service import ConsistencyService
 from services.reference_asset_service import ReferenceAssetService
 from services.style_templates import style_prompt_params
+from services.security import (
+    UploadLimitExceeded,
+    atomic_write_bytes,
+    download_remote_bytes,
+    download_remote_file,
+    safe_path,
+    validate_identifier,
+)
+from services.storage_service import StorageQuotaExceeded, StorageService
 
 
 class SeedanceVideoService:
@@ -18,6 +27,7 @@ class SeedanceVideoService:
         self.output_dir = settings.OUTPUT_DIR / "projects"
         self.consistency = ConsistencyService()
         self.reference_assets = ReferenceAssetService()
+        self.storage = StorageService()
 
     # 运行时实时读取 settings，保证保存模型/API 配置后新任务即生效。
     @property
@@ -47,19 +57,19 @@ class SeedanceVideoService:
         if not prompt.strip():
             raise RuntimeError("Seedance 提示词为空")
 
-        output_dir = self.output_dir / project_id / "seedance"
-        output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            safe_project_id = validate_identifier(project_id, "项目 ID")
+            safe_shot_id = validate_identifier(shot_id, "镜头 ID")
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+        output_dir = safe_path(self.output_dir, safe_project_id, "seedance", create_parent=True)
         task, payload_mode = await self._create_task(prompt, duration, ratio, resolution, content)
         task_id = self._extract_task_id(task)
         result = await self._wait_for_task(task_id)
-        video_bytes, frame_bytes = await self._download_outputs(result)
-
-        video_path = output_dir / f"{shot_id}.mp4"
-        frame_path = output_dir / f"{shot_id}_frame.png"
-        video_path.write_bytes(video_bytes)
-        if frame_bytes:
-            frame_path.write_bytes(frame_bytes)
-        else:
+        video_path = output_dir / f"{safe_shot_id}.mp4"
+        frame_path = output_dir / f"{safe_shot_id}_frame.png"
+        has_frame = await self._download_outputs_to_files(result, safe_project_id, video_path, frame_path)
+        if not has_frame:
             await self._extract_last_frame(video_path, frame_path)
 
         if video_path.stat().st_size <= 4096:
@@ -347,31 +357,73 @@ class SeedanceVideoService:
                 await asyncio.sleep(5)
         raise TimeoutError(f"Seedance 任务超时: {task_id}")
 
-    async def _download_outputs(self, data: dict) -> tuple[bytes, bytes | None]:
+    async def _download_outputs_to_files(self, data: dict, project_id: str, video_path: Path, frame_path: Path) -> bool:
         video_url = self._find_url(data, {"video_url", "video", "url"})
         frame_url = self._find_url(data, {"last_frame_url", "frame_url", "image_url", "cover_url"})
         video_b64 = self._find_b64(data, {"video_base64", "video_b64", "b64_json"})
         frame_b64 = self._find_b64(data, {"last_frame_base64", "frame_base64", "image_base64"})
 
         if video_b64:
-            video_bytes = base64.b64decode(video_b64)
+            video_bytes = self._decode_b64(video_b64, "视频")
+            self._write_media(project_id, video_path, video_bytes, minimum_size=4096)
         elif video_url:
-            video_bytes = await self._download_url(video_url)
+            await self._download_url_to_path(project_id, video_url, video_path, minimum_size=4096)
         else:
             raise RuntimeError(f"Seedance 返回缺少视频 URL/base64: {data}")
 
-        frame_bytes = None
         if frame_b64:
-            frame_bytes = base64.b64decode(frame_b64)
+            self._write_media(project_id, frame_path, self._decode_b64(frame_b64, "单帧"), minimum_size=1024)
+            return True
         elif frame_url:
-            frame_bytes = await self._download_url(frame_url)
-        return video_bytes, frame_bytes
+            await self._download_url_to_path(project_id, frame_url, frame_path, minimum_size=1024)
+            return True
+        return False
+
+    def _decode_b64(self, value: str, label: str) -> bytes:
+        raw = str(value or "")
+        # Base64 expands data by roughly 4/3. Reject oversized payloads before
+        # allocating a potentially unbounded decoded buffer.
+        if len(raw) > int(settings.MAX_REMOTE_MEDIA_BYTES * 4 / 3) + 16:
+            raise RuntimeError(f"{label}数据超过大小限制")
+        try:
+            decoded = base64.b64decode(raw, validate=True)
+        except Exception as exc:
+            raise RuntimeError(f"{label}数据编码无效") from exc
+        if len(decoded) > settings.MAX_REMOTE_MEDIA_BYTES:
+            raise RuntimeError(f"{label}数据超过大小限制")
+        return decoded
 
     async def _download_url(self, url: str) -> bytes:
-        async with httpx.AsyncClient(timeout=180, follow_redirects=True) as client:
-            response = await client.get(url)
-        response.raise_for_status()
-        return response.content
+        try:
+            return await download_remote_bytes(
+                url,
+                max_bytes=settings.MAX_REMOTE_MEDIA_BYTES,
+                timeout=180,
+            )
+        except (UploadLimitExceeded, ValueError, httpx.HTTPError) as exc:
+            raise RuntimeError(f"下载远程媒体失败: {exc}") from exc
+
+    async def _download_url_to_path(self, project_id: str, url: str, destination: Path, *, minimum_size: int) -> None:
+        try:
+            available = self.storage.ensure_project_capacity(project_id, replacing=destination)
+            size = await download_remote_file(
+                url,
+                destination,
+                max_bytes=min(settings.MAX_REMOTE_MEDIA_BYTES, available),
+                timeout=180,
+            )
+        except (StorageQuotaExceeded, UploadLimitExceeded, ValueError, httpx.HTTPError) as exc:
+            raise RuntimeError(f"下载远程媒体失败: {exc}") from exc
+        if size < minimum_size:
+            destination.unlink(missing_ok=True)
+            raise RuntimeError("下载的远程媒体为空或过小")
+
+    def _write_media(self, project_id: str, destination: Path, content: bytes, *, minimum_size: int) -> None:
+        try:
+            self.storage.ensure_project_capacity(project_id, len(content), replacing=destination)
+        except StorageQuotaExceeded as exc:
+            raise RuntimeError("项目媒体存储空间不足") from exc
+        atomic_write_bytes(destination, content, minimum_size=minimum_size)
 
     async def _extract_last_frame(self, video_path: Path, frame_path: Path) -> None:
         proc = await asyncio.create_subprocess_exec(
@@ -387,7 +439,20 @@ class SeedanceVideoService:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr = await proc.communicate()
+        try:
+            _, stderr = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=max(30, int(settings.FFMPEG_TIMEOUT_SECONDS)),
+            )
+        except asyncio.CancelledError:
+            if proc.returncode is None:
+                proc.kill()
+            await proc.communicate()
+            raise
+        except asyncio.TimeoutError as exc:
+            proc.kill()
+            await proc.communicate()
+            raise TimeoutError("提取 Seedance 单帧超时") from exc
         if proc.returncode != 0:
             raise RuntimeError(f"提取 Seedance 单帧失败: {stderr.decode('utf-8', errors='ignore')[-1000:]}")
 

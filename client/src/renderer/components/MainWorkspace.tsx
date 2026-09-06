@@ -1,5 +1,11 @@
 ﻿import React, { useEffect, useMemo, useRef, useState } from 'react'
-import { Button, Input, Modal, Segmented, Select, Tooltip, message } from 'antd'
+import Button from 'antd/es/button'
+import Input from 'antd/es/input'
+import message from 'antd/es/message'
+import Modal from 'antd/es/modal'
+import Segmented from 'antd/es/segmented'
+import Select from 'antd/es/select'
+import Tooltip from 'antd/es/tooltip'
 import {
   BulbOutlined,
   CheckCircleOutlined,
@@ -15,9 +21,15 @@ import {
 } from '@ant-design/icons'
 import { useShotStore } from '../stores/shotStore'
 import { useProjectStore } from '../stores/projectStore'
-import { API_OUTPUT_BASE, assetApi, createWebSocket, projectApi, renderApi, scriptApi, settingsApi, shotApi } from '../services/api'
+import { assetApi, createWebSocket, projectApi, renderApi, scriptApi, settingsApi, shotApi, toOutputUrl } from '../services/api'
+import {
+  beginProjectNavigationIntent,
+  currentProjectNavigationIntent,
+  requestProjectNavigation,
+} from '../services/projectNavigationGuard'
+import { isCurrentProjectAsyncSnapshot, isLatestResourceResponse } from '../services/asyncGuard'
 import { STYLE_DESCRIPTIONS, STYLE_OPTIONS } from '../constants/styleTemplates'
-import { STYLE_TEMPLATES_UPDATED_EVENT } from './SystemSettingsPage'
+import { STYLE_TEMPLATES_UPDATED_EVENT } from '../constants/events'
 
 const { TextArea } = Input
 const PARSE_SCRIPT_EVENT = 'pipeline:parse-script'
@@ -52,10 +64,12 @@ const WORKSPACE_TABS = [
 
 type WorkspaceTab = typeof WORKSPACE_TABS[number]['id']
 
-function toOutputUrl(imagePath?: string) {
-  if (!imagePath) return null
-  const relative = imagePath.replace(/^.*output[\\/]/, '').replace(/\\/g, '/')
-  return `${API_OUTPUT_BASE}${relative}`
+type ProjectOperation = {
+  key: string
+  token: number
+  projectId: string | null
+  projectEpoch: number
+  navigationIntent: number
 }
 
 function normalizeShot(shot: any) {
@@ -159,6 +173,25 @@ const MainWorkspace: React.FC = () => {
   const [imagePreview, setImagePreview] = useState<{ url: string; title: string } | null>(null)
   const wsRef = useRef<WebSocket | null>(null)
   const wsProjectIdRef = useRef<string | null>(null)
+  const wsProjectEpochRef = useRef(0)
+  const wsEpochRef = useRef(0)
+  const wsReconnectTimerRef = useRef<number | null>(null)
+  const wsReconnectAttemptRef = useRef(0)
+  const wsClosedByUserRef = useRef(false)
+  const projectEpochRef = useRef(0)
+  const activeProjectIdRef = useRef<string | null>(projectId)
+  const activatedProjectRef = useRef<{ projectId: string; projectEpoch: number } | null>(null)
+  const operationTokensRef = useRef(new Map<string, number>())
+  const projectCreationPromiseRef = useRef<Promise<any> | null>(null)
+  const shotLoadRequestRef = useRef(0)
+  const assetLoadRequestRef = useRef(0)
+  const shotMutationRef = useRef(0)
+  const assetMutationRef = useRef(0)
+  const styleTemplateRequestRef = useRef(0)
+  const mountedRef = useRef(false)
+  const initializingProjectRef = useRef(false)
+  const initializingProjectIdRef = useRef<string | null>(null)
+  const initialScriptRef = useRef('')
   const uploadInputRef = useRef<HTMLInputElement | null>(null)
   const generateRef = useRef<() => Promise<void>>(async () => {})
   const awaitingRef = useRef(awaitingStoryboardConfirm)
@@ -186,6 +219,25 @@ const MainWorkspace: React.FC = () => {
   )
 
   useEffect(() => {
+    mountedRef.current = true
+    let previousShots = useShotStore.getState().shots
+    const unsubscribe = useShotStore.subscribe((state) => {
+      if (state.shots !== previousShots) {
+        previousShots = state.shots
+        shotMutationRef.current += 1
+      }
+    })
+    return () => {
+      mountedRef.current = false
+      operationTokensRef.current.clear()
+      shotLoadRequestRef.current += 1
+      assetLoadRequestRef.current += 1
+      styleTemplateRequestRef.current += 1
+      unsubscribe()
+    }
+  }, [])
+
+  useEffect(() => {
     const navigateWorkspace = (event: Event) => {
       const detail = (event as CustomEvent<{ tab?: WorkspaceTab; previewMode?: 'shot' | 'video' }>).detail || {}
       const nextTab = detail.tab
@@ -205,36 +257,110 @@ const MainWorkspace: React.FC = () => {
     return () => window.removeEventListener(WORKSPACE_NAVIGATE_EVENT, navigateWorkspace)
   }, [])
 
-  const replaceShots = (nextShots: any[]) => {
-    const normalized = nextShots.map(normalizeShot).filter((s) => s.id)
-    setShots(normalized)
-    const stillExists = normalized.some((s) => s.id === selectedShotId)
-    if (!stillExists && normalized[0]?.id) {
-      selectShot(normalized[0].id)
+  const isCurrentProject = (pid: string, epoch = projectEpochRef.current) =>
+    activeProjectIdRef.current === pid && projectEpochRef.current === epoch && useProjectStore.getState().projectId === pid
+
+  const beginOperation = (key: string, operationProjectId: string | null = projectId): ProjectOperation => {
+    const token = (operationTokensRef.current.get(key) || 0) + 1
+    operationTokensRef.current.set(key, token)
+    return {
+      key,
+      token,
+      projectId: operationProjectId,
+      projectEpoch: projectEpochRef.current,
+      navigationIntent: currentProjectNavigationIntent(),
     }
   }
 
-  const loadProjectShots = async (pid: string) => {
+  const isLatestOperation = (operation: ProjectOperation) =>
+    mountedRef.current && operationTokensRef.current.get(operation.key) === operation.token
+
+  const isCurrentOperation = (operation: ProjectOperation) =>
+    activeProjectIdRef.current === useProjectStore.getState().projectId &&
+    isCurrentProjectAsyncSnapshot(
+      {
+        projectId: operation.projectId,
+        projectEpoch: operation.projectEpoch,
+        operationToken: operation.token,
+      },
+      {
+        projectId: activeProjectIdRef.current,
+        projectEpoch: projectEpochRef.current,
+        operationToken: operationTokensRef.current.get(operation.key) || 0,
+      },
+      mountedRef.current,
+    )
+
+  const rebaseOperation = (
+    operation: ProjectOperation,
+    operationProjectId: string,
+    projectEpoch: number,
+  ): ProjectOperation => ({ ...operation, projectId: operationProjectId, projectEpoch })
+
+  const bindOperationToProject = (
+    operation: ProjectOperation,
+    context: { projectId: string; projectEpoch: number },
+  ): ProjectOperation | null => {
+    if (
+      !isLatestOperation(operation) ||
+      operation.navigationIntent !== currentProjectNavigationIntent()
+    ) return null
+    const bound = operation.projectId === null
+      ? rebaseOperation(operation, context.projectId, context.projectEpoch)
+      : operation
+    return bound.projectId === context.projectId &&
+      bound.projectEpoch === context.projectEpoch &&
+      isCurrentOperation(bound)
+      ? bound
+      : null
+  }
+
+  const replaceShots = (nextShots: any[]) => {
+    const normalized = nextShots.map(normalizeShot).filter((s) => s.id)
+    setShots(normalized)
+    const currentSelectedShotId = useShotStore.getState().selectedShotId
+    const stillExists = normalized.some((s) => s.id === currentSelectedShotId)
+    if (!stillExists && normalized[0]?.id) {
+      selectShot(normalized[0].id)
+    } else if (!normalized.length) {
+      selectShot(null)
+    }
+  }
+
+  const loadProjectShots = async (pid: string, epoch = projectEpochRef.current) => {
+    const requestId = ++shotLoadRequestRef.current
+    const mutation = shotMutationRef.current
     const list = await shotApi.list(pid)
+    if (
+      !isLatestResourceResponse(requestId, shotLoadRequestRef.current, mutation, shotMutationRef.current) ||
+      !isCurrentProject(pid, epoch)
+    ) return
     replaceShots(list || [])
   }
 
-  const loadAssetBoard = async (pid: string) => {
+  const loadAssetBoard = async (pid: string, epoch = projectEpochRef.current) => {
+    const requestId = ++assetLoadRequestRef.current
+    const mutation = assetMutationRef.current
     const board = await assetApi.board(pid)
+    if (
+      !isLatestResourceResponse(requestId, assetLoadRequestRef.current, mutation, assetMutationRef.current) ||
+      !isCurrentProject(pid, epoch)
+    ) return null
     setAssetBoard({ characters: board.characters || [], scenes: board.scenes || [] })
     return board
   }
 
-  const refreshWorkspaceData = async (pid: string, includeAssets = false) => {
-    await loadProjectShots(pid)
+  const refreshWorkspaceData = async (pid: string, includeAssets = false, epoch = projectEpochRef.current) => {
+    await loadProjectShots(pid, epoch)
     if (includeAssets) {
-      await loadAssetBoard(pid)
+      await loadAssetBoard(pid, epoch)
     }
   }
 
   const loadStyleTemplates = async () => {
+    const requestId = ++styleTemplateRequestRef.current
     const result = await settingsApi.styleTemplates()
-    if (Array.isArray(result.templates)) {
+    if (mountedRef.current && requestId === styleTemplateRequestRef.current && Array.isArray(result.templates)) {
       setStyleTemplates(result.templates)
     }
   }
@@ -257,20 +383,79 @@ const MainWorkspace: React.FC = () => {
     setEpisodeTitleDraft(projectDetail.title || '')
   }
 
-  const connectWebSocket = (pid: string) => {
+  const activateProjectDetail = (projectDetail: any) => {
+    const nextProjectId = String(projectDetail.id)
+    const nextEpoch = projectEpochRef.current + 1
+    projectEpochRef.current = nextEpoch
+    activeProjectIdRef.current = nextProjectId
+    activatedProjectRef.current = { projectId: nextProjectId, projectEpoch: nextEpoch }
+    applyProjectDetail(projectDetail)
+    return { projectId: nextProjectId, projectEpoch: nextEpoch }
+  }
+
+  const closeCurrentWebSocket = () => {
+    wsClosedByUserRef.current = true
+    wsEpochRef.current += 1
+    if (wsReconnectTimerRef.current != null) {
+      window.clearTimeout(wsReconnectTimerRef.current)
+      wsReconnectTimerRef.current = null
+    }
+    wsRef.current?.close()
+    wsRef.current = null
+    wsProjectIdRef.current = null
+    wsProjectEpochRef.current = 0
+  }
+
+  const connectWebSocket = (pid: string, projectEpoch = projectEpochRef.current) => {
     if (
       wsRef.current &&
       wsProjectIdRef.current === pid &&
+      wsProjectEpochRef.current === projectEpoch &&
       (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING)
     ) {
       return wsRef.current
     }
 
+    if (wsReconnectTimerRef.current != null) {
+      window.clearTimeout(wsReconnectTimerRef.current)
+      wsReconnectTimerRef.current = null
+    }
+    // Invalidate callbacks from the previous socket before closing it. The
+    // close event is asynchronous and must not schedule a reconnect for an
+    // obsolete project.
+    wsEpochRef.current += 1
+    wsClosedByUserRef.current = true
     wsRef.current?.close()
+    const socketEpoch = wsEpochRef.current + 1
+    wsEpochRef.current = socketEpoch
+    wsClosedByUserRef.current = false
     wsProjectIdRef.current = pid
+    wsProjectEpochRef.current = projectEpoch
+
+    const scheduleReconnect = () => {
+      if (
+        wsClosedByUserRef.current ||
+        socketEpoch !== wsEpochRef.current ||
+        !isCurrentProject(pid, projectEpoch) ||
+        wsReconnectTimerRef.current != null
+      ) {
+        return
+      }
+      const attempt = wsReconnectAttemptRef.current
+      const delay = Math.min(1000 * 2 ** Math.min(attempt, 4), 10000)
+      wsReconnectAttemptRef.current = attempt + 1
+      wsReconnectTimerRef.current = window.setTimeout(() => {
+        wsReconnectTimerRef.current = null
+        if (socketEpoch !== wsEpochRef.current || !isCurrentProject(pid, projectEpoch)) return
+        connectWebSocket(pid, projectEpoch)
+      }, delay)
+    }
 
     // 单一 WebSocket 入口：统一驱动流程进度、镜头更新和完成态。
     const ws = createWebSocket(pid, (data) => {
+      // A delayed frame from a previous project/socket must never mutate the
+      // currently selected project.
+      if (socketEpoch !== wsEpochRef.current || !isCurrentProject(pid, projectEpoch)) return
       const ts = new Date().toLocaleTimeString('zh-CN', { hour12: false })
       // 实时读取最新运行模式：全自动模式下后端 LangGraph 不在人工卡点停留，
       // 前端也不应切到“等待确认”态或关闭生成中状态。
@@ -457,35 +642,68 @@ const MainWorkspace: React.FC = () => {
         setAwaitingStoryboardConfirm(false)
         void loadProjectShots(pid)
       }
+    }, {
+      onOpen: () => {
+        if (socketEpoch === wsEpochRef.current) wsReconnectAttemptRef.current = 0
+      },
+      onClose: scheduleReconnect,
     })
 
     wsRef.current = ws
     return ws
   }
 
-  const ensureProject = async () => {
-    if (projectId) return projectId
+  const ensureProject = async (): Promise<{ projectId: string; projectEpoch: number }> => {
+    const currentProjectId = useProjectStore.getState().projectId
+    if (currentProjectId && activeProjectIdRef.current === currentProjectId) {
+      return { projectId: currentProjectId, projectEpoch: projectEpochRef.current }
+    }
 
-    const project = await projectApi.create({
-      title: script.trim() ? script.slice(0, 20) : '未命名项目',
-      first_episode_title: '第 1 集',
-      style,
-      genre: '',
-    })
-    const activeProject = project.first_episode || project
+    if (projectCreationPromiseRef.current) return projectCreationPromiseRef.current
 
-    applyProjectDetail(activeProject)
-
-    return activeProject.id as string
+    const navigationIntent = currentProjectNavigationIntent()
+    initializingProjectRef.current = true
+    initialScriptRef.current = script
+    const operation = (async () => {
+      try {
+        const project = await projectApi.create({
+          title: script.trim() ? script.slice(0, 20) : '未命名项目',
+          first_episode_title: '第 1 集',
+          style,
+          genre: '',
+        })
+        if (
+          !mountedRef.current ||
+          useProjectStore.getState().projectId !== null ||
+          currentProjectNavigationIntent() !== navigationIntent
+        ) {
+          throw new Error('项目上下文已变化，已忽略新建结果')
+        }
+        const activeProject = project.first_episode || project
+        initializingProjectIdRef.current = activeProject.id as string
+        return activateProjectDetail(activeProject)
+      } catch (error) {
+        initializingProjectRef.current = false
+        initializingProjectIdRef.current = null
+        initialScriptRef.current = ''
+        throw error
+      } finally {
+        projectCreationPromiseRef.current = null
+      }
+    })()
+    projectCreationPromiseRef.current = operation
+    return operation
   }
 
   const updateProjectField = async (field: 'style' | 'resolution' | 'title', value: string) => {
     setProject({ [field]: value } as any)
     if (!projectId) return
+    const operation = beginOperation(`project-field:${field}`, projectId)
 
     try {
       await projectApi.update(projectId, { [field]: value })
     } catch (err: any) {
+      if (!isCurrentOperation(operation)) return
       message.error('项目配置更新失败：' + (err.message || '未知错误'))
     }
   }
@@ -505,60 +723,70 @@ const MainWorkspace: React.FC = () => {
 
   const handleSaveAsset = async (regenerate = false) => {
     if (!projectId || !editingAssetId) return
+    const entryProjectId = projectId
+    const assetId = editingAssetId
+    const tab = assetTab
+    const draft = { ...assetDraft }
+    const operation = beginOperation('save-asset', entryProjectId)
     try {
       setSavingAsset(true)
-      const keyFeatures = String(assetDraft.keyFeaturesText || '')
+      const keyFeatures = String(draft.keyFeaturesText || '')
         .split('\n')
         .map((item) => item.trim())
         .filter(Boolean)
       const payload =
-        assetTab === 'characters'
+        tab === 'characters'
           ? {
-              name: assetDraft.name || '',
-              appearance: { ...(assetDraft.appearance || {}), description: assetDraft.appearanceText || '' },
-              personality: assetDraft.personality || '',
-              visual_prompt: assetDraft.visual_prompt || '',
-              negative_prompt: assetDraft.negative_prompt || '',
-              voice_id: assetDraft.voice_id || '',
+              project_id: entryProjectId,
+              name: draft.name || '',
+              appearance: { ...(draft.appearance || {}), description: draft.appearanceText || '' },
+              personality: draft.personality || '',
+              visual_prompt: draft.visual_prompt || '',
+              negative_prompt: draft.negative_prompt || '',
+              voice_id: draft.voice_id || '',
               key_features: keyFeatures,
-              default_outfit: assetDraft.default_outfit || '',
-              lora_profile: assetDraft.lora_profile || '',
-              ip_adapter_profile: assetDraft.ip_adapter_profile || '',
-              wardrobe_lock: assetDraft.wardrobe_lock || '',
-              seed: String(assetDraft.seed || '42'),
+              default_outfit: draft.default_outfit || '',
+              lora_profile: draft.lora_profile || '',
+              ip_adapter_profile: draft.ip_adapter_profile || '',
+              wardrobe_lock: draft.wardrobe_lock || '',
+              seed: String(draft.seed || '42'),
               regenerate,
             }
           : {
-              name: assetDraft.name || '',
-              description: assetDraft.description || '',
-              visual_prompt: assetDraft.visual_prompt || '',
-              negative_prompt: assetDraft.negative_prompt || '',
+              project_id: entryProjectId,
+              name: draft.name || '',
+              description: draft.description || '',
+              visual_prompt: draft.visual_prompt || '',
+              negative_prompt: draft.negative_prompt || '',
               key_features: keyFeatures,
-              scene_group_key: assetDraft.scene_group_key || '',
-              time_of_day: assetDraft.time_of_day || '',
-              prop_lock: assetDraft.prop_lock || '',
-              seed: Number(assetDraft.seed || 1200),
+              scene_group_key: draft.scene_group_key || '',
+              time_of_day: draft.time_of_day || '',
+              prop_lock: draft.prop_lock || '',
+              seed: Number(draft.seed || 1200),
               regenerate,
             }
       const updated =
-        assetTab === 'characters'
-          ? await assetApi.updateCharacter(editingAssetId, payload)
-          : await assetApi.updateScene(editingAssetId, payload)
+        tab === 'characters'
+          ? await assetApi.updateCharacter(assetId, payload)
+          : await assetApi.updateScene(assetId, payload)
+      if (!isCurrentOperation(operation)) return
+      assetMutationRef.current += 1
       setAssetBoard((board) => {
         if (!board) return board
-        const key = assetTab
+        const key = tab
         return {
           ...board,
-          [key]: board[key].map((item: any) => (item.id === editingAssetId ? updated : item)),
+          [key]: board[key].map((item: any) => (item.id === assetId ? updated : item)),
         }
       })
       setEditingAssetId(null)
       setAssetDraft({})
       message.success(regenerate ? '素材已更新并重生成' : '素材已保存')
     } catch (err: any) {
+      if (!isCurrentOperation(operation)) return
       message.error('素材保存失败：' + (err.message || '未知错误'))
     } finally {
-      setSavingAsset(false)
+      if (isCurrentOperation(operation)) setSavingAsset(false)
     }
   }
 
@@ -571,11 +799,16 @@ const MainWorkspace: React.FC = () => {
   }
 
   const handleCreateProject = async () => {
+    beginProjectNavigationIntent()
+    const sourceProjectId = useProjectStore.getState().projectId
+    const operation = beginOperation('create-project', sourceProjectId)
     try {
       setCreatingProject(true)
-      const title = newProjectTitle.trim() || '未命名项目'
+      const canNavigate = await requestProjectNavigation(sourceProjectId, null)
+      if (!canNavigate || !isCurrentOperation(operation)) return
+      const nextTitle = newProjectTitle.trim() || '未命名项目'
       const project = await projectApi.create({
-        title,
+        title: nextTitle,
         first_episode_title: newEpisodeTitle.trim() || '第 1 集',
         style,
         genre: '',
@@ -583,12 +816,13 @@ const MainWorkspace: React.FC = () => {
         resolution,
         platform,
       })
+      if (!isCurrentOperation(operation)) return
       const activeProject = project.first_episode || project
-
-      applyProjectDetail(activeProject)
+      activateProjectDetail(activeProject)
 
       setShots([])
       selectShot(null)
+      setScript('')
       setGenerating(false)
       setAwaitingStoryboardConfirm(false)
       setAssetBoardReady(false)
@@ -602,17 +836,19 @@ const MainWorkspace: React.FC = () => {
       setShowCreatePanel(false)
       message.success('新建项目成功，已自动创建第一集')
     } catch (err: any) {
+      if (!isCurrentOperation(operation)) return
       message.error('新建项目失败：' + (err.message || '未知错误'))
     } finally {
-      setCreatingProject(false)
+      if (isLatestOperation(operation) && mountedRef.current) setCreatingProject(false)
     }
   }
 
-  const submitScriptForStoryboard = async (nextScript: string) => {
+  const submitScriptForStoryboard = async (nextScript: string, existingOperation?: ProjectOperation) => {
     if (!nextScript.trim()) {
       message.warning('请输入剧本内容')
       return
     }
+    let operation = existingOperation || beginOperation('pipeline')
 
     setLoading(true)
     setGenerating(true)
@@ -625,10 +861,13 @@ const MainWorkspace: React.FC = () => {
     setProgress(0, 'parse_script')
 
     try {
-      const pid = await ensureProject()
-      connectWebSocket(pid)
+      const context = await ensureProject()
+      const boundOperation = bindOperationToProject(operation, context)
+      if (!boundOperation) return
+      operation = boundOperation
+      connectWebSocket(context.projectId, context.projectEpoch)
       await scriptApi.parse({
-        project_id: pid,
+        project_id: context.projectId,
         user_input: nextScript,
         input_type: 'text',
         style,
@@ -638,10 +877,12 @@ const MainWorkspace: React.FC = () => {
         target_duration: 30,
         mode: runMode,
       })
+      if (!isCurrentOperation(operation)) return
       appendLog(
         `[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] 已提交解析任务（${runMode === 'auto' ? '全自动生成' : '手动审核'}）`,
       )
     } catch (err: any) {
+      if (!isCurrentOperation(operation)) return
       message.error('提交失败：' + (err.message || '未知错误'))
       setGenerating(false)
       setLoading(false)
@@ -653,6 +894,7 @@ const MainWorkspace: React.FC = () => {
   }
 
   const handleAutoWriteScript = async () => {
+    let operation = beginOperation('pipeline')
     try {
       setAutoWriting(true)
       setGenerating(true)
@@ -663,30 +905,36 @@ const MainWorkspace: React.FC = () => {
       setWorkspaceTab('script')
       setProgress(0, 'generate_script')
 
-      const pid = await ensureProject()
-      connectWebSocket(pid)
+      const context = await ensureProject()
+      const boundOperation = bindOperationToProject(operation, context)
+      if (!boundOperation) return
+      operation = boundOperation
+      connectWebSocket(context.projectId, context.projectEpoch)
       const prompt = script.trim() || '一个适合 45 秒竖屏漫剧的温暖成长故事'
       const result = await scriptApi.generate({
-        project_id: pid,
+        project_id: context.projectId,
         prompt,
         style,
         genre: '原创短剧',
         target_duration: 45,
       })
+      if (!isCurrentOperation(operation)) return
       const generatedScript = result.script || ''
       setScript(generatedScript)
       appendLog(`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] Agent 已生成完整剧本`)
-      await submitScriptForStoryboard(generatedScript)
+      await submitScriptForStoryboard(generatedScript, operation)
     } catch (err: any) {
+      if (!isCurrentOperation(operation)) return
       message.error('自动生成剧本失败：' + (err.message || '未知错误'))
       setGenerating(false)
       setLoading(false)
     } finally {
-      setAutoWriting(false)
+      if (isLatestOperation(operation) && mountedRef.current) setAutoWriting(false)
     }
   }
 
   const handleUpload = async (file: File) => {
+    let operation = beginOperation('pipeline')
     try {
       setUploading(true)
       setGenerating(true)
@@ -698,11 +946,14 @@ const MainWorkspace: React.FC = () => {
       clearLogs()
       setProgress(0, 'parse_script')
 
-      const pid = await ensureProject()
-      connectWebSocket(pid)
+      const context = await ensureProject()
+      const boundOperation = bindOperationToProject(operation, context)
+      if (!boundOperation) return
+      operation = boundOperation
+      connectWebSocket(context.projectId, context.projectEpoch)
 
       const formData = new FormData()
-      formData.append('project_id', pid)
+      formData.append('project_id', context.projectId)
       formData.append('file', file)
       formData.append('style', style)
       formData.append('output_format', outputFormat)
@@ -711,45 +962,52 @@ const MainWorkspace: React.FC = () => {
       formData.append('mode', runMode)
 
       const result = await scriptApi.upload(formData)
+      if (!isCurrentOperation(operation)) return
       if (typeof result.script === 'string') {
         setScript(result.script)
       }
       appendLog(`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] 已上传剧本：${file.name}`)
       message.success('剧本上传成功')
     } catch (err: any) {
+      if (!isCurrentOperation(operation)) return
       message.error('上传失败：' + (err.message || '未知错误'))
       setGenerating(false)
     } finally {
-      setUploading(false)
+      if (isLatestOperation(operation) && mountedRef.current) setUploading(false)
     }
   }
 
   const handleGenerateSelectedShotVideo = async () => {
     if (!projectId || !selectedShot) return
+    const entryProjectId = projectId
+    const shot = selectedShot
+    const operation = beginOperation(`generate-video:${shot.id}`, entryProjectId)
 
     try {
       setConfirming(true)
-      if (!selectedShot.confirmed) {
+      if (!shot.confirmed) {
         message.warning('请先审核通过当前镜头故事板')
         return
       }
-      if (!(selectedShot.storyboard_path || selectedShot.image_path)) {
+      if (!(shot.storyboard_path || shot.image_path)) {
         message.warning('当前镜头尚未生成定稿故事板')
         return
       }
       setGenerating(true)
       setPreviewMode('shot')
       setWorkspaceTab('video')
-      connectWebSocket(projectId)
-      await shotApi.generateVideo(selectedShot.id, Boolean(selectedShot.video_path))
+      connectWebSocket(entryProjectId, operation.projectEpoch)
+      await shotApi.generateVideo(shot.id, Boolean(shot.video_path))
+      if (!isCurrentOperation(operation)) return
       setAwaitingStoryboardConfirm(false)
-      appendLog(`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] 已提交镜头 ${selectedShot.sequence} 视频生成`)
+      appendLog(`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] 已提交镜头 ${shot.sequence} 视频生成`)
       message.success('当前镜头视频生成已启动')
     } catch (err: any) {
+      if (!isCurrentOperation(operation)) return
       message.error('镜头视频生成失败：' + (err.message || '未知错误'))
       setGenerating(false)
     } finally {
-      setConfirming(false)
+      if (isLatestOperation(operation) && mountedRef.current) setConfirming(false)
     }
   }
 
@@ -759,6 +1017,8 @@ const MainWorkspace: React.FC = () => {
       message.warning('请先完成每个镜头的视频生成')
       return
     }
+    const entryProjectId = projectId
+    const operation = beginOperation('compose-video', entryProjectId)
 
     try {
       setComposing(true)
@@ -766,24 +1026,30 @@ const MainWorkspace: React.FC = () => {
       setPreviewMode('video')
       setWorkspaceTab('video')
       setProgress(92, 'compose_video')
-      connectWebSocket(projectId)
-      await renderApi.start({ project_id: projectId, output_format: outputFormat, resolution })
+      connectWebSocket(entryProjectId, operation.projectEpoch)
+      await renderApi.start({ project_id: entryProjectId, output_format: outputFormat, resolution })
+      if (!isCurrentOperation(operation)) return
       appendLog(`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] 已提交成片合成任务`)
       message.success('成片合成已启动')
     } catch (err: any) {
+      if (!isCurrentOperation(operation)) return
       message.error('成片合成失败：' + (err.message || '未知错误'))
       setGenerating(false)
     } finally {
-      setComposing(false)
+      if (isLatestOperation(operation) && mountedRef.current) setComposing(false)
     }
   }
 
   const handleApproveShot = async (shotId: string, approved: boolean) => {
+    if (!projectId) return
+    const operation = beginOperation(`approve-shot:${shotId}`, projectId)
     try {
       await shotApi.approveStoryboard(shotId, approved)
+      if (!isCurrentOperation(operation)) return
       updateShot(shotId, { confirmed: approved, status: approved ? 'storyboard_approved' : 'needs_review' })
       message.success(approved ? '该镜头已通过审核' : '已标记为需调整')
     } catch (err: any) {
+      if (!isCurrentOperation(operation)) return
       message.error('审核操作失败：' + (err.message || '未知错误'))
     }
   }
@@ -814,21 +1080,25 @@ const MainWorkspace: React.FC = () => {
 
   const handleGenerateStoryboard = async () => {
     if (!projectId) return
+    const entryProjectId = projectId
+    const operation = beginOperation('generate-storyboard', entryProjectId)
 
     try {
       setGeneratingStoryboard(true)
       setGenerating(true)
       setAwaitingStoryboardConfirm(false)
       setWorkspaceTab('storyboard')
-      connectWebSocket(projectId)
-      await shotApi.generateStoryboard(projectId)
+      connectWebSocket(entryProjectId, operation.projectEpoch)
+      await shotApi.generateStoryboard(entryProjectId)
+      if (!isCurrentOperation(operation)) return
       appendLog(`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] 已确认素材，开始生成定稿故事板参考图`)
       message.success('故事板任务已启动')
     } catch (err: any) {
+      if (!isCurrentOperation(operation)) return
       message.error('故事板生成失败：' + (err.message || '未知错误'))
       setGenerating(false)
     } finally {
-      setGeneratingStoryboard(false)
+      if (isLatestOperation(operation) && mountedRef.current) setGeneratingStoryboard(false)
     }
   }
 
@@ -874,35 +1144,94 @@ const MainWorkspace: React.FC = () => {
   }, [])
 
   useEffect(() => {
-    if (!projectId) return
+    const activated = projectId && activatedProjectRef.current?.projectId === projectId
+      ? activatedProjectRef.current
+      : null
+    const epoch = activated?.projectEpoch ?? projectEpochRef.current + 1
+    projectEpochRef.current = epoch
+    activatedProjectRef.current = null
+    activeProjectIdRef.current = projectId
+    shotLoadRequestRef.current += 1
+    assetLoadRequestRef.current += 1
+    assetMutationRef.current += 1
+    // React StrictMode mounts effects twice in development. Tie the flag to
+    // the created project ID so both setup passes preserve the submitted
+    // script, while a later project switch still performs a full reset.
+    const preserveInitialRun =
+      initializingProjectRef.current && initializingProjectIdRef.current === projectId
+    const preservedScript = preserveInitialRun ? initialScriptRef.current : ''
+    if (!preserveInitialRun) {
+      initializingProjectRef.current = false
+      initializingProjectIdRef.current = null
+      initialScriptRef.current = ''
+    }
 
-    connectWebSocket(projectId)
+    // Clear all project-scoped state before loading the next project. This is
+    // intentionally synchronous so an old project's script/media cannot be
+    // displayed while the new project requests are in flight.
+    setShots([])
+    selectShot(null)
+    setScript(preservedScript)
+    setAssetBoard(null)
+    setAssetBoardReady(false)
+    setEditingAssetId(null)
+    setAssetDraft({})
+    setSavingAsset(false)
+    setVideoPath('')
+    setAwaitingStoryboardConfirm(false)
+    setLoading(false)
+    setAutoWriting(false)
+    setUploading(false)
+    setConfirming(false)
+    setComposing(false)
+    setGeneratingStoryboard(false)
+    setImagePreview(null)
+    if (!preserveInitialRun) {
+      setGenerating(false)
+      setProgress(0, '')
+      clearLogs()
+    }
+    setWorkspaceTab('script')
+    setPreviewMode('shot')
+    resetPreviewTransform()
+
+    if (!projectId) {
+      closeCurrentWebSocket()
+      return () => {
+        if (projectEpochRef.current === epoch) activeProjectIdRef.current = null
+      }
+    }
+
+    connectWebSocket(projectId, epoch)
     projectApi.get(projectId)
       .then((projectDetail) => {
+        if (!isCurrentProject(projectId, epoch)) return
         applyProjectDetail(projectDetail)
-        setScript(projectDetail.input_text || '')
-        if (projectDetail.video_path) {
-          setVideoPath(projectDetail.video_path)
+        if (!preserveInitialRun || projectDetail.input_text) {
+          setScript(projectDetail.input_text || '')
         }
+        setVideoPath(projectDetail.video_path || '')
       })
       .catch(() => undefined)
-    void loadProjectShots(projectId).catch(() => undefined)
-    void loadAssetBoard(projectId).catch(() => undefined)
+    void loadProjectShots(projectId, epoch).catch(() => undefined)
+    void loadAssetBoard(projectId, epoch).catch(() => undefined)
     return () => {
-      wsRef.current?.close()
-      wsRef.current = null
-      wsProjectIdRef.current = null
+      if (projectEpochRef.current !== epoch) return
+      activeProjectIdRef.current = null
+      closeCurrentWebSocket()
     }
   }, [projectId])
 
   useEffect(() => {
     if (!projectId || !isGenerating) return
 
+    const epoch = projectEpochRef.current
     const timer = window.setInterval(() => {
+      if (!isCurrentProject(projectId, epoch)) return
       if (pollingRef.current) return
       pollingRef.current = true
       const includeAssets = currentStep === 'wait_asset_confirm' || currentStep === 'generate_storyboard'
-      refreshWorkspaceData(projectId, includeAssets)
+      refreshWorkspaceData(projectId, includeAssets, epoch)
         .catch(() => undefined)
         .finally(() => {
           pollingRef.current = false
@@ -913,11 +1242,7 @@ const MainWorkspace: React.FC = () => {
   }, [projectId, isGenerating, currentStep])
 
   const imageUrl = toOutputUrl(selectedShot?.storyboard_path || selectedShot?.image_path)
-  const videoUrl = videoPath
-    ? videoPath.startsWith('/output/')
-      ? `${API_OUTPUT_BASE}${videoPath.replace('/output/', '')}`
-      : toOutputUrl(videoPath)
-    : null
+  const videoUrl = toOutputUrl(videoPath)
   const currentVideoUrl = selectedShotVideoUrl || videoUrl
 
   useEffect(() => {
@@ -936,7 +1261,7 @@ const MainWorkspace: React.FC = () => {
         onClick={() => setImagePreview({ url: previewUrl, title: item.name || label })}
         aria-label="查看高清原图"
       >
-        <img src={previewUrl} alt={label} />
+        <img src={previewUrl} alt={label} loading="lazy" decoding="async" />
       </button>
     ) : (
       <span>{label}</span>
@@ -972,7 +1297,9 @@ const MainWorkspace: React.FC = () => {
               key={tab.id}
               type="button"
               role="tab"
+              id={`workspace-tab-${tab.id}`}
               aria-selected={active}
+              aria-controls={`workspace-panel-${tab.id}`}
               className={`workspace-tab${active ? ' active' : ''}`}
               onClick={() => {
                 setWorkspaceTab(tab.id)
@@ -993,7 +1320,13 @@ const MainWorkspace: React.FC = () => {
 
       <div className="workspace-tab-body">
         {workspaceTab === 'script' && (
-          <div className="script-panel panel-enter" role="tabpanel">
+          <div
+            className="script-panel panel-enter"
+            role="tabpanel"
+            id="workspace-panel-script"
+            aria-labelledby="workspace-tab-script"
+            tabIndex={0}
+          >
         <div className="script-scope-bar">
           <div className="script-scope-copy">
             <span>{parentProjectTitle || (projectType === 'series' ? title : '未选择大项目')}</span>
@@ -1158,7 +1491,13 @@ const MainWorkspace: React.FC = () => {
         )}
 
         {workspaceTab === 'assets' && (
-          <div className="asset-page panel-enter" role="tabpanel">
+          <div
+            className="asset-page panel-enter"
+            role="tabpanel"
+            id="workspace-panel-assets"
+            aria-labelledby="workspace-tab-assets"
+            tabIndex={0}
+          >
             <div className="asset-page-head">
               <div>
                 <div className="asset-board-title">项目素材板</div>
@@ -1302,7 +1641,13 @@ const MainWorkspace: React.FC = () => {
               </div>
             )}
 
-            <div className="preview-panel panel-enter" role="tabpanel">
+            <div
+              className="preview-panel panel-enter"
+              role="tabpanel"
+              id={`workspace-panel-${workspaceTab}`}
+              aria-labelledby={`workspace-tab-${workspaceTab}`}
+              tabIndex={0}
+            >
         <div
           className={`preview-stage${dragStart ? ' dragging' : ''}`}
           onMouseDown={beginPreviewDrag}
@@ -1441,7 +1786,7 @@ const MainWorkspace: React.FC = () => {
                   onClick={() => openShotConfig(shot.id)}
                 >
                   {thumbUrl ? (
-                    <img src={thumbUrl} alt={`镜头 ${i + 1}`} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                    <img src={thumbUrl} alt={`镜头 ${i + 1}`} loading="lazy" decoding="async" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
                   ) : (
                     <div className="thumb-index">{i + 1}</div>
                   )}
