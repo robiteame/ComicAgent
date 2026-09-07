@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 import socket
 import sys
@@ -39,7 +40,10 @@ class ModelConfigSecurityTests(unittest.TestCase):
                 config_path = Path(root) / "model_api_config.json"
 
                 self.assertEqual(json.loads(config_path.read_text(encoding="utf-8")), payload)
-                self.assertEqual(stat.S_IMODE(config_path.stat().st_mode) & 0o077, 0)
+                # POSIX permission bits are not enforceable via os.chmod on
+                # Windows; the private-mode contract is a POSIX-only check.
+                if os.name != "nt":
+                    self.assertEqual(stat.S_IMODE(config_path.stat().st_mode) & 0o077, 0)
                 self.assertEqual(model_config_service.get_model_config()["categories"]["script"]["api_key"], "********")
                 self.assertEqual(list(Path(root).glob(".model_api_config.json.*.tmp")), [])
 

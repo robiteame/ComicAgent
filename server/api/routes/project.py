@@ -467,8 +467,10 @@ def _write_delete_manifest(token: str, project_ids: list[str], previous_statuses
         "previous_statuses": previous_statuses,
     }
     try:
-        temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        with temporary.open("rb") as stream:
+        # fsync requires a writable handle; a read-only descriptor raises EBADF
+        # on Windows, so the manifest is written and flushed in one open call.
+        with temporary.open("w", encoding="utf-8") as stream:
+            stream.write(json.dumps(payload, ensure_ascii=False))
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, manifest)

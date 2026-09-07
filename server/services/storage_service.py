@@ -225,23 +225,29 @@ class StorageService:
         if parsed.scheme == "file":
             value = unquote(parsed.path)
 
-        normalized = value.replace("\\", os.sep)
-        path = Path(normalized)
-        candidates: list[Path]
-        if path.is_absolute():
-            output_prefix = f"{os.sep}output{os.sep}"
-            if normalized.startswith(output_prefix):
-                candidates = [self.base_dir / normalized[len(output_prefix) :]]
-            else:
-                candidates = [path]
+        unified = value.replace("\\", "/")
+        # URL-style public paths (get_relative_url emits "/output/...") must
+        # resolve identically on every OS: a drive-less "/output/..." is not
+        # is_absolute() on Windows and would otherwise miss the mapping below.
+        if unified.startswith("/output/"):
+            candidates = [self.base_dir / unified[len("/output/") :]]
         else:
-            parts = path.parts
-            if parts and parts[0] == "output":
-                candidates = [self.base_dir.joinpath(*parts[1:])]
-            elif parts and parts[0] == "projects":
-                candidates = [self.base_dir / path]
+            normalized = value.replace("\\", os.sep)
+            path = Path(normalized)
+            if path.is_absolute():
+                output_prefix = f"{os.sep}output{os.sep}"
+                if normalized.startswith(output_prefix):
+                    candidates = [self.base_dir / normalized[len(output_prefix) :]]
+                else:
+                    candidates = [path]
             else:
-                candidates = [project_dir / path, Path.cwd() / path]
+                parts = path.parts
+                if parts and parts[0] == "output":
+                    candidates = [self.base_dir.joinpath(*parts[1:])]
+                elif parts and parts[0] == "projects":
+                    candidates = [self.base_dir / path]
+                else:
+                    candidates = [project_dir / path, Path.cwd() / path]
 
         root = project_dir.resolve()
         for candidate in candidates:
