@@ -30,6 +30,14 @@ import { useShotStore } from '../stores/shotStore'
 const { TextArea } = Input
 const FlowGraph = React.lazy(() => import('./FlowGraph'))
 
+// 镜头级音频路径覆盖：空=继承系统设置的全局 audio_mode。
+const SHOT_AUDIO_MODE_OPTIONS = [
+  { value: '', label: '继承全局设置' },
+  { value: 'tts', label: 'TTS 配音合成' },
+  { value: 'native', label: '原生音频（需模型支持）' },
+  { value: 'auto', label: '智能 auto' },
+]
+
 const stepLabels: Record<string, string> = {
   generate_script: '剧本生成',
   parse_script: '剧本解析',
@@ -347,6 +355,7 @@ const RightSidebar: React.FC<RightSidebarProps> = ({ collapsed, onToggleCollapse
     scene_description: shot.scene_description || '',
     character_action: shot.character_action || '',
     dialogue: shot.dialogue || '',
+    audio_mode: String(shot.continuity_profile?.audio_mode || ''),
   })
 
   useEffect(() => {
@@ -808,6 +817,19 @@ const RightSidebar: React.FC<RightSidebarProps> = ({ collapsed, onToggleCollapse
                         value={shotDraft.dialogue ?? selectedShot.dialogue}
                         disabled={selectedShot.confirmed}
                         onChange={(e) => updateCurrentShot({ dialogue: e.target.value })}
+                      />
+                    </div>
+
+                    <div className="form-block">
+                      <label className="form-label" htmlFor="shot-audio-mode">音频方式（镜头级覆盖）</label>
+                      <Select
+                        id="shot-audio-mode"
+                        aria-label="音频方式（镜头级覆盖）"
+                        style={{ width: '100%' }}
+                        value={String(shotDraft.audio_mode ?? '')}
+                        disabled={selectedShot.confirmed}
+                        onChange={(value) => updateCurrentShot({ audio_mode: value })}
+                        options={SHOT_AUDIO_MODE_OPTIONS}
                       />
                     </div>
 

@@ -58,6 +58,73 @@ type ModelCategory = 'script' | 'image' | 'video' | 'voice'
 type ModelConfig = Record<string, any>
 type ModelConfigState = Record<ModelCategory, ModelConfig>
 
+// 协议即代码路径：script 固定 openai-chat 不露出；其余类别提供下拉选择。
+// 接入同协议新服务只需改 base_url/api_key/model；全新协议需后端新增适配器。
+const PROTOCOL_OPTIONS: Partial<Record<ModelCategory, { value: string; label: string }[]>> = {
+  image: [
+    { value: 'ark-seedream', label: '火山方舟 Seedream（支持参考图）' },
+    { value: 'stability', label: 'Stability AI' },
+    { value: 'placeholder', label: '本地占位图（离线/免密钥）' },
+  ],
+  video: [
+    { value: 'ark-seedance', label: '火山方舟 Seedance（无声视频 + TTS）' },
+    { value: 'native-audio', label: '原生音视频（对白直出，厂商接入中）' },
+  ],
+  voice: [{ value: 'mimo-tts', label: 'Mimo 内置 TTS' }],
+}
+
+const AUDIO_MODE_OPTIONS = [
+  { value: 'tts', label: 'TTS 配音合成（默认，无声视频 + 配音）' },
+  { value: 'native', label: '原生音频（模型直接生成对白语音）' },
+  { value: 'auto', label: '智能 auto（特写台词镜头用原生，其余 TTS）' },
+]
+
+const SHOT_AUDIO_MODE_OPTIONS = [
+  { value: '', label: '继承全局设置' },
+  { value: 'tts', label: 'TTS 配音合成' },
+  { value: 'native', label: '原生音频（需模型支持）' },
+  { value: 'auto', label: '智能 auto' },
+]
+
+// 厂商预设只做表单快捷填充，不产生任何代码分支。
+const VENDOR_PRESETS: Record<ModelCategory, { label: string; patch: ModelConfig }[]> = {
+  script: [
+    { label: 'OpenAI', patch: { base_url: 'https://api.openai.com/v1', model: 'gpt-4o', auth_style: 'bearer' } },
+    { label: 'DeepSeek', patch: { base_url: 'https://api.deepseek.com', model: 'deepseek-chat', auth_style: 'bearer' } },
+    { label: '小米 MiMo', patch: { base_url: 'https://token-plan-cn.xiaomimimo.com/v1', model: 'mimo-v2.5', auth_style: 'api-key-header' } },
+    { label: '硅基流动', patch: { base_url: 'https://api.siliconflow.cn/v1', model: '', auth_style: 'bearer' } },
+  ],
+  image: [
+    {
+      label: '火山 Seedream',
+      patch: {
+        protocol: 'ark-seedream',
+        base_url: 'https://ark.cn-beijing.volces.com/api/v3',
+        model: 'doubao-seedream-5.0-lite',
+        image_size: '1440x2560',
+      },
+    },
+    { label: 'Stability', patch: { protocol: 'stability', base_url: 'https://api.stability.ai/v2beta', model: '' } },
+    { label: '本地占位图', patch: { protocol: 'placeholder' } },
+  ],
+  video: [
+    {
+      label: '火山 Seedance 1.5 Pro',
+      patch: {
+        protocol: 'ark-seedance',
+        base_url: 'https://ark.cn-beijing.volces.com/api/v3',
+        model: 'doubao-seedance-1-5-pro-251215',
+      },
+    },
+  ],
+  voice: [
+    {
+      label: '小米 MiMo TTS',
+      patch: { protocol: 'mimo-tts', base_url: 'https://token-plan-cn.xiaomimimo.com/v1', model: 'mimo-v2.5-tts', voice: '冰糖', format: 'wav' },
+    },
+  ],
+}
+
 interface SystemSettingsPageProps {
   onBack: () => void
 }
@@ -475,12 +542,12 @@ const SystemSettingsPage: React.FC<SystemSettingsPageProps> = ({ onBack }) => {
                 <div className="settings-model-grid">
                   <ModelConfigCard
                     title="剧本生成模型"
-                    subtitle="LLM · 脚本生成 / 分镜决策"
+                    subtitle="LLM · 脚本生成 / 分镜决策 · OpenAI 兼容协议"
                     category="script"
                     config={modelConfig.script}
                     onChange={updateModelField}
-                    providerHint="openai / mimo / deepseek"
                     extraFields={[{ key: 'max_tokens', label: '最大 Token', type: 'number' }]}
+                    showAuthStyle
                   />
                   <ModelConfigCard
                     title="图像生成模型"
@@ -488,24 +555,22 @@ const SystemSettingsPage: React.FC<SystemSettingsPageProps> = ({ onBack }) => {
                     category="image"
                     config={modelConfig.image}
                     onChange={updateModelField}
-                    providerHint="local / stability / doubao-seedream-5.0-lite"
                     extraFields={[{ key: 'image_size', label: '出图尺寸', type: 'text', placeholder: '例如 1440x2560' }]}
                   />
                   <ModelConfigCard
                     title="视频生成模型"
-                    subtitle="SeedDance · 逐镜头视频"
+                    subtitle="逐镜头视频 · 音频路径按能力自动路由"
                     category="video"
                     config={modelConfig.video}
                     onChange={updateModelField}
-                    providerHint="Doubao-Seedance-1.5-pro"
+                    showAudioMode
                   />
                   <ModelConfigCard
                     title="配音生成模型"
-                    subtitle="Mimo 内置 TTS"
+                    subtitle="TTS 语音合成"
                     category="voice"
                     config={modelConfig.voice}
                     onChange={updateModelField}
-                    hideProvider
                     extraFields={[
                       { key: 'voice', label: '默认音色', type: 'text', placeholder: '例如 冰糖' },
                       { key: 'format', label: '音频格式', type: 'text', placeholder: '例如 wav' },
@@ -615,32 +680,64 @@ function ModelConfigCard({
   category,
   config,
   onChange,
-  providerHint,
-  hideProvider,
   extraFields,
+  showAuthStyle,
+  showAudioMode,
 }: {
   title: string
   subtitle: string
   category: ModelCategory
   config: ModelConfig
   onChange: (category: ModelCategory, field: string, value: any) => void
-  providerHint?: string
-  hideProvider?: boolean
   extraFields?: { key: string; label: string; type: 'text' | 'number'; placeholder?: string }[]
+  showAuthStyle?: boolean
+  showAudioMode?: boolean
 }) {
+  const protocolOptions = PROTOCOL_OPTIONS[category]
+  const currentProtocol = String(config.protocol || config.provider || '').toLowerCase()
+  const audioMode = String(config.audio_mode || '').toLowerCase()
   return (
     <div className="model-config-card">
       <div className="model-config-head">
         <strong>{title}</strong>
         <span>{subtitle}</span>
       </div>
-      {!hideProvider && (
+      <div className="settings-field">
+        <span>厂商预设（点击填充表单）</span>
+        <div className="settings-template-list">
+          {VENDOR_PRESETS[category].map((preset) => (
+            <button
+              key={preset.label}
+              type="button"
+              className="settings-template-chip"
+              onClick={() => Object.entries(preset.patch).forEach(([field, value]) => onChange(category, field, value))}
+            >
+              <strong>{preset.label}</strong>
+              <span>{String(preset.patch.base_url || preset.patch.protocol || '快捷填充')}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+      {protocolOptions && (
         <div className="settings-field">
-          <span>Provider 渠道</span>
-          <Input
-            value={config.provider || ''}
-            placeholder={providerHint}
-            onChange={(event) => onChange(category, 'provider', event.target.value)}
+          <span>接入协议 Protocol</span>
+          <Select
+            value={currentProtocol || protocolOptions[0].value}
+            onChange={(value) => onChange(category, 'protocol', value)}
+            options={protocolOptions}
+          />
+        </div>
+      )}
+      {showAuthStyle && (
+        <div className="settings-field">
+          <span>鉴权方式</span>
+          <Select
+            value={String(config.auth_style || 'bearer').toLowerCase()}
+            onChange={(value) => onChange(category, 'auth_style', value)}
+            options={[
+              { value: 'bearer', label: 'Bearer Token（Authorization 头）' },
+              { value: 'api-key-header', label: 'api-key 请求头（小米 MiMo 等）' },
+            ]}
           />
         </div>
       )}
@@ -656,7 +753,7 @@ function ModelConfigCard({
         <span>API 密钥</span>
         <Password
           value={config.api_key || ''}
-          placeholder="留空表示沿用环境变量配置"
+          placeholder="留空表示沿用环境变量配置；换地址后需填新密钥"
           visibilityToggle
           onChange={(event) => onChange(category, 'api_key', event.target.value)}
         />
@@ -665,6 +762,21 @@ function ModelConfigCard({
         <span>模型名称</span>
         <Input value={config.model || ''} onChange={(event) => onChange(category, 'model', event.target.value)} />
       </div>
+      {showAudioMode && (
+        <>
+          <div className="settings-field">
+            <span>音频路径 audio_mode</span>
+            <Select
+              value={['tts', 'native', 'auto'].includes(audioMode) ? audioMode : 'tts'}
+              onChange={(value) => onChange(category, 'audio_mode', value)}
+              options={AUDIO_MODE_OPTIONS}
+            />
+          </div>
+          <div className="asset-board-note">
+            镜头可在右侧镜头编辑面板单独覆盖音频方式（保存于镜头的 continuity_profile，优先于此处全局设置）。
+          </div>
+        </>
+      )}
       {extraFields?.map((field) => (
         <div className="settings-field" key={field.key}>
           <span>{field.label}</span>
