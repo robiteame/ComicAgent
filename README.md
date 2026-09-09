@@ -6,6 +6,12 @@
   <p align="center">
     全流程自动化的 AI 漫剧生产桌面工作台，零门槛将故事转化为可发布的漫剧视频。
   </p>
+  <br/>
+  <p align="center">
+    <img src="docs/screenshots/desktop-workspace.png" alt="ComicAgent 桌面客户端真实启动界面" width="920" />
+    <br/>
+    <sub><b>桌面客户端（Electron）真实启动界面</b> —— 漫剧工坊主界面：左侧项目与系统入口，中部剧本编辑与多页签工作区，右侧 AI 写剧本 / 解析 / 上传与画风·分辨率·生成模式设置</sub>
+  </p>
 </p>
 
 ---
