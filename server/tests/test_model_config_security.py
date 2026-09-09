@@ -93,7 +93,7 @@ class ModelConfigSecurityTests(unittest.TestCase):
                     patch.object(model_config_service.socket, "getaddrinfo", return_value=public_dns),
                 ):
                     model_config_service._save_raw(
-                        {"script": {"provider": "openai", "api_key": "old-key", "base_url": "https://old.example.test/v1"}}
+                        {"script": {"protocol": "openai-chat", "api_key": "old-key", "base_url": "https://old.example.test/v1"}}
                     )
                     model_config_service.settings.OPENAI_API_KEY = "old-key"
 
@@ -103,19 +103,22 @@ class ModelConfigSecurityTests(unittest.TestCase):
                     stored = model_config_service._load_raw()["script"]
                     self.assertNotIn("api_key", stored)
                     self.assertTrue(stored[model_config_service.API_KEY_REQUIRED])
-                    self.assertEqual(model_config_service.settings.OPENAI_API_KEY, "")
+                    # script 端点改地址未换 key 后，生效端点必须返回空密钥。
+                    from services.providers.endpoint import get_endpoint
+
+                    self.assertEqual(get_endpoint("script").api_key, "")
                     self.assertEqual(model_config_service.get_model_config()["categories"]["script"]["api_key"], "")
 
                     model_config_service.settings.OPENAI_API_KEY = "environment-old-key"
                     model_config_service.apply_model_config_to_settings()
-                    self.assertEqual(model_config_service.settings.OPENAI_API_KEY, "")
+                    self.assertEqual(get_endpoint("script").api_key, "")
 
                     model_config_service.save_model_config(
                         {"script": {"base_url": "https://third.example.test/v1", "api_key": "new-key"}}
                     )
                     stored = model_config_service._load_raw()["script"]
                     self.assertNotIn(model_config_service.API_KEY_REQUIRED, stored)
-                    self.assertEqual(model_config_service.settings.OPENAI_API_KEY, "new-key")
+                    self.assertEqual(get_endpoint("script").api_key, "new-key")
         finally:
             model_config_service.settings.OPENAI_API_KEY = original_key
             model_config_service.settings.OPENAI_BASE_URL = original_base_url

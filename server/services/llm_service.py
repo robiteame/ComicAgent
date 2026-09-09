@@ -1,108 +1,78 @@
+"""基于 openai-chat 协议适配器的 LLM 客户端。
+
+通过 ``get_endpoint("script")`` 实时读取主端点、``get_endpoint("script_fallback")``
+读取备端点，保存模型/API 配置后新任务即生效。主端点调用失败且备端点可用
+（配置了 api_key 且端点标识不同）时自动回落。解析层保留 reasoning_content
+与 markdown 围栏 JSON 容错。
+"""
+
 import json
 import re
 
-from openai import AsyncOpenAI
-
 from config import settings
-
-
-def _provider_config() -> dict[str, dict[str, str | None]]:
-    return {
-        "openai": {
-            "api_key": settings.OPENAI_API_KEY,
-            "base_url": settings.OPENAI_BASE_URL or None,
-            "model": settings.OPENAI_MODEL,
-        },
-        "deepseek": {
-            "api_key": settings.OPENAI_API_KEY,
-            "base_url": settings.OPENAI_BASE_URL or "https://api.deepseek.com",
-            "model": settings.OPENAI_MODEL or "deepseek-chat",
-        },
-        "mimo": {
-            "api_key": settings.MIMO_API_KEY,
-            "base_url": settings.MIMO_BASE_URL,
-            "model": settings.MIMO_MODEL,
-            "vision_model": settings.MIMO_MULTIMODAL_MODEL,
-        },
-        "seeddance": {
-            "api_key": settings.SEEDDANCE_API_KEY,
-            "base_url": settings.SEEDDANCE_BASE_URL,
-            "model": settings.SEEDDANCE_MODEL,
-        },
-    }
+from services.providers.base import BaseAdapter
+from services.providers.endpoint import EndpointConfig, endpoint_identity, get_endpoint
+from services.providers.registry import get_adapter
 
 
 class LLMService:
-    """OpenAI-compatible LLM client with provider aliases and JSON cleanup."""
+    """OpenAI 兼容协议 LLM 客户端：主/备端点自动回落 + JSON 清洗。"""
 
     def __init__(self):
-        self._client: AsyncOpenAI | None = None
-        self._fallback_client: AsyncOpenAI | None = None
+        self._adapters: dict[tuple, BaseAdapter] = {}
         self._sync_config()
 
+    @staticmethod
+    def _connection_key(endpoint: EndpointConfig | None) -> tuple | None:
+        if endpoint is None:
+            return None
+        return (endpoint.protocol, endpoint.base_url, endpoint.api_key, endpoint.auth_style)
+
+    def _adapter_for(self, endpoint: EndpointConfig) -> BaseAdapter:
+        key = self._connection_key(endpoint)
+        adapter = self._adapters.get(key)
+        if adapter is None:
+            adapter = get_adapter("script", endpoint.protocol)(endpoint)
+            self._adapters[key] = adapter
+        return adapter
+
     def _sync_config(self) -> None:
-        """实时从 settings 读取配置，保证保存模型/API 配置后新任务即生效。
+        """实时从端点配置读取，保证保存模型/API 配置后新任务即生效。"""
+        endpoint = get_endpoint("script")
+        fallback = get_endpoint("script_fallback")
+        # 备端点必须配置了密钥、且与主端点不是同一个服务地址时才参与回落。
+        if not fallback.api_key or endpoint_identity(fallback.base_url) == endpoint_identity(endpoint.base_url):
+            fallback = None
 
-        当关键连接参数（provider / key / base_url）变化时，丢弃已缓存的客户端，
-        下次调用时按最新配置重新创建。
-        """
-        provider = (settings.LLM_PROVIDER or "openai").lower()
-        configs = _provider_config()
-        cfg = configs.get(provider, configs["openai"])
-        api_key = cfg["api_key"] or ""
-        base_url = cfg["base_url"]
+        self._endpoint = endpoint
+        self._fallback_endpoint = fallback
+        self.model = endpoint.model or "gpt-4o-mini"
+        self.vision_model = endpoint.param("vision_model") or self.model
+        self.max_tokens = self._int_param(endpoint.param("max_tokens"), settings.LLM_MAX_TOKENS)
+        self.last_provider_used = self._endpoint_label(endpoint)
 
-        if (
-            getattr(self, "provider", None) != provider
-            or getattr(self, "_api_key", None) != api_key
-            or getattr(self, "_base_url", None) != base_url
-        ):
-            self._client = None
+    @staticmethod
+    def _int_param(value, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
 
-        self.provider = provider
-        self.model = cfg["model"] or "gpt-4o-mini"
-        self.vision_model = cfg.get("vision_model") or self.model
-        self._api_key = api_key
-        self._base_url = base_url
-        self.max_tokens = settings.LLM_MAX_TOKENS
-        self.last_provider_used = self.provider
-
-        new_fallback = self._build_fallback_config()
-        if new_fallback != getattr(self, "_fallback_cfg", None):
-            self._fallback_client = None
-        self._fallback_cfg = new_fallback
+    @staticmethod
+    def _endpoint_label(endpoint: EndpointConfig) -> str:
+        return f"{endpoint.protocol}:{endpoint.model or 'default'}"
 
     @property
     def available(self) -> bool:
         self._sync_config()
-        return bool(self._api_key or self._fallback_cfg)
+        return bool(self._endpoint.api_key or self._fallback_endpoint)
 
     @property
-    def client(self) -> AsyncOpenAI:
+    def client(self):
         self._sync_config()
         if not self.available:
             raise RuntimeError("未配置可用的 LLM API Key")
-        if self._client is None:
-            default_headers = {"api-key": self._api_key} if self.provider == "mimo" else None
-            self._client = AsyncOpenAI(
-                api_key=self._api_key,
-                base_url=self._base_url,
-                timeout=60,
-                default_headers=default_headers,
-            )
-        return self._client
-
-    @property
-    def fallback_client(self) -> AsyncOpenAI:
-        if not self._fallback_cfg:
-            raise RuntimeError("未配置可用的 LLM 兜底接口")
-        if self._fallback_client is None:
-            self._fallback_client = AsyncOpenAI(
-                api_key=self._fallback_cfg["api_key"] or "",
-                base_url=self._fallback_cfg["base_url"],
-                timeout=60,
-            )
-        return self._fallback_client
+        return self._adapter_for(self._endpoint).client
 
     async def call(
         self,
@@ -117,9 +87,9 @@ class LLMService:
             {"role": "user", "content": user_prompt},
         ]
         response = await self._completion_with_fallback(
-            lambda client, model: client.chat.completions.create(
-                model=model_override or model,
+            lambda adapter, model: adapter.complete(
                 messages=messages,
+                model=model_override or model,
                 temperature=temperature,
                 max_tokens=self.max_tokens,
             ),
@@ -166,53 +136,35 @@ class LLMService:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
-        try:
-            return await self._completion_with_fallback(
-                lambda client, model: client.chat.completions.create(
-                    model=model_override or model,
-                    messages=messages,
-                    temperature=temperature,
-                    response_format={"type": "json_object"},
-                    max_tokens=self.max_tokens,
-                ),
-                allow_fallback=allow_fallback,
-            )
-        except Exception as exc:
-            if "response_format" not in str(exc):
-                raise
-            return await self._completion_with_fallback(
-                lambda client, model: client.chat.completions.create(
-                    model=model_override or model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=self.max_tokens,
-                ),
-                allow_fallback=allow_fallback,
-            )
+        return await self._completion_with_fallback(
+            lambda adapter, model: adapter.complete_json(
+                messages=messages,
+                model=model_override or model,
+                temperature=temperature,
+                max_tokens=self.max_tokens,
+            ),
+            allow_fallback=allow_fallback,
+        )
 
     async def _completion_with_fallback(self, create_completion, allow_fallback: bool = True):
+        self._sync_config()
         try:
-            response = await create_completion(self.client, self.model)
-            self.last_provider_used = self.provider
+            response = await create_completion(self._adapter_for(self._endpoint), self.model)
+            self.last_provider_used = self._endpoint_label(self._endpoint)
             return response
         except Exception as primary_error:
-            if not allow_fallback or not self._fallback_cfg:
+            fallback = self._fallback_endpoint
+            if not allow_fallback or fallback is None:
                 raise
-            response = await create_completion(self.fallback_client, self._fallback_cfg["model"])
-            self.last_provider_used = self._fallback_cfg["provider"]
+            try:
+                response = await create_completion(
+                    self._adapter_for(fallback), fallback.model or self.model
+                )
+            except Exception as fallback_error:
+                # 备端点也失败时优先暴露主端点错误（更具诊断价值）。
+                raise primary_error from fallback_error
+            self.last_provider_used = self._endpoint_label(fallback)
             return response
-
-    def _build_fallback_config(self) -> dict[str, str | None] | None:
-        if not settings.OPENAI_API_KEY:
-            return None
-        if self.provider in {"openai", "deepseek"} and settings.OPENAI_API_KEY == self._api_key:
-            return None
-        return {
-            "provider": "deepseek",
-            "api_key": settings.OPENAI_API_KEY,
-            "base_url": settings.OPENAI_BASE_URL or "https://api.deepseek.com",
-            "model": settings.OPENAI_MODEL or "deepseek-chat",
-        }
 
     def _loads_json(self, content: str) -> dict:
         try:

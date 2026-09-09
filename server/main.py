@@ -37,8 +37,10 @@ async def lifespan(app: FastAPI):
         print(f"已标记 {interrupted} 个服务重启中断的后台任务")
     print("数据库初始化完成")
     try:
-        from services.model_config_service import apply_model_config_to_settings
+        from services.model_config_service import apply_model_config_to_settings, migrate_store
 
+        if migrate_store():
+            print("旧版模型配置已自动迁移为端点式新格式")
         apply_model_config_to_settings()
         print("模型与 API 自定义配置已加载")
     except Exception as exc:  # noqa: BLE001

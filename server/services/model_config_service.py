@@ -1,14 +1,19 @@
-"""模型与 API 自定义配置服务。
+"""模型与 API 自定义配置服务（端点式存储）。
 
-提供剧本(LLM)/图像/视频/配音四类生成模型的接口地址、密钥、模型名等可视化配置的
-持久化与运行时生效能力。配置以全局 JSON 形式保存在 ``data/model_api_config.json``，
-保存后立即覆盖到全局 ``settings`` 单例；各生成服务在调用时实时读取 ``settings``，
-因此新任务会自动加载最新配置，而已生成的存量产物不受影响。
+四类能力（script/image/video/voice，另含可选的 script_fallback 备用 LLM 端点）
+各持久化一份完整端点配置：protocol/base_url/api_key/model/auth_style/params，
+以全局 JSON 形式保存在 ``data/model_api_config.json``（原子写 + 0600）。
 
-设计要点：
-- 仅当某字段填写了非空值时才覆盖 ``settings``，留空表示沿用 ``.env`` / 默认值，
-  避免误清空已有密钥。
-- GET 返回「生效值」（持久化覆盖优先，否则回退到当前 settings），便于前端回填表单。
+各生成服务通过 ``services.providers.endpoint.get_endpoint(capability)`` 实时读取
+端点配置，因此保存后新任务立即生效、无需重启；已生成的存量产物不受影响。
+
+安全与兼容：
+- base_url SSRF 校验、api_key 掩码回显（``********``）、换端点未换 key 时置
+  ``api_key_required`` 并清空相关密钥的逻辑全部保留。
+- 旧版「provider 字符串 + 平铺字段」JSON 由 ``migrate_store`` 在首次启动时自动
+  迁移为新端点结构；旧 .env 字段继续作为默认值来源（JSON 覆盖 > .env > 默认值）。
+- GET 额外回显 ``provider``（等于 protocol）及平铺参数字段，保证旧前端在迁移期
+  可正常回填与保存。
 """
 
 from __future__ import annotations
@@ -23,20 +28,24 @@ from typing import Any
 from urllib.parse import urlparse
 
 from config import settings
+from services.providers.endpoint import (
+    API_KEY_REQUIRED,
+    CAPABILITIES,
+    FLAT_PARAM_FIELDS,
+    KNOWN_PROTOCOLS,
+    endpoint_from_stored,
+    normalize_protocol,
+    protocol_family,
+)
 
-
-# 四类模型的可视化字段定义。每个字段映射到一个或多个 settings 属性，
-# apply 时根据 provider 选择正确的目标属性，保证沿用现有调用链路。
-CATEGORIES = ("script", "image", "video", "voice")
 MASKED_SECRET = "********"
-API_KEY_REQUIRED = "api_key_required"
 
 
 def _store_path():
     return settings.DATA_DIR / "model_api_config.json"
 
 
-def _load_raw() -> dict[str, Any]:
+def _read_raw() -> dict[str, Any]:
     path = _store_path()
     if not path.exists():
         return {}
@@ -63,6 +72,67 @@ def _save_raw(data: dict[str, Any]) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def normalize_category(capability: str, payload: dict) -> dict:
+    """把任意版本的类别数据归一化为新端点结构（幂等）。"""
+    data = payload if isinstance(payload, dict) else {}
+    legacy_provider = str(data.get("provider") or "").strip().lower()
+    protocol = str(data.get("protocol") or "").strip().lower() or legacy_provider
+    normalized: dict[str, Any] = {"protocol": normalize_protocol(capability, protocol)}
+
+    if capability.startswith("script"):
+        # 旧版 mimo provider 需要 api-key 请求头鉴权。
+        auth_style = str(data.get("auth_style") or "").strip().lower()
+        if not auth_style and legacy_provider == "mimo":
+            auth_style = "api-key-header"
+        if auth_style:
+            normalized["auth_style"] = auth_style
+
+    for field in ("base_url", "api_key", "model"):
+        if data.get(field) is not None:
+            normalized[field] = data[field]
+
+    params = dict(data.get("params") or {})
+    for name in FLAT_PARAM_FIELDS:
+        if name in data and name not in params and data[name] not in (None, ""):
+            params[name] = data[name]
+    if params:
+        normalized["params"] = params
+
+    if data.get(API_KEY_REQUIRED):
+        normalized[API_KEY_REQUIRED] = True
+    return normalized
+
+
+def _normalize_store(raw: dict[str, Any]) -> dict[str, Any]:
+    return {
+        capability: normalize_category(capability, payload)
+        for capability, payload in raw.items()
+        if isinstance(payload, dict)
+    }
+
+
+def _load_raw() -> dict[str, Any]:
+    """读取持久化配置（归一化为新端点结构后返回）。"""
+    return _normalize_store(_read_raw())
+
+
+def migrate_store() -> bool:
+    """把旧格式存储原地迁移为新端点结构。返回是否发生了改写。"""
+    raw = _read_raw()
+    normalized = _normalize_store(raw)
+    if normalized == raw:
+        return False
+    _save_raw(normalized)
+    return True
+
+
+def stored_category(capability: str) -> dict[str, Any]:
+    """返回某能力归一化后的持久化端点数据（可能为空 dict）。"""
+    if capability not in CAPABILITIES:
+        raise ValueError(f"未知能力类别: {capability}，可选值: {', '.join(CAPABILITIES)}")
+    return _load_raw().get(capability) or {}
 
 
 def _clean(value: Any) -> str:
@@ -140,23 +210,9 @@ def _validate_base_url(value: Any) -> str:
 
 
 def _endpoint_identity(value: Any) -> tuple[str, str, int | None] | None:
-    text = _clean(value)
-    if not text:
-        return None
-    parsed = urlparse(text)
-    try:
-        port = parsed.port
-    except ValueError:
-        return None
-    if not parsed.scheme or not parsed.hostname:
-        return None
-    host = parsed.hostname.rstrip(".").lower()
-    try:
-        host = host.encode("idna").decode("ascii")
-    except UnicodeError:
-        return None
-    effective_port = port if port is not None else {"http": 80, "https": 443}.get(parsed.scheme.lower())
-    return parsed.scheme.lower(), host, effective_port
+    from services.providers.endpoint import endpoint_identity
+
+    return endpoint_identity(value)
 
 
 # ---------------------------------------------------------------------------
@@ -172,67 +228,28 @@ def _mask_secret(value: Any) -> str:
 
 
 def _effective(*, mask_secrets: bool = True) -> dict[str, dict[str, Any]]:
-    stored = _load_raw()
-
-    def pick(category: str, field: str, fallback: Any) -> Any:
-        cat = stored.get(category) or {}
-        if field == "api_key" and cat.get(API_KEY_REQUIRED):
-            return ""
-        val = cat.get(field)
-        if val is None or (isinstance(val, str) and not val.strip()):
-            return fallback
-        return val
-
-    result = {
-        "script": {
-            "provider": pick("script", "provider", settings.LLM_PROVIDER or "openai"),
-            "api_key": pick(
-                "script",
-                "api_key",
-                settings.MIMO_API_KEY if (settings.LLM_PROVIDER or "").lower() == "mimo" else settings.OPENAI_API_KEY,
-            ),
-            "base_url": pick(
-                "script",
-                "base_url",
-                settings.MIMO_BASE_URL if (settings.LLM_PROVIDER or "").lower() == "mimo" else settings.OPENAI_BASE_URL,
-            ),
-            "model": pick(
-                "script",
-                "model",
-                settings.MIMO_MODEL if (settings.LLM_PROVIDER or "").lower() == "mimo" else settings.OPENAI_MODEL,
-            ),
-            "max_tokens": pick("script", "max_tokens", settings.LLM_MAX_TOKENS),
-        },
-        "image": {
-            "provider": pick("image", "provider", settings.IMAGE_PROVIDER or "local"),
-            "api_key": pick("image", "api_key", settings.ARK_API_KEY or settings.SEEDREAM_API_KEY),
-            "base_url": pick("image", "base_url", settings.SEEDDANCE_BASE_URL),
-            "model": pick("image", "model", settings.SEEDREAM_MODEL),
-            "image_size": pick("image", "image_size", settings.SEEDREAM_IMAGE_SIZE),
-        },
-        "video": {
-            "provider": pick("video", "provider", settings.VIDEO_PROVIDER),
-            "api_key": pick("video", "api_key", settings.SEEDDANCE_API_KEY or settings.ARK_API_KEY),
-            "base_url": pick("video", "base_url", settings.SEEDDANCE_BASE_URL),
-            "model": pick("video", "model", settings.SEEDDANCE_MODEL),
-        },
-        "voice": {
-            "api_key": pick("voice", "api_key", settings.MIMO_API_KEY),
-            "base_url": pick("voice", "base_url", settings.MIMO_BASE_URL),
-            "model": pick("voice", "model", settings.MIMO_TTS_MODEL),
-            "voice": pick("voice", "voice", settings.MIMO_TTS_VOICE),
-            "format": pick("voice", "format", settings.MIMO_TTS_FORMAT),
-        },
-    }
-    if mask_secrets:
-        for category in result.values():
-            if "api_key" in category:
-                category["api_key"] = _mask_secret(category["api_key"])
+    result: dict[str, dict[str, Any]] = {}
+    for capability in CAPABILITIES:
+        endpoint = endpoint_from_stored(capability, _load_raw().get(capability) or {})
+        data: dict[str, Any] = {
+            "protocol": endpoint.protocol,
+            "auth_style": endpoint.auth_style,
+            "base_url": endpoint.base_url,
+            "model": endpoint.model,
+            "api_key": _mask_secret(endpoint.api_key) if mask_secrets else endpoint.api_key,
+            "params": dict(endpoint.params),
+            # 旧版前端兼容镜像：provider 等价于 protocol，参数字段平铺到顶层。
+            "provider": endpoint.protocol,
+        }
+        for name, value in endpoint.params.items():
+            if name in FLAT_PARAM_FIELDS:
+                data[name] = value
+        result[capability] = data
     return result
 
 
 def get_model_config() -> dict[str, Any]:
-    """返回四类模型的生效配置，供前端回填。"""
+    """返回各能力端点的生效配置，供前端回填。"""
     return {"categories": _effective(mask_secrets=True)}
 
 
@@ -241,18 +258,28 @@ def get_model_config() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _validate_protocol(capability: str, protocol: str) -> str:
+    known = KNOWN_PROTOCOLS.get(protocol_family(capability), ())
+    if protocol not in known:
+        raise ValueError(
+            f"未知的 {capability} 协议: {protocol or '<empty>'}，可选值: {', '.join(known) if known else '（暂无）'}"
+        )
+    return protocol
+
+
 def save_model_config(data: dict[str, Any]) -> dict[str, Any]:
-    """合并保存四类模型配置并立即应用到运行时 settings。"""
+    """合并保存各能力端点配置并立即应用到运行时。"""
     stored = _load_raw()
     previous_effective = _effective(mask_secrets=False)
     incoming = data.get("categories") if isinstance(data.get("categories"), dict) else data
-    for category in CATEGORIES:
-        if category in (incoming or {}):
-            payload = incoming[category] or {}
+    for capability in CAPABILITIES:
+        if capability in (incoming or {}):
+            payload = incoming[capability] or {}
             if isinstance(payload, dict):
                 # A masked/empty value from the UI means "leave the existing
                 # secret untouched"; only a genuinely new key replaces it.
-                sanitized_payload = dict(payload)
+                sanitized_payload = normalize_category(capability, payload)
+                _validate_protocol(capability, sanitized_payload.get("protocol", ""))
                 explicit_api_key = bool(
                     "api_key" in sanitized_payload
                     and _clean(sanitized_payload["api_key"])
@@ -265,15 +292,15 @@ def save_model_config(data: dict[str, Any]) -> dict[str, Any]:
                     or _clean(sanitized_payload["api_key"]) == MASKED_SECRET
                 ):
                     sanitized_payload.pop("api_key", None)
-                merged = {**(stored.get(category) or {}), **sanitized_payload}
-                old_endpoint = _endpoint_identity(previous_effective.get(category, {}).get("base_url"))
+                merged = {**(stored.get(capability) or {}), **sanitized_payload}
+                old_endpoint = _endpoint_identity(previous_effective.get(capability, {}).get("base_url"))
                 new_endpoint = _endpoint_identity(merged.get("base_url"))
                 if _clean(sanitized_payload.get("base_url")) and old_endpoint != new_endpoint and not explicit_api_key:
                     merged.pop("api_key", None)
                     merged[API_KEY_REQUIRED] = True
                 elif explicit_api_key:
                     merged.pop(API_KEY_REQUIRED, None)
-                stored[category] = {k: v for k, v in merged.items() if k is not None}
+                stored[capability] = {k: v for k, v in merged.items() if k is not None}
     _save_raw(stored)
     apply_model_config_to_settings()
     return get_model_config()
@@ -306,52 +333,34 @@ def _set_base_url(field: str, value: Any) -> None:
 
 
 def apply_model_config_to_settings(config: dict[str, Any] | None = None) -> None:
-    """将持久化配置覆盖到全局 settings 单例。
+    """将持久化端点配置覆盖到全局 settings。
 
-    各生成服务调用时实时读取 settings，因此覆盖后新任务即生效。
+    LLM 服务已直接读取 ``get_endpoint("script" / "script_fallback")``，script
+    类别无需再写入 settings；image/video/voice 服务迁移完成前，这里继续按
+    protocol 把端点数据映射到对应的旧 settings 字段，保持热生效行为不变。
     """
-    raw = config if config is not None else _load_raw()
+    raw = _normalize_store(config) if config is not None else _load_raw()
     if not raw:
         return
 
-    script = raw.get("script") or {}
-    if script:
-        provider = _clean(script.get("provider")).lower()
-        if provider:
-            settings.LLM_PROVIDER = provider
-        active = provider or (settings.LLM_PROVIDER or "").lower()
-        if active == "mimo":
-            _set_api_key("MIMO_API_KEY", script)
-            _set_base_url("MIMO_BASE_URL", script.get("base_url"))
-            _set("MIMO_MODEL", script.get("model"))
-        else:
-            _set_api_key("OPENAI_API_KEY", script)
-            _set_base_url("OPENAI_BASE_URL", script.get("base_url"))
-            _set("OPENAI_MODEL", script.get("model"))
-        max_tokens = script.get("max_tokens")
-        if max_tokens not in (None, "", 0):
-            try:
-                settings.LLM_MAX_TOKENS = int(max_tokens)
-            except (TypeError, ValueError):
-                pass
-
     image = raw.get("image") or {}
     if image:
-        provider = _clean(image.get("provider")).lower()
-        if provider:
-            settings.IMAGE_PROVIDER = provider
-        if provider == "stability":
+        protocol = image.get("protocol") or ""
+        if protocol == "stability":
+            settings.IMAGE_PROVIDER = "stability"
             _set_api_key("STABILITY_API_KEY", image)
             _set_base_url("STABILITY_API_URL", image.get("base_url"))
-        else:
+        elif protocol == "ark-seedream":
+            settings.IMAGE_PROVIDER = "doubao-seedream"
             _set_api_key("ARK_API_KEY", image)
             _set_base_url("SEEDDANCE_BASE_URL", image.get("base_url"))
-        _set("SEEDREAM_MODEL", image.get("model"))
-        _set("SEEDREAM_IMAGE_SIZE", image.get("image_size"))
+            _set("SEEDREAM_MODEL", image.get("model"))
+            _set("SEEDREAM_IMAGE_SIZE", (image.get("params") or {}).get("image_size"))
+        elif protocol == "placeholder":
+            settings.IMAGE_PROVIDER = "local"
 
     video = raw.get("video") or {}
     if video:
-        _set("VIDEO_PROVIDER", video.get("provider"))
         _set_api_key("SEEDDANCE_API_KEY", video)
         _set_base_url("SEEDDANCE_BASE_URL", video.get("base_url"))
         _set("SEEDDANCE_MODEL", video.get("model"))
@@ -361,16 +370,14 @@ def apply_model_config_to_settings(config: dict[str, Any] | None = None) -> None
         _set_api_key("MIMO_API_KEY", voice)
         _set_base_url("MIMO_BASE_URL", voice.get("base_url"))
         _set("MIMO_TTS_MODEL", voice.get("model"))
-        _set("MIMO_TTS_VOICE", voice.get("voice"))
-        _set("MIMO_TTS_FORMAT", voice.get("format"))
+        voice_params = voice.get("params") or {}
+        _set("MIMO_TTS_VOICE", voice_params.get("voice"))
+        _set("MIMO_TTS_FORMAT", voice_params.get("format"))
 
     # Some services deliberately fall back across related provider keys, and
-    # image/video plus script/voice share base URL settings. Enforce the marker
-    # after every category has been applied so a later category cannot restore
-    # an old credential for an endpoint that was changed without a new key.
-    if script.get(API_KEY_REQUIRED):
-        active = _clean(script.get("provider")).lower() or (settings.LLM_PROVIDER or "").lower()
-        setattr(settings, "MIMO_API_KEY" if active == "mimo" else "OPENAI_API_KEY", "")
+    # image/video share base URL settings. Enforce the marker after every
+    # category has been applied so a later category cannot restore an old
+    # credential for an endpoint that was changed without a new key.
     if image.get(API_KEY_REQUIRED):
         for field in ("ARK_API_KEY", "SEEDDANCE_API_KEY", "SEEDREAM_API_KEY", "STABILITY_API_KEY"):
             setattr(settings, field, "")
@@ -385,4 +392,6 @@ __all__ = [
     "get_model_config",
     "save_model_config",
     "apply_model_config_to_settings",
+    "migrate_store",
+    "stored_category",
 ]

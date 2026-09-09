@@ -1,29 +1,48 @@
 {
   "script": {
-    "provider": "mimo",
+    "protocol": "openai-chat",
+    "auth_style": "bearer",
     "api_key": "",
-    "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
-    "model": "mimo-v2.5",
-    "max_tokens": 4096
+    "base_url": "https://api.openai.com/v1",
+    "model": "gpt-4o",
+    "params": {
+      "max_tokens": 4096
+    }
+  },
+  "script_fallback": {
+    "protocol": "openai-chat",
+    "auth_style": "bearer",
+    "api_key": "",
+    "base_url": "https://api.deepseek.com",
+    "model": "deepseek-chat",
+    "params": {}
   },
   "image": {
-    "provider": "Doubao-Seedream-4.5",
+    "protocol": "ark-seedream",
     "api_key": "",
     "base_url": "https://ark.cn-beijing.volces.com/api/v3",
-    "model": "Doubao-Seedream-4.5",
-    "image_size": "1440x2560"
+    "model": "doubao-seedream-5.0-lite",
+    "params": {
+      "image_size": "1440x2560"
+    }
   },
   "video": {
-    "provider": "Doubao-Seedance-1.5-pro",
+    "protocol": "ark-seedance",
     "api_key": "",
     "base_url": "https://ark.cn-beijing.volces.com/api/v3",
-    "model": "doubao-seedance-1-5-pro-251215"
+    "model": "doubao-seedance-1-5-pro-251215",
+    "params": {
+      "audio_mode": "tts"
+    }
   },
   "voice": {
+    "protocol": "mimo-tts",
     "api_key": "",
     "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
     "model": "mimo-v2.5-tts",
-    "voice": "冰糖",
-    "format": "wav"
+    "params": {
+      "voice": "冰糖",
+      "format": "wav"
+    }
   }
 }

@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config import settings
 from services.llm_service import LLMService
+from services.providers.endpoint import get_endpoint
 from services.tts_service import TTSService
 from services.video_service import SeedanceVideoService
 
@@ -30,21 +31,37 @@ DIAGNOSTIC_SHOT_ID = f"diagnostic_single_shot_{RUN_ID}"
 
 
 def _print_config() -> None:
+    script = get_endpoint("script")
+    fallback = get_endpoint("script_fallback")
+    video = get_endpoint("video")
+    voice = get_endpoint("voice")
     print("CONFIG")
-    print(f"  LLM_PROVIDER={settings.LLM_PROVIDER}")
-    print(f"  MIMO_MODEL={settings.MIMO_MODEL}")
-    print(f"  MIMO_MULTIMODAL_MODEL={settings.MIMO_MULTIMODAL_MODEL}")
-    print(f"  MIMO_TTS_MODEL={settings.MIMO_TTS_MODEL}")
-    print(f"  MIMO_KEY_PRESENT={bool(settings.MIMO_API_KEY)}")
-    print(f"  VIDEO_PROVIDER={settings.VIDEO_PROVIDER}")
-    print(f"  SEEDDANCE_BASE_URL={settings.SEEDDANCE_BASE_URL}")
-    print(f"  SEEDDANCE_MODEL={settings.SEEDDANCE_MODEL}")
-    print(f"  SEEDDANCE_KEY_PRESENT={bool(settings.SEEDDANCE_API_KEY or settings.ARK_API_KEY or settings.SEEDREAM_API_KEY)}")
-    print("  TTS_BACKEND=mimo_builtin")
+    print(
+        f"  SCRIPT protocol={script.protocol} base_url={script.base_url} model={script.model} "
+        f"auth={script.auth_style} key_present={bool(script.api_key)}"
+    )
+    print(
+        f"  SCRIPT_FALLBACK base_url={fallback.base_url} model={fallback.model} key_present={bool(fallback.api_key)}"
+    )
+    print(
+        f"  VIDEO protocol={video.protocol} base_url={video.base_url} model={video.model} "
+        f"key_present={bool(video.api_key)}"
+    )
+    print(
+        f"  VOICE protocol={voice.protocol} base_url={voice.base_url} model={voice.model} "
+        f"key_present={bool(voice.api_key)}"
+    )
     print(f"  LEGACY_TTS_PROVIDER={settings.TTS_PROVIDER}")
 
 
 async def _check_mimo_storyboard() -> dict:
+    script_endpoint = get_endpoint("script")
+    # 多模态分镜优先用端点配置的 vision 模型，缺省回落到端点主模型 / 旧 MIMO 字段。
+    vision_model = (
+        script_endpoint.param("vision_model")
+        or script_endpoint.model
+        or settings.MIMO_MULTIMODAL_MODEL
+    )
     result = await LLMService().call_json(
         "你是漫剧编导，只输出 JSON，不要 Markdown。",
         """
@@ -67,7 +84,7 @@ JSON 结构：
         temperature=0,
         max_retries=0,
         allow_fallback=False,
-        model_override=settings.MIMO_MULTIMODAL_MODEL,
+        model_override=vision_model,
     )
     shot = result.get("shot") or {}
     if not result.get("script") or not shot.get("scene_description") or not shot.get("dialogue"):
