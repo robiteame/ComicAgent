@@ -14,7 +14,8 @@ if str(_SERVER_DIR) not in sys.path:
 from test_environment import TEST_ROOT  # noqa: F401,E402
 
 from services.ffmpeg_service import FFmpegService
-from services.video_service import SeedanceVideoService
+from services.providers.endpoint import EndpointConfig
+from services.providers.video_ark_seedance import ArkSeedanceVideoAdapter
 
 
 class _BlockingProcess:
@@ -66,7 +67,7 @@ class SubprocessCleanupTests(unittest.TestCase):
             with tempfile.TemporaryDirectory(prefix="comic-agent-frame-") as root:
                 with patch("asyncio.create_subprocess_exec", new=create_process):
                     task = asyncio.create_task(
-                        SeedanceVideoService()._extract_last_frame(
+                        ArkSeedanceVideoAdapter(EndpointConfig(protocol="ark-seedance"))._extract_last_frame(
                             Path(root) / "video.mp4",
                             Path(root) / "frame.png",
                         )

@@ -67,19 +67,23 @@ class ModelConfigSecurityTests(unittest.TestCase):
         self.assertNotEqual(identity("http://api.example.test"), identity("https://api.example.test"))
         self.assertNotEqual(identity("https://api.example.test"), identity("https://api.example.test:8443"))
 
-    def test_image_endpoint_marker_clears_all_fallback_keys(self) -> None:
-        fields = ("ARK_API_KEY", "SEEDDANCE_API_KEY", "SEEDREAM_API_KEY", "STABILITY_API_KEY")
-        originals = {field: getattr(model_config_service.settings, field) for field in fields}
-        try:
-            for field in fields:
-                setattr(model_config_service.settings, field, "old-key")
-            model_config_service.apply_model_config_to_settings(
-                {"image": {"provider": "stability", model_config_service.API_KEY_REQUIRED: True}}
-            )
-            self.assertTrue(all(getattr(model_config_service.settings, field) == "" for field in fields))
-        finally:
-            for field, value in originals.items():
-                setattr(model_config_service.settings, field, value)
+    def test_image_endpoint_marker_clears_effective_key(self) -> None:
+        from services.providers.endpoint import get_endpoint
+
+        with tempfile.TemporaryDirectory(prefix="comic-agent-config-") as root:
+            with patch.object(model_config_service.settings, "DATA_DIR", Path(root)):
+                model_config_service._save_raw(
+                    {
+                        "image": {
+                            "protocol": "stability",
+                            "api_key": "old-key",
+                            model_config_service.API_KEY_REQUIRED: True,
+                        }
+                    }
+                )
+                # 换端点未换 key 的标记必须让生效端点返回空密钥。
+                self.assertEqual(get_endpoint("image").api_key, "")
+                self.assertEqual(model_config_service.get_model_config()["categories"]["image"]["api_key"], "")
 
     def test_endpoint_change_requires_explicit_new_api_key(self) -> None:
         public_dns = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))]

@@ -1,0 +1,95 @@
+"""火山方舟 Seedream 图像适配器（原 ImageService._call_seedream 迁入）。
+
+支持多参考图输入（capabilities.reference_images=True）；model 只来自端点配置，
+不再把 provider 字符串当模型名兜底。
+"""
+
+from __future__ import annotations
+
+import httpx
+
+from services.providers.base import BaseAdapter, ImageCapabilities, ImageRequest
+from services.providers.image_common import extract_image_bytes, read_bounded_response
+
+
+class ArkSeedreamImageAdapter(BaseAdapter):
+    capabilities = ImageCapabilities(reference_images=True, requires_credentials=True)
+
+    async def generate(self, request: ImageRequest) -> bytes:
+        errors: list[str] = []
+        models = self._model_candidates()
+        sizes = [
+            request.size,
+            self.endpoint.param("image_size"),
+            "2048x2048",
+            "1440x2560",
+            "2K",
+        ]
+        base_url = self.endpoint.base_url.rstrip("/")
+
+        async with httpx.AsyncClient(timeout=180) as client:
+            for model in models:
+                for size in list(dict.fromkeys(size for size in sizes if size)):
+                    payload = self._payload(model, request, size)
+                    try:
+                        request_message = client.build_request(
+                            "POST",
+                            f"{base_url}/images/generations",
+                            headers={
+                                "Authorization": f"Bearer {self.endpoint.api_key}",
+                                "Content-Type": "application/json",
+                            },
+                            json=payload,
+                        )
+                        response = await client.send(request_message, stream=True)
+                        response_bytes = await read_bounded_response(response)
+                        if response.status_code in {401, 403}:
+                            raise PermissionError(response_bytes.decode("utf-8", errors="replace")[:600])
+                        if response.status_code >= 400:
+                            errors.append(
+                                f"{model} {size}: {response.status_code} {response_bytes.decode('utf-8', errors='replace')[:400]}"
+                            )
+                            continue
+                        return await extract_image_bytes(client, response, response_bytes)
+                    except PermissionError as exc:
+                        raise RuntimeError(f"火山方舟鉴权失败，请确认 API Key 和模型权限: {exc}") from exc
+                    except Exception as exc:
+                        errors.append(f"{model} {size}: {exc}")
+
+        raise RuntimeError("Seedream 图像生成失败: " + " | ".join(errors[-4:]))
+
+    def _payload(self, model: str, request: ImageRequest, size: str) -> dict:
+        payload = {
+            "model": model,
+            "prompt": f"{request.prompt}\nNegative prompt: {request.negative_prompt}",
+            "response_format": "b64_json",
+            "size": size,
+            "n": 1,
+            "seed": request.seed,
+            "watermark": False,
+            "output_format": "png",
+            "sequential_image_generation": "disabled",
+        }
+        if request.reference_images:
+            payload["image"] = request.reference_images[:8]
+        return payload
+
+    def _model_candidates(self) -> list[str]:
+        raw = self.endpoint.model
+        candidates: list[str] = []
+        if raw:
+            candidates.extend(
+                [
+                    raw,
+                    raw.replace(".", "-"),
+                    raw.replace(".0", "-0"),
+                ]
+            )
+        # 历史 API 兼容垫片：部分方舟网点仅识别带日期后缀的模型名。
+        candidates.extend(
+            [
+                "doubao-seedream-5-0-lite",
+                "doubao-seedream-5-0-lite-260128",
+            ]
+        )
+        return list(dict.fromkeys(candidates))

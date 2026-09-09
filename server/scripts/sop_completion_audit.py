@@ -20,6 +20,7 @@ from services.consistency_service import ConsistencyService
 from services.ffmpeg_service import FFmpegService
 from services.image_service import ImageService
 from services.video_service import SeedanceVideoService
+from services.providers.video_ark_seedance import ArkSeedanceVideoAdapter
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -242,9 +243,10 @@ def main() -> None:
         )
     )
     video_service_source = inspect.getsource(SeedanceVideoService)
+    seedance_adapter_source = inspect.getsource(ArkSeedanceVideoAdapter)
     checks.append(
         _assert(
-            '"role": "first_frame"' in video_service_source
+            '"role": "first_frame"' in seedance_adapter_source
             and "_validate_video_references" in video_service_source
             and "text_locked_reference_fallback" not in video_service_source,
             "seedance_first_frame_reference_without_text_fallback",
@@ -253,7 +255,7 @@ def main() -> None:
     )
     checks.append(
         _assert(
-            video_service._duration_for_model() == 5,
+            ArkSeedanceVideoAdapter.capabilities.fixed_duration == 5,
             "seedance_verified_duration_gate",
             "duration=5",
         )

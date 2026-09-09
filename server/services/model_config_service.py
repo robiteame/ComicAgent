@@ -84,7 +84,7 @@ def normalize_category(capability: str, payload: dict) -> dict:
     if capability.startswith("script"):
         # 旧版 mimo provider 需要 api-key 请求头鉴权。
         auth_style = str(data.get("auth_style") or "").strip().lower()
-        if not auth_style and legacy_provider == "mimo":
+        if not auth_style and legacy_provider in {"mimo"}:
             auth_style = "api-key-header"
         if auth_style:
             normalized["auth_style"] = auth_style
@@ -315,77 +315,16 @@ def _set(field: str, value: Any) -> None:
     setattr(settings, field, value)
 
 
-def _set_api_key(field: str, category: dict[str, Any]) -> None:
-    if category.get(API_KEY_REQUIRED):
-        setattr(settings, field, "")
-        return
-    _set(field, category.get("api_key"))
-
-
-def _set_base_url(field: str, value: Any) -> None:
-    if value is None or (isinstance(value, str) and not value.strip()):
-        return
-    try:
-        _set(field, _validate_base_url(value))
-    except ValueError:
-        # Ignore unsafe persisted values and keep the environment/default.
-        return
-
-
 def apply_model_config_to_settings(config: dict[str, Any] | None = None) -> None:
-    """将持久化端点配置覆盖到全局 settings。
+    """配置生效钩子（启动 / 保存后调用）。
 
-    LLM 服务已直接读取 ``get_endpoint("script" / "script_fallback")``，script
-    类别无需再写入 settings；image/video/voice 服务迁移完成前，这里继续按
-    protocol 把端点数据映射到对应的旧 settings 字段，保持热生效行为不变。
+    自适配器化改造起，LLM/图像/视频/语音服务均通过
+    ``services.providers.endpoint.get_endpoint(capability)`` 实时读取端点配置，
+    保存即生效、无需重启，因此不再需要把配置覆盖到 settings。本函数保留用于：
+    - 启动时触发旧格式存储到端点式新格式的一次性迁移；
+    - 兼容既有调用点（main.py lifespan / save_model_config / 旧测试）。
     """
-    raw = _normalize_store(config) if config is not None else _load_raw()
-    if not raw:
-        return
-
-    image = raw.get("image") or {}
-    if image:
-        protocol = image.get("protocol") or ""
-        if protocol == "stability":
-            settings.IMAGE_PROVIDER = "stability"
-            _set_api_key("STABILITY_API_KEY", image)
-            _set_base_url("STABILITY_API_URL", image.get("base_url"))
-        elif protocol == "ark-seedream":
-            settings.IMAGE_PROVIDER = "doubao-seedream"
-            _set_api_key("ARK_API_KEY", image)
-            _set_base_url("SEEDDANCE_BASE_URL", image.get("base_url"))
-            _set("SEEDREAM_MODEL", image.get("model"))
-            _set("SEEDREAM_IMAGE_SIZE", (image.get("params") or {}).get("image_size"))
-        elif protocol == "placeholder":
-            settings.IMAGE_PROVIDER = "local"
-
-    video = raw.get("video") or {}
-    if video:
-        _set_api_key("SEEDDANCE_API_KEY", video)
-        _set_base_url("SEEDDANCE_BASE_URL", video.get("base_url"))
-        _set("SEEDDANCE_MODEL", video.get("model"))
-
-    voice = raw.get("voice") or {}
-    if voice:
-        _set_api_key("MIMO_API_KEY", voice)
-        _set_base_url("MIMO_BASE_URL", voice.get("base_url"))
-        _set("MIMO_TTS_MODEL", voice.get("model"))
-        voice_params = voice.get("params") or {}
-        _set("MIMO_TTS_VOICE", voice_params.get("voice"))
-        _set("MIMO_TTS_FORMAT", voice_params.get("format"))
-
-    # Some services deliberately fall back across related provider keys, and
-    # image/video share base URL settings. Enforce the marker after every
-    # category has been applied so a later category cannot restore an old
-    # credential for an endpoint that was changed without a new key.
-    if image.get(API_KEY_REQUIRED):
-        for field in ("ARK_API_KEY", "SEEDDANCE_API_KEY", "SEEDREAM_API_KEY", "STABILITY_API_KEY"):
-            setattr(settings, field, "")
-    if video.get(API_KEY_REQUIRED):
-        for field in ("ARK_API_KEY", "SEEDDANCE_API_KEY", "SEEDREAM_API_KEY"):
-            setattr(settings, field, "")
-    if voice.get(API_KEY_REQUIRED):
-        settings.MIMO_API_KEY = ""
+    migrate_store()
 
 
 __all__ = [

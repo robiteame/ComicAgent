@@ -7,10 +7,22 @@
 from __future__ import annotations
 
 from services.providers.base import BaseAdapter
+from services.providers.image_ark_seedream import ArkSeedreamImageAdapter
+from services.providers.image_placeholder import PlaceholderImageAdapter
+from services.providers.image_stability import StabilityImageAdapter
 from services.providers.llm_openai_chat import OpenAIChatAdapter
+from services.providers.tts_mimo import MimoTTSAdapter
+from services.providers.video_ark_seedance import ArkSeedanceVideoAdapter
+from services.providers.video_native_audio import NativeAudioVideoAdapter
 
 ADAPTERS: dict[tuple[str, str], type[BaseAdapter]] = {
     ("script", "openai-chat"): OpenAIChatAdapter,
+    ("image", "placeholder"): PlaceholderImageAdapter,
+    ("image", "stability"): StabilityImageAdapter,
+    ("image", "ark-seedream"): ArkSeedreamImageAdapter,
+    ("video", "ark-seedance"): ArkSeedanceVideoAdapter,
+    ("video", "native-audio"): NativeAudioVideoAdapter,
+    ("voice", "mimo-tts"): MimoTTSAdapter,
 }
 
 

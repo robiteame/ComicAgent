@@ -127,10 +127,16 @@ class FFmpegService:
             raise ValueError("镜头视频文件不存在或无效")
         video_path = str(video_path_obj)
         audio_path = self._media_path(shot.get("audio_path"), minimum_size=1)
+        native_audio = self._shot_has_native_audio(shot)
         if audio_path:
             audio_input = ["-i", str(audio_path)]
             map_audio = ["-map", "1:a:0"]
             audio_codec = ["-c:a", "aac", "-af", f"apad=pad_dur={duration}"]
+        elif native_audio:
+            # 原生音频视频：直接沿用其自带音轨，保证两条音频路径产出契约一致。
+            audio_input = []
+            map_audio = ["-map", "0:a:0"]
+            audio_codec = ["-c:a", "aac"]
         else:
             audio_input = ["-f", "lavfi", "-t", str(duration), "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"]
             map_audio = ["-map", "1:a:0"]
@@ -230,6 +236,13 @@ class FFmpegService:
         )
         mixed_path.replace(video_path)
         return video_path
+
+    @staticmethod
+    def _shot_has_native_audio(shot: dict) -> bool:
+        if shot.get("native_audio") is True:
+            return True
+        profile = shot.get("continuity_profile") or {}
+        return isinstance(profile, dict) and str(profile.get("audio_source") or "").lower() == "native"
 
     def _zoom_filter(self, shot_type: str, width: int, height: int, frames: int) -> str:
         if shot_type == "wide":

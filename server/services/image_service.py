@@ -1,22 +1,26 @@
-import base64
-import json
+import base64  # noqa: F401  (kept for reference-asset data URLs)
+import logging
 import re
-import textwrap
-from io import BytesIO
 
-import httpx
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
+from io import BytesIO
 
 from config import settings
 from services.consistency_service import ConsistencyService
+from services.providers.base import ImageRequest
+from services.providers.endpoint import EndpointConfig, get_endpoint
+from services.providers.image_placeholder import PlaceholderImageAdapter
+from services.providers.registry import UnknownProtocolError, get_adapter
 from services.reference_asset_service import ReferenceAssetService
-from services.style_templates import style_prompt_params
-from services.security import atomic_write_bytes, download_remote_bytes, safe_path, validate_identifier
+from services.security import atomic_write_bytes, safe_path, validate_identifier
 from services.storage_service import StorageQuotaExceeded, StorageService
+from services.style_templates import style_prompt_params
+
+logger = logging.getLogger(__name__)
 
 
 class ImageService:
-    """Image generation service backed by real remote image APIs."""
+    """Image generation service routing to protocol adapters via endpoint config."""
 
     def __init__(self):
         self.output_dir = settings.OUTPUT_DIR / "projects"
@@ -24,26 +28,42 @@ class ImageService:
         self.reference_assets = ReferenceAssetService()
         self.storage = StorageService()
 
-    # 运行时实时读取 settings，保证保存模型/API 配置后新任务即生效。
-    @property
-    def api_key(self) -> str:
-        return settings.ARK_API_KEY or settings.SEEDDANCE_API_KEY or settings.SEEDREAM_API_KEY or settings.STABILITY_API_KEY
+    # ------------------------------------------------------------------
+    # 适配器路由：protocol 显式决定代码路径；协议非法或缺 key 回退占位图。
+    # ------------------------------------------------------------------
 
-    @property
-    def api_url(self) -> str:
-        return settings.STABILITY_API_URL
+    def _resolve_route(self) -> tuple[object, EndpointConfig]:
+        endpoint = get_endpoint("image")
+        try:
+            adapter_cls = get_adapter("image", endpoint.protocol)
+        except UnknownProtocolError as exc:
+            logger.warning("图像协议 %r 未注册适配器，回退占位图: %s", endpoint.protocol, exc)
+            return PlaceholderImageAdapter(EndpointConfig(protocol="placeholder")), endpoint
+        capabilities = adapter_cls.capabilities
+        if capabilities.requires_credentials and not endpoint.api_key:
+            logger.warning(
+                "图像协议 %s 未配置 API Key，本次生成回退占位图（配置密钥后自动启用云端出图）",
+                endpoint.protocol,
+            )
+            return PlaceholderImageAdapter(EndpointConfig(protocol="placeholder")), endpoint
+        return adapter_cls(endpoint), endpoint
 
-    @property
-    def provider(self) -> str:
-        return (settings.IMAGE_PROVIDER or "").lower()
-
-    @property
-    def seedream_base_url(self) -> str:
-        return settings.SEEDDANCE_BASE_URL.rstrip("/")
-
-    @property
-    def seedream_model(self) -> str:
-        return settings.SEEDREAM_MODEL or settings.IMAGE_PROVIDER
+    async def _generate(self, *, prompt: str, negative_prompt: str, seed: int, reference_images: list[str], preferred_size: str, label: str) -> bytes:
+        adapter, endpoint = self._resolve_route()
+        size = preferred_size or str(endpoint.param("image_size") or "")
+        request = ImageRequest(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            seed=seed,
+            # 适配器声明支持参考图时才传入，不再硬编码假设。
+            reference_images=list(reference_images) if adapter.capabilities.reference_images else [],
+            size=size,
+            label=label,
+        )
+        image_data = await adapter.generate(request)
+        if not image_data:
+            raise RuntimeError("图像生成接口未返回图片数据")
+        return image_data
 
     async def generate_shot_image(
         self,
@@ -65,16 +85,14 @@ class ImageService:
         image_path = shot_dir / f"{safe_shot_id}_v{int(shot.get('version', 1) or 1)}.png"
 
         preferred_size = self._size_for_ratio(shot.get("output_format"))
-
-        if self.provider == "stability" and self.api_key:
-            image_data = await self._call_stability(prompt, negative_prompt, seed)
-        elif self._is_seedream_provider() and self.api_key:
-            image_data = await self._call_seedream(prompt, negative_prompt, seed, reference_images, preferred_size=preferred_size)
-        else:
-            image_data = self._generate_placeholder("SHOT PLACEHOLDER", prompt, self._placeholder_size(preferred_size))
-
-        if not image_data:
-            raise RuntimeError("图像生成接口未返回图片数据")
+        image_data = await self._generate(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            seed=seed,
+            reference_images=reference_images,
+            preferred_size=preferred_size,
+            label="SHOT PLACEHOLDER",
+        )
 
         self._validate_image(image_data)
         self._write_image(project_id, image_path, image_data)
@@ -102,14 +120,16 @@ class ImageService:
         scene_dir = ref_dir / safe_name
         scene_dir.mkdir(parents=True, exist_ok=True)
         image_path = scene_dir / "baseline_original.png"
-        preferred_size = settings.SEEDREAM_IMAGE_SIZE or "1440x2560"
+        preferred_size = str(get_endpoint("image").param("image_size") or "1440x2560")
 
-        if self.provider == "stability" and self.api_key:
-            image_data = await self._call_stability(prompt, negative_prompt, seed)
-        elif self._is_seedream_provider() and self.api_key:
-            image_data = await self._call_seedream(prompt, negative_prompt, seed, preferred_size=preferred_size)
-        else:
-            image_data = self._generate_placeholder("SCENE BASELINE", prompt, self._placeholder_size(preferred_size))
+        image_data = await self._generate(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            seed=seed,
+            reference_images=[],
+            preferred_size=preferred_size,
+            label="SCENE BASELINE",
+        )
 
         self._validate_image(image_data)
         self._write_image(project_id, image_path, image_data)
@@ -136,23 +156,34 @@ class ImageService:
         image_path = character_dir / "three_view_original.png"
         preferred_size = "2048x2048"
 
-        if self.provider == "stability" and self.api_key:
-            image_data = await self._call_stability(prompt, negative_prompt, seed)
-        elif self._is_seedream_provider() and self.api_key:
-            image_data = await self._call_seedream(prompt, negative_prompt, seed, preferred_size=preferred_size)
-        else:
-            image_data = self._generate_placeholder("CHARACTER REF", prompt, self._placeholder_size(preferred_size))
+        image_data = await self._generate(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            seed=seed,
+            reference_images=[],
+            preferred_size=preferred_size,
+            label="CHARACTER REF",
+        )
 
         self._validate_image(image_data)
         self._write_image(project_id, image_path, image_data)
         return str(image_path)
 
-    def _is_seedream_provider(self) -> bool:
-        provider = self.provider.replace("_", "-")
-        return provider.startswith("doubao-seedream") or provider in {"seedream", "volcengine", "ark"}
+    def _seedream_payload(self, model: str, prompt: str, negative_prompt: str, seed: int, size: str, reference_images: list[str] | None = None) -> dict:
+        """兼容保留：sop 校验脚本使用。实际载荷由 ark-seedream 适配器构造。"""
+        from services.providers.image_ark_seedream import ArkSeedreamImageAdapter
+
+        request = ImageRequest(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            seed=seed,
+            reference_images=list(reference_images or []),
+            size=size,
+        )
+        return ArkSeedreamImageAdapter(EndpointConfig(protocol="ark-seedream"))._payload(model, request, size)
 
     def _size_for_ratio(self, output_format: str | None) -> str:
-        # 画面比例 -> Seedream 出图尺寸。未识别的比例回退到 settings 配置的默认尺寸，
+        # 画面比例 -> Seedream 出图尺寸。未识别的比例回退到配置的默认尺寸，
         # 保证用户在前端切换 9:16 / 16:9 / 1:1 等比例后，定稿故事板真实按比例出图。
         ratio = str(output_format or "").strip()
         ratio_size_map = {
@@ -162,187 +193,10 @@ class ImageService:
             "4:3": "2048x1536",
             "16:9": "2560x1440",
         }
-        return ratio_size_map.get(ratio, settings.SEEDREAM_IMAGE_SIZE or "1440x2560")
+        return ratio_size_map.get(ratio, str(get_endpoint("image").param("image_size") or "1440x2560"))
 
     def build_shot_prompt(self, shot: dict, characters: list, style_params: dict) -> tuple[str, str]:
         return self._build_prompt(shot, characters, style_params)
-
-    def _placeholder_size(self, preferred_size: str | None = None) -> tuple[int, int]:
-        match = re.match(r"\s*(\d+)\s*[xX]\s*(\d+)", preferred_size or settings.SEEDREAM_IMAGE_SIZE or "")
-        if match:
-            return int(match.group(1)), int(match.group(2))
-        return 1440, 2560
-
-    def _placeholder_font(self, size: int):
-        for name in ("msyh.ttc", "arial.ttf", "DejaVuSans.ttf"):
-            try:
-                return ImageFont.truetype(name, size)
-            except Exception:
-                continue
-        return ImageFont.load_default()
-
-    def _generate_placeholder(self, label: str, prompt: str, size: tuple[int, int]) -> bytes:
-        """Render a deterministic placeholder image so the full pipeline runs without image API keys."""
-        width, height = size
-        tint = sum(ord(ch) for ch in label)
-        background = (30 + tint * 53 % 60, 30 + tint * 97 % 60, 50 + tint * 131 % 60)
-        image = Image.new("RGB", (width, height), background)
-        draw = ImageDraw.Draw(image)
-        font_px = max(width // 40, 16)
-        title_font = self._placeholder_font(max(width // 18, 28))
-        body_font = self._placeholder_font(font_px)
-        margin = int(width * 0.06)
-        draw.text((margin, margin), label, fill=(245, 245, 245), font=title_font)
-        body = " ".join(str(prompt or "").split())[:600]
-        chars_per_line = max(int(width * 0.9 / (font_px * 0.6)), 24)
-        wrapped = textwrap.fill(body, width=chars_per_line, max_lines=12, placeholder=" …")
-        draw.multiline_text((margin, int(height * 0.16)), wrapped, fill=(215, 215, 215), font=body_font, spacing=8)
-        buffer = BytesIO()
-        image.save(buffer, format="PNG")
-        data = buffer.getvalue()
-        self._validate_image(data)
-        return data
-
-    async def _call_seedream(
-        self,
-        prompt: str,
-        negative_prompt: str,
-        seed: int,
-        reference_images: list[str] | None = None,
-        preferred_size: str | None = None,
-    ) -> bytes:
-        errors: list[str] = []
-        models = self._seedream_model_candidates()
-        sizes = [preferred_size, settings.SEEDREAM_IMAGE_SIZE, "2048x2048", "1440x2560", "2K"]
-
-        async with httpx.AsyncClient(timeout=180) as client:
-            for model in models:
-                for size in list(dict.fromkeys(size for size in sizes if size)):
-                    payload = self._seedream_payload(model, prompt, negative_prompt, seed, size, reference_images)
-                    try:
-                        request = client.build_request(
-                            "POST",
-                            f"{self.seedream_base_url}/images/generations",
-                            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-                            json=payload,
-                        )
-                        response = await client.send(request, stream=True)
-                        response_bytes = await self._read_bounded_response(response)
-                        if response.status_code in {401, 403}:
-                            raise PermissionError(response_bytes.decode("utf-8", errors="replace")[:600])
-                        if response.status_code >= 400:
-                            errors.append(f"{model} {size}: {response.status_code} {response_bytes.decode('utf-8', errors='replace')[:400]}")
-                            continue
-                        return await self._extract_image_bytes(client, response, response_bytes)
-                    except PermissionError as exc:
-                        raise RuntimeError(f"火山方舟鉴权失败，请确认 API Key 和模型权限: {exc}") from exc
-                    except Exception as exc:
-                        errors.append(f"{model} {size}: {exc}")
-
-        raise RuntimeError("Seedream 图像生成失败: " + " | ".join(errors[-4:]))
-
-    def _seedream_payload(
-        self,
-        model: str,
-        prompt: str,
-        negative_prompt: str,
-        seed: int,
-        size: str,
-        reference_images: list[str] | None = None,
-    ) -> dict:
-        payload = {
-            "model": model,
-            "prompt": f"{prompt}\nNegative prompt: {negative_prompt}",
-            "response_format": "b64_json",
-            "size": size,
-            "n": 1,
-            "seed": seed,
-            "watermark": False,
-            "output_format": "png",
-            "sequential_image_generation": "disabled",
-        }
-        if reference_images:
-            payload["image"] = reference_images[:8]
-        return payload
-
-    def _seedream_model_candidates(self) -> list[str]:
-        raw = [self.seedream_model, settings.IMAGE_PROVIDER]
-        candidates: list[str] = []
-        for value in raw:
-            if not value:
-                continue
-            candidates.extend(
-                [
-                    value,
-                    value.replace(".", "-"),
-                    value.replace(".0", "-0"),
-                ]
-            )
-        candidates.extend(
-            [
-                "doubao-seedream-5-0-lite",
-                "doubao-seedream-5-0-lite-260128",
-            ]
-        )
-        return list(dict.fromkeys(candidates))
-
-    async def _extract_image_bytes(self, client: httpx.AsyncClient, response: httpx.Response, response_bytes: bytes) -> bytes:
-        content_type = response.headers.get("content-type", "")
-        if content_type.startswith("image/"):
-            if len(response_bytes) > settings.MAX_IMAGE_GENERATION_BYTES:
-                raise RuntimeError("图像数据超过大小限制")
-            return response_bytes
-
-        try:
-            data = json.loads(response_bytes)
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError("图像接口返回不是有效 JSON") from exc
-        items = data.get("data") if isinstance(data, dict) else None
-        if not items:
-            raise RuntimeError(f"图像接口返回缺少 data: {data}")
-
-        item = items[0]
-        b64_data = item.get("b64_json") or item.get("image") or item.get("base64")
-        if b64_data:
-            if "," in b64_data and b64_data.startswith("data:"):
-                b64_data = b64_data.split(",", 1)[1]
-            if len(b64_data) > int(settings.MAX_IMAGE_GENERATION_BYTES * 4 / 3) + 16:
-                raise RuntimeError("图像数据超过大小限制")
-            decoded = base64.b64decode(b64_data, validate=True)
-            if len(decoded) > settings.MAX_IMAGE_GENERATION_BYTES:
-                raise RuntimeError("图像数据超过大小限制")
-            return decoded
-
-        image_url = item.get("url") or item.get("image_url")
-        if isinstance(image_url, dict):
-            image_url = image_url.get("url")
-        if image_url:
-            try:
-                return await download_remote_bytes(
-                    image_url,
-                    max_bytes=settings.MAX_IMAGE_GENERATION_BYTES,
-                    timeout=180,
-                )
-            except Exception as exc:
-                raise RuntimeError(f"图像 URL 下载失败: {exc}") from exc
-
-        raise RuntimeError(f"无法解析图像接口返回: {data}")
-
-    async def _read_bounded_response(self, response: httpx.Response) -> bytes:
-        limit = max(1024, int(settings.MAX_IMAGE_GENERATION_BYTES * 4 / 3) + 16)
-        length = response.headers.get("content-length")
-        if length and int(length) > limit:
-            await response.aclose()
-            raise RuntimeError("图像接口响应超过大小限制")
-        body = bytearray()
-        try:
-            async for chunk in response.aiter_bytes(1024 * 1024):
-                body.extend(chunk)
-                if len(body) > limit:
-                    raise RuntimeError("图像接口响应超过大小限制")
-            return bytes(body)
-        finally:
-            await response.aclose()
 
     def _write_image(self, project_id: str, image_path, image_data: bytes) -> None:
         try:
@@ -547,32 +401,6 @@ class ImageService:
             "different outfits between views, inconsistent face, extra characters, watermark, text artifacts, low quality",
         ]
         return ", ".join(part for part in prompt_parts if part), ", ".join(part for part in negative_parts if part)
-
-    async def _call_stability(self, prompt: str, negative_prompt: str, seed: int) -> bytes:
-        async with httpx.AsyncClient(timeout=45) as client:
-            request = client.build_request(
-                "POST",
-                f"{self.api_url}/stable-image/generate/core",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Accept": "image/*",
-                },
-                data={
-                    "prompt": prompt,
-                    "negative_prompt": negative_prompt,
-                    "seed": seed,
-                    "output_format": "png",
-                },
-            )
-            response = await client.send(request, stream=True)
-            try:
-                response.raise_for_status()
-                data = await self._read_bounded_response(response)
-                if len(data) > settings.MAX_IMAGE_GENERATION_BYTES:
-                    raise RuntimeError("图像数据超过大小限制")
-                return data
-            finally:
-                await response.aclose()
 
     def _camera_prompt(self, shot_type: str) -> str:
         return {

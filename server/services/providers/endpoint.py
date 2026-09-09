@@ -165,7 +165,7 @@ def _script_defaults(*, fallback: bool) -> dict:
             "params": {},
         }
     provider = (settings.LLM_PROVIDER or "").strip().lower()
-    if provider == "mimo":
+    if provider in {"mimo"}:
         return {
             "protocol": "openai-chat",
             "base_url": settings.MIMO_BASE_URL,

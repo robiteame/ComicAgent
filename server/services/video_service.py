@@ -1,46 +1,39 @@
+"""视频生成服务：prompt/参考图/一致性策略 + 协议适配器路由。
+
+端点来自 ``get_endpoint("video")``，协议调用委托给
+``services.providers.registry.get_adapter("video", protocol)`` 注册的适配器：
+- ``ark-seedance``：异步任务式无声视频（对白走独立 TTS 路径）；
+- ``native-audio``：原生音视频骨架（对白编入 prompt，音频随视频直出）。
+"""
+
 import asyncio
-import base64
+import logging
 import re
 from pathlib import Path
 
-import httpx
-
 from config import settings
 from services.consistency_service import ConsistencyService
+from services.providers.base import Dialogue, VideoRequest
+from services.providers.endpoint import get_endpoint
+from services.providers.registry import get_adapter
 from services.reference_asset_service import ReferenceAssetService
+from services.security import safe_path, validate_identifier
 from services.style_templates import style_prompt_params
-from services.security import (
-    UploadLimitExceeded,
-    atomic_write_bytes,
-    download_remote_bytes,
-    download_remote_file,
-    safe_path,
-    validate_identifier,
-)
-from services.storage_service import StorageQuotaExceeded, StorageService
+
+logger = logging.getLogger(__name__)
 
 
-class SeedanceVideoService:
-    """Minimal Seedance client for one-shot connectivity checks."""
+class VideoService:
+    """按端点协议路由的视频生成服务（保留原 SeedanceVideoService 的策略逻辑）。"""
 
     def __init__(self):
         self.output_dir = settings.OUTPUT_DIR / "projects"
         self.consistency = ConsistencyService()
         self.reference_assets = ReferenceAssetService()
-        self.storage = StorageService()
 
-    # 运行时实时读取 settings，保证保存模型/API 配置后新任务即生效。
-    @property
-    def api_key(self) -> str:
-        return settings.SEEDDANCE_API_KEY or settings.ARK_API_KEY or settings.SEEDREAM_API_KEY
-
-    @property
-    def base_url(self) -> str:
-        return self._normalize_base_url(settings.SEEDDANCE_BASE_URL)
-
-    @property
-    def model(self) -> str:
-        return settings.SEEDDANCE_MODEL or "doubao-seedance-1-5-pro-251215"
+    # ------------------------------------------------------------------
+    # 对外入口
+    # ------------------------------------------------------------------
 
     async def generate_single_shot(
         self,
@@ -51,11 +44,16 @@ class SeedanceVideoService:
         ratio: str = "9:16",
         resolution: str = "720p",
         content: list[dict] | None = None,
+        dialogues: list[Dialogue] | None = None,
     ) -> dict[str, str]:
-        if not self.api_key:
-            raise RuntimeError("未配置 Seedance/Ark API Key，无法调用 Seedance")
+        endpoint = get_endpoint("video")
+        adapter = get_adapter("video", endpoint.protocol)(endpoint)
         if not prompt.strip():
-            raise RuntimeError("Seedance 提示词为空")
+            raise RuntimeError("视频生成提示词为空")
+
+        if content is None:
+            content = [{"type": "text", "text": prompt}]
+        reference_image, content_payload_mode = self._reference_from_content(content)
 
         try:
             safe_project_id = validate_identifier(project_id, "项目 ID")
@@ -63,20 +61,34 @@ class SeedanceVideoService:
         except ValueError as exc:
             raise RuntimeError(str(exc)) from exc
         output_dir = safe_path(self.output_dir, safe_project_id, "seedance", create_parent=True)
-        task, payload_mode = await self._create_task(prompt, duration, ratio, resolution, content)
-        task_id = self._extract_task_id(task)
-        result = await self._wait_for_task(task_id)
         video_path = output_dir / f"{safe_shot_id}.mp4"
         frame_path = output_dir / f"{safe_shot_id}_frame.png"
-        has_frame = await self._download_outputs_to_files(result, safe_project_id, video_path, frame_path)
-        if not has_frame:
-            await self._extract_last_frame(video_path, frame_path)
 
-        if video_path.stat().st_size <= 4096:
-            raise RuntimeError("Seedance 返回视频为空或过小")
-        if not frame_path.exists() or frame_path.stat().st_size <= 1024:
-            raise RuntimeError("Seedance 单帧画面保存失败")
-        return {"video_path": str(video_path), "frame_path": str(frame_path), "task_id": task_id, "reference_payload_mode": payload_mode}
+        fixed_duration = getattr(adapter.capabilities, "fixed_duration", None)
+        request = VideoRequest(
+            prompt=prompt,
+            reference_image=reference_image,
+            dialogues=dialogues,
+            duration=int(fixed_duration or duration or 5),
+            ratio=ratio,
+            resolution=resolution,
+            project_id=safe_project_id,
+            output_video_path=video_path,
+            output_frame_path=frame_path,
+        )
+        result = await adapter.generate(request)
+
+        if result.native_audio:
+            # 原生音频契约校验：不允许产出无声成品。
+            await self._assert_stream_has_audio(result.video_path)
+
+        return {
+            "video_path": result.video_path,
+            "frame_path": result.frame_path,
+            "task_id": result.task_id,
+            "reference_payload_mode": result.payload_mode or content_payload_mode,
+            "native_audio": bool(result.native_audio),
+        }
 
     async def generate_shot_video(
         self,
@@ -85,23 +97,61 @@ class SeedanceVideoService:
         scenes: dict[str, dict],
         project_id: str,
     ) -> dict[str, str]:
-        reference_manifest = self._validate_video_references(shot)
-        shot["seedance_reference_manifest"] = reference_manifest
+        endpoint = get_endpoint("video")
+        adapter_cls = get_adapter("video", endpoint.protocol)
+        capabilities = adapter_cls.capabilities
+
+        reference_manifest: list[dict] = []
+        if capabilities.reference_image:
+            reference_manifest = self._validate_video_references(shot)
+            shot["seedance_reference_manifest"] = reference_manifest
         prompt = self._build_prompt(shot, characters, scenes)
         content = self._build_content(prompt, shot)
-        if not self._has_image_content(content):
-            raise RuntimeError("Seedance 视频生成缺少已审核分镜首帧参考图，已阻止纯文本生成")
+        if capabilities.reference_image and not self._has_image_content(content):
+            raise RuntimeError("视频生成缺少已审核分镜首帧参考图，已阻止纯文本生成")
         return await self.generate_single_shot(
             prompt=prompt,
             project_id=project_id,
             shot_id=shot.get("shot_id", "seedance_shot"),
-            duration=self._duration_for_model(),
+            duration=int(shot.get("duration") or 5),
             ratio=shot.get("output_format", "9:16"),
-            resolution=self._seedance_resolution(shot.get("resolution")),
+            resolution=self._resolution(shot.get("resolution")),
             content=content,
+            dialogues=self._dialogues_from_shot(shot),
         )
 
-    def _seedance_resolution(self, resolution: str | None) -> str:
+    # ------------------------------------------------------------------
+    # 台词与参考图策略
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _dialogues_from_shot(shot: dict) -> list[Dialogue] | None:
+        dialogues = shot.get("dialogues")
+        if not dialogues:
+            return None
+        normalized: list[Dialogue] = []
+        for item in dialogues:
+            if isinstance(item, Dialogue):
+                normalized.append(item)
+            elif isinstance(item, dict):
+                normalized.append(
+                    Dialogue(
+                        role=str(item.get("role") or ""),
+                        text=str(item.get("text") or ""),
+                        emotion=str(item.get("emotion") or "neutral"),
+                    )
+                )
+        return normalized or None
+
+    def _reference_from_content(self, content: list[dict]) -> tuple[str | None, str]:
+        """从内容列表中取首帧参考图；payload 模式由适配器按内容判定。"""
+        for item in content or []:
+            if item.get("type") == "image_url":
+                url = (item.get("image_url") or {}).get("url") if isinstance(item.get("image_url"), dict) else None
+                return (url or None), ""
+        return None, "text_only"
+
+    def _resolution(self, resolution: str | None) -> str:
         # 项目分辨率可为 720p/1080p/2k/4k；Seedance 1.5 pro 仅支持到 1080p，
         # 因此 2k/4k 统一降级到 1080p，保证 API 不因不支持的档位报错。
         value = str(resolution or "").strip().lower()
@@ -114,12 +164,6 @@ class SeedanceVideoService:
             "4k": "1080p",
         }
         return mapping.get(value, "720p")
-
-    def _duration_for_model(self) -> int:
-        # Seedance pro t2v rejects arbitrary shot durations. Keep generation at
-        # the verified API-safe duration; ffmpeg still uses the shot duration
-        # later when normalizing and composing clips.
-        return 5
 
     def _build_prompt(self, shot: dict, characters: list[dict], scenes: dict[str, dict]) -> str:
         scene = scenes.get(shot.get("scene_asset_id", "")) or {}
@@ -258,6 +302,17 @@ class SeedanceVideoService:
             content.append({"type": "image_url", "image_url": {"url": first_frame_url}, "role": "first_frame"})
         return content
 
+    def _has_image_content(self, content: list[dict]) -> bool:
+        return any(item.get("type") == "image_url" for item in content)
+
+    def _reference_payload_mode(self, content: list[dict]) -> str:
+        roles = {str(item.get("role") or "") for item in content if item.get("type") == "image_url"}
+        if "first_frame" in roles:
+            return "first_frame_reference"
+        if roles:
+            return "image_reference"
+        return "text_only"
+
     def _validate_video_references(self, shot: dict) -> list[dict]:
         missing: list[str] = []
         manifest: list[dict] = []
@@ -286,7 +341,7 @@ class SeedanceVideoService:
             add_reference("depth_control", shot.get("depth_reference_path", ""))
 
         if missing:
-            raise RuntimeError("Seedance 视频生成缺少必需一致性参考素材: " + " | ".join(missing))
+            raise RuntimeError("视频生成缺少必需一致性参考素材: " + " | ".join(missing))
         return manifest
 
     def _ordered_reference_assets(self, shot: dict) -> list[dict]:
@@ -313,192 +368,26 @@ class SeedanceVideoService:
         }
         return sorted(assets, key=lambda item: priority.get(str(item.get("type")), 9))
 
-    async def _create_task(self, prompt: str, duration: int, ratio: str, resolution: str, content: list[dict] | None = None) -> tuple[dict, str]:
-        request_content = content or [{"type": "text", "text": prompt}]
-        payload = {
-            "model": self.model,
-            "content": request_content,
-            "duration": duration,
-            "ratio": ratio,
-            "resolution": resolution,
-            "return_last_frame": True,
-            "watermark": False,
-        }
-        async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.post(self._tasks_url(), headers=self._headers(), json=payload)
-            payload_mode = self._reference_payload_mode(request_content)
-        if response.status_code >= 400:
-            raise RuntimeError(f"Seedance 创建任务失败: {response.status_code} {response.text[:1000]}")
-        return response.json(), payload_mode
-
-    def _has_image_content(self, content: list[dict]) -> bool:
-        return any(item.get("type") == "image_url" for item in content)
-
-    def _reference_payload_mode(self, content: list[dict]) -> str:
-        roles = {str(item.get("role") or "") for item in content if item.get("type") == "image_url"}
-        if "first_frame" in roles:
-            return "first_frame_reference"
-        if roles:
-            return "image_reference"
-        return "text_only"
-
-    async def _wait_for_task(self, task_id: str) -> dict:
-        async with httpx.AsyncClient(timeout=60) as client:
-            for _ in range(90):
-                response = await client.get(f"{self._tasks_url()}/{task_id}", headers=self._headers())
-                if response.status_code >= 400:
-                    raise RuntimeError(f"Seedance 查询任务失败: {response.status_code} {response.text[:1000]}")
-                data = response.json()
-                status = str(data.get("status") or data.get("task_status") or data.get("data", {}).get("status") or "").lower()
-                if status in {"succeeded", "success", "completed", "done"}:
-                    return data
-                if status in {"failed", "cancelled", "canceled", "error"}:
-                    raise RuntimeError(f"Seedance 任务失败: {data}")
-                await asyncio.sleep(5)
-        raise TimeoutError(f"Seedance 任务超时: {task_id}")
-
-    async def _download_outputs_to_files(self, data: dict, project_id: str, video_path: Path, frame_path: Path) -> bool:
-        video_url = self._find_url(data, {"video_url", "video", "url"})
-        frame_url = self._find_url(data, {"last_frame_url", "frame_url", "image_url", "cover_url"})
-        video_b64 = self._find_b64(data, {"video_base64", "video_b64", "b64_json"})
-        frame_b64 = self._find_b64(data, {"last_frame_base64", "frame_base64", "image_base64"})
-
-        if video_b64:
-            video_bytes = self._decode_b64(video_b64, "视频")
-            self._write_media(project_id, video_path, video_bytes, minimum_size=4096)
-        elif video_url:
-            await self._download_url_to_path(project_id, video_url, video_path, minimum_size=4096)
-        else:
-            raise RuntimeError(f"Seedance 返回缺少视频 URL/base64: {data}")
-
-        if frame_b64:
-            self._write_media(project_id, frame_path, self._decode_b64(frame_b64, "单帧"), minimum_size=1024)
-            return True
-        elif frame_url:
-            await self._download_url_to_path(project_id, frame_url, frame_path, minimum_size=1024)
-            return True
-        return False
-
-    def _decode_b64(self, value: str, label: str) -> bytes:
-        raw = str(value or "")
-        # Base64 expands data by roughly 4/3. Reject oversized payloads before
-        # allocating a potentially unbounded decoded buffer.
-        if len(raw) > int(settings.MAX_REMOTE_MEDIA_BYTES * 4 / 3) + 16:
-            raise RuntimeError(f"{label}数据超过大小限制")
-        try:
-            decoded = base64.b64decode(raw, validate=True)
-        except Exception as exc:
-            raise RuntimeError(f"{label}数据编码无效") from exc
-        if len(decoded) > settings.MAX_REMOTE_MEDIA_BYTES:
-            raise RuntimeError(f"{label}数据超过大小限制")
-        return decoded
-
-    async def _download_url(self, url: str) -> bytes:
-        try:
-            return await download_remote_bytes(
-                url,
-                max_bytes=settings.MAX_REMOTE_MEDIA_BYTES,
-                timeout=180,
-            )
-        except (UploadLimitExceeded, ValueError, httpx.HTTPError) as exc:
-            raise RuntimeError(f"下载远程媒体失败: {exc}") from exc
-
-    async def _download_url_to_path(self, project_id: str, url: str, destination: Path, *, minimum_size: int) -> None:
-        try:
-            available = self.storage.ensure_project_capacity(project_id, replacing=destination)
-            size = await download_remote_file(
-                url,
-                destination,
-                max_bytes=min(settings.MAX_REMOTE_MEDIA_BYTES, available),
-                timeout=180,
-            )
-        except (StorageQuotaExceeded, UploadLimitExceeded, ValueError, httpx.HTTPError) as exc:
-            raise RuntimeError(f"下载远程媒体失败: {exc}") from exc
-        if size < minimum_size:
-            destination.unlink(missing_ok=True)
-            raise RuntimeError("下载的远程媒体为空或过小")
-
-    def _write_media(self, project_id: str, destination: Path, content: bytes, *, minimum_size: int) -> None:
-        try:
-            self.storage.ensure_project_capacity(project_id, len(content), replacing=destination)
-        except StorageQuotaExceeded as exc:
-            raise RuntimeError("项目媒体存储空间不足") from exc
-        atomic_write_bytes(destination, content, minimum_size=minimum_size)
-
-    async def _extract_last_frame(self, video_path: Path, frame_path: Path) -> None:
+    async def _assert_stream_has_audio(self, video_path: str) -> None:
+        """ffprobe 校验原生音频视频确有音轨（两条路径输出契约一致性）。"""
         proc = await asyncio.create_subprocess_exec(
-            "ffmpeg",
-            "-y",
-            "-sseof",
-            "-0.1",
-            "-i",
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "json",
             str(video_path),
-            "-frames:v",
-            "1",
-            str(frame_path),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        try:
-            _, stderr = await asyncio.wait_for(
-                proc.communicate(),
-                timeout=max(30, int(settings.FFMPEG_TIMEOUT_SECONDS)),
-            )
-        except asyncio.CancelledError:
-            if proc.returncode is None:
-                proc.kill()
-            await proc.communicate()
-            raise
-        except asyncio.TimeoutError as exc:
-            proc.kill()
-            await proc.communicate()
-            raise TimeoutError("提取 Seedance 单帧超时") from exc
+        stdout, stderr = await proc.communicate()
         if proc.returncode != 0:
-            raise RuntimeError(f"提取 Seedance 单帧失败: {stderr.decode('utf-8', errors='ignore')[-1000:]}")
+            raise RuntimeError(f"校验视频音轨失败: {stderr.decode('utf-8', errors='ignore')[-500:]}")
+        if '"audio"' not in stdout.decode("utf-8", errors="ignore"):
+            raise RuntimeError("原生音频视频未包含音轨，已阻止无声成品进入成片流程")
 
-    def _extract_task_id(self, data: dict) -> str:
-        for key in ("id", "task_id"):
-            value = data.get(key) or data.get("data", {}).get(key)
-            if value:
-                return str(value)
-        raise RuntimeError(f"Seedance 创建任务返回缺少任务 ID: {data}")
 
-    def _find_url(self, value, keys: set[str]) -> str:
-        if isinstance(value, dict):
-            for key, item in value.items():
-                if key in keys and isinstance(item, str) and item.startswith(("http://", "https://")):
-                    return item
-                nested = self._find_url(item, keys)
-                if nested:
-                    return nested
-        if isinstance(value, list):
-            for item in value:
-                nested = self._find_url(item, keys)
-                if nested:
-                    return nested
-        return ""
-
-    def _find_b64(self, value, keys: set[str]) -> str:
-        if isinstance(value, dict):
-            for key, item in value.items():
-                if key in keys and isinstance(item, str) and not item.startswith(("http://", "https://")):
-                    return item.split(",", 1)[-1] if item.startswith("data:") else item
-                nested = self._find_b64(item, keys)
-                if nested:
-                    return nested
-        if isinstance(value, list):
-            for item in value:
-                nested = self._find_b64(item, keys)
-                if nested:
-                    return nested
-        return ""
-
-    def _headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-
-    def _tasks_url(self) -> str:
-        return f"{self.base_url}/contents/generations/tasks"
-
-    def _normalize_base_url(self, value: str) -> str:
-        base = (value or "https://ark.cn-beijing.volces.com/api/v3").rstrip("/")
-        return base.replace("/api/plan/v3", "/api/v3")
+# 兼容旧导入名（api_diagnostics / sop 脚本 / 测试）。
+SeedanceVideoService = VideoService

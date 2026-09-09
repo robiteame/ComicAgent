@@ -12,8 +12,10 @@ from api.websocket import ws_manager
 from config import settings
 from db import SessionLocal, get_db
 from models import Character, Project, SceneAsset, Shot
+from services.audio_routing import resolve_audio_mode
 from services.consistency_service import ConsistencyService
 from services.image_service import ImageService
+from services.providers.base import Dialogue
 from services.reference_asset_service import ReferenceAssetService
 from services.skill_config_service import (
     agent_style_id,
@@ -54,6 +56,7 @@ class ShotUpdate(BaseModel):
     visual_notes: str | None = None
     scene_asset_id: str | None = None
     character_asset_ids: list[str] | None = None
+    audio_mode: str | None = None  # 镜头级音频路径覆盖："tts" | "native" | "auto"，空串清除
 
 
 class RegenerateRequest(BaseModel):
@@ -149,6 +152,14 @@ async def update_shot(shot_id: str, data: ShotUpdate, db: Session = Depends(get_
     for key, value in changed.items():
         if key == "character_asset_ids":
             setattr(shot, key, json.dumps(value or [], ensure_ascii=False))
+        elif key == "audio_mode":
+            profile = _json_dict(shot.continuity_profile)
+            mode = str(value or "").strip().lower()
+            if mode:
+                profile["audio_mode"] = mode
+            else:
+                profile.pop("audio_mode", None)
+            shot.continuity_profile = json.dumps(profile, ensure_ascii=False)
         else:
             setattr(shot, key, value)
 
@@ -716,6 +727,11 @@ async def _run_single_shot_video(
                 )
             )
             apply_agent_config_to_shot(shot_data, skill_config)
+            # 镜头级 audio_mode 覆盖存于 continuity_profile，但一致性上下文会重建
+            # profile，这里从数据库存档提升为 shot 顶级字段，保证覆盖不被冲掉。
+            stored_audio_mode = _json_dict(shot.continuity_profile).get("audio_mode")
+            if stored_audio_mode:
+                shot_data["audio_mode"] = str(stored_audio_mode).strip().lower()
             shot_sequence = shot.sequence
             dialogue = shot.dialogue
             emotion = shot.emotion or "neutral"
@@ -725,10 +741,23 @@ async def _run_single_shot_video(
             db.close()
         _materialize_control_references(project_id, shot_data, skill_config)
 
-        await _progress(project_id, "generate_voice", 82, f"正在生成镜头 {shot_sequence} 的配音")
+        await _progress(project_id, "generate_voice", 82, f"正在准备镜头 {shot_sequence} 的音频（音频路由决策中）")
         media_id = _versioned_media_id(shot_id, expected_version)
         audio_path = shot_data.get("audio_path", "")
-        if dialogue:
+        audio_mode = resolve_audio_mode(shot_data)
+        native_routed = audio_mode == "native"
+        dialogues = None
+        if native_routed:
+            # 原生音频路径：对白交给视频模型经 prompt 生成并随视频直出，
+            # 跳过独立 TTS 配音与后续 ffmpeg 音轨合成。
+            audio_path = ""
+            shot_data["audio_path"] = ""
+            if dialogue:
+                dialogues = [
+                    Dialogue(role=speaker, text=clean_tts_text(dialogue, skill_config), emotion=emotion)
+                ]
+        elif dialogue:
+            await _progress(project_id, "generate_voice", 84, f"正在生成镜头 {shot_sequence} 的配音")
             voice_id = next((item.get("voice_id", "") for item in characters if item.get("name") == speaker), "")
             audio_path = await tts_service.generate_dialogue(
                 text=clean_tts_text(dialogue, skill_config),
@@ -739,12 +768,22 @@ async def _run_single_shot_video(
             )
             shot_data["audio_path"] = audio_path
 
-        await _progress(project_id, "generate_seedance_video", 90, f"正在生成镜头 {shot_sequence} 的 Seedance 视频")
-        video_shot_data = {**shot_data, "shot_id": media_id}
+        await _progress(project_id, "generate_seedance_video", 90, f"正在生成镜头 {shot_sequence} 的视频")
+        video_shot_data = {**shot_data, "shot_id": media_id, "dialogues": dialogues}
         result = await seedance_service.generate_shot_video(video_shot_data, characters, scenes, project_id)
+        if native_routed and not result.get("native_audio"):
+            raise RuntimeError("视频适配器未按原生音频模式返回带音轨视频，已阻止无声成品")
         continuity_profile = shot_data.get("continuity_profile", {}) or {}
         if result.get("reference_payload_mode"):
             continuity_profile["seedance_reference_payload_mode"] = result["reference_payload_mode"]
+            shot_data["continuity_profile"] = continuity_profile
+        if native_routed:
+            # 标记音轨来源为视频自带，渲染时沿用视频音轨而非叠加 TTS。
+            continuity_profile["audio_source"] = "native"
+            shot_data["continuity_profile"] = continuity_profile
+        if shot_data.get("audio_mode"):
+            # 镜头级覆盖写回存档，保证后续重新生成时依然生效。
+            continuity_profile["audio_mode"] = str(shot_data["audio_mode"]).strip().lower()
             shot_data["continuity_profile"] = continuity_profile
 
         db = SessionLocal()
@@ -1023,7 +1062,13 @@ def _invalidate_video_outputs(shot: Shot, reset_status: bool = True) -> None:
     shot.continuity_reference_path = ""
     shot.pose_reference_path = ""
     shot.depth_reference_path = ""
-    shot.continuity_profile = "{}"
+    # 镜头级 audio_mode 覆盖是用户设定，重建一致性档案时必须保留。
+    preserved_audio_mode = _json_dict(shot.continuity_profile).get("audio_mode")
+    shot.continuity_profile = (
+        json.dumps({"audio_mode": str(preserved_audio_mode).lower()}, ensure_ascii=False)
+        if preserved_audio_mode
+        else "{}"
+    )
     if not reset_status:
         return
     if shot.storyboard_path or shot.image_path:

@@ -35,7 +35,7 @@ GRAPH_NODE_META: dict[str, dict] = {
     "generate_shot_videos": {
         "label": "逐镜头视频",
         "type": "process",
-        "description": "逐镜头生成配音并调用 Seedance 出视频",
+        "description": "逐镜头按音频路由生成（TTS 配音合成或原生音视频）并出视频",
     },
     "compose": {
         "label": "合成成片",
