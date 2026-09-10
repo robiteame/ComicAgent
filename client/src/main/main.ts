@@ -43,6 +43,14 @@ function createWindow() {
   if (process.platform === 'win32') {
     // Win11 下启用 acrylic 材质，配合透明窗口形成桌面透视毛玻璃观感。
     ;(winOpts as Electron.BrowserWindowConstructorOptions & { backgroundMaterial?: string }).backgroundMaterial = 'acrylic'
+  } else if (process.platform === 'darwin') {
+    // macOS（26+）上透明窗口不渲染默认标题栏的红绿灯按钮；hiddenInset 让按钮
+    // 以悬浮形式绘制在透明内容之上，玻璃观感与窗口控制两者兼得。
+    winOpts.titleBarStyle = 'hiddenInset'
+    // CSS backdrop-filter 无法模糊桌面，透明窗口只会直透桌面；under-window
+    // vibrancy 提供系统级磨砂，配合渲染层的白色蒙版形成白色玻璃观感。
+    winOpts.vibrancy = 'under-window'
+    winOpts.visualEffectState = 'active'
   }
 
   mainWindow = new BrowserWindow(winOpts)

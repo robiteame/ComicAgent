@@ -392,6 +392,18 @@ pnpm --dir client run electron:dev    # 自动启动后端 + Vite + Electron 窗
 
 > 如遇 Electron 二进制下载超时，项目 `.npmrc` 已配置国内镜像源。也可先使用纯 Web 模式开发。
 
+### 桌面窗口外观
+
+桌面壳使用透明窗口 + 系统级玻璃材质，叠加渲染层白色渐变蒙版，形成白色磨砂玻璃观感：
+
+| 平台 | 实现 |
+|------|------|
+| Windows 11 | `backgroundMaterial: 'acrylic'`，系统亚克力磨砂 |
+| macOS | `titleBarStyle: 'hiddenInset'` 悬浮红绿灯 + `vibrancy: 'under-window'`（`visualEffectState: 'active'`）系统磨砂，顶部拖拽条加高为 28px |
+
+macOS 上 CSS `backdrop-filter` 无法模糊桌面，因此由系统 vibrancy 负责磨砂、
+渲染层 `.app-shell` 的白色蒙版负责着色；暗色主题下蒙版自动切换为深色渐变。
+
 ### Electron 发布包
 
 `pnpm --dir client run build` 使用 `client/electron-builder.yml`，仅将 Vite 产物和经过过滤的

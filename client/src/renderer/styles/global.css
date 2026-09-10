@@ -139,7 +139,7 @@ button {
   overflow: hidden;
   background:
     radial-gradient(circle at 18% 0%, rgba(79, 127, 216, 0.08), transparent 34%),
-    linear-gradient(135deg, rgba(253, 254, 255, 0.9), rgba(238, 244, 252, 0.76));
+    linear-gradient(135deg, rgba(255, 255, 255, 0.92), rgba(240, 245, 251, 0.85));
   backdrop-filter: blur(22px) saturate(1.18);
   -webkit-backdrop-filter: blur(22px) saturate(1.18);
 }
@@ -195,6 +195,12 @@ button {
   height: 10px;
   flex: 0 0 10px;
   -webkit-app-region: drag;
+}
+
+/* macOS 无边框窗口：加高拖拽条，为悬浮红绿灯留出非交互空间 */
+.topbar-mac {
+  height: 28px;
+  flex-basis: 28px;
 }
 
 .app-main {
