@@ -27,6 +27,7 @@
   - [流水线流程](#流水线流程)
   - [视觉一致性系统](#视觉一致性系统)
   - [三层记忆系统](#三层记忆系统)
+- [下载安装](#下载安装)
 - [快速开始](#快速开始)
   - [前置条件](#前置条件)
   - [后端启动](#后端启动)
@@ -329,6 +330,37 @@ ComicAgent/
 
 ---
 
+## 下载安装
+
+桌面安装包已内置完整运行时（自包含 CPython 3.11 + 全部后端依赖 + 静态 FFmpeg），**无需安装 Python、pip 依赖或 FFmpeg**，下载后开箱即用：
+
+| 平台 | 安装包 | 说明 |
+|------|--------|------|
+| macOS（Apple Silicon） | `ComicAgent-<版本>-mac-arm64.dmg` | dmg 拖入 Applications，或解压 zip |
+| macOS（Intel） | `ComicAgent-<版本>-mac-x64.dmg` | 同上 |
+| Windows（x64） | `ComicAgent-<版本>-win-x64.exe` | NSIS 安装器，另有绿色版 zip |
+
+从 [GitHub Releases](https://github.com/robiteame/ComicAgent/releases) 获取最新版本；每次打 `v*` 标签会自动构建全部三个平台并发布。
+
+### macOS 首次启动（未签名应用）
+
+当前安装包未做开发者签名与公证，首次打开会被 Gatekeeper 拦截（“无法验证开发者”）。两种绕过方式任选：
+
+```bash
+# 方式一：命令行清除隔离属性（推荐）
+xattr -cr /Applications/ComicAgent.app
+
+# 方式二：右键 -> 打开 -> 再点“打开”；或在 系统设置 -> 隐私与安全性 中点“仍要打开”
+```
+
+### Windows 首次启动（SmartScreen）
+
+未签名 exe 会触发 SmartScreen 蓝色警告：点击 **“更多信息” → “仍要运行”** 即可继续安装。
+
+> 签名与公证（Apple Developer ID / Windows 代码签名证书）规划在后续版本；第三方组件来源与许可见安装包内 `Resources/THIRD-PARTY-NOTICES.md`。
+
+---
+
 ## 快速开始
 
 ### 前置条件
@@ -406,12 +438,28 @@ macOS 上 CSS `backdrop-filter` 无法模糊桌面，因此由系统 vibrancy �
 
 ### Electron 发布包
 
-`pnpm --dir client run build` 使用 `client/electron-builder.yml`，仅将 Vite 产物和经过过滤的
-`server/` 源码放入安装包；本地 API Key、SQLite 数据库、上传文件和缓存不会被打包。
-当前发布包不内置 Python、Python site-packages 或 FFmpeg。目标机器仍需提供 Python
-3.11+、按 `server/requirements.lock` 安装的锁定运行依赖，以及 PATH 中可执行的
-FFmpeg。主进程会将后端运行数据写入 Electron `userData` 目录；发布前请确认它能启动
-`resources/server/main.py`，而不是依赖开发机工作区中的 `server/` 路径。
+`pnpm --dir client run build:local` 完成桌面安装包的一键本地构建：先由
+`client/scripts/build-python-runtime.mjs` 组装可重定位运行时，再经 Vite 与 electron-builder
+打包。安装包内 `Resources/`（Windows 为 `resources\`）布局：
+
+```text
+server/   # 过滤后的 Python 源码（排除 .venv/.env/data 运行数据/测试残留）
+python/   # python-build-standalone CPython 3.11 + 按 requirements.lock 预装的 site-packages
+bin/      # 钉死版本的静态 ffmpeg（含 libx264，渲染必需）
+```
+
+运行时构建脚本的要点：
+
+- 所有外部下载（PBS 运行时、ffmpeg）**钉死版本 + sha256 校验**，缓存于 `client/build/cache/`，重复构建幂等跳过，`--clean` 可整体清理；
+- 依赖用 `uv pip install --python <捆绑解释器> --require-hashes -r server/requirements.lock` 直接装入 PBS 前缀（**不创建 venv**，PBS 按二进制位置解析 prefix，天然可重定位，脚本内含 relocation 自检）；uv 不可用时自动回退 `ensurepip + pip`；
+- 主进程打包态优先 spawn `Resources/python/` 内的解释器，并把 `Resources/bin` 注入 `PATH` 头部使 FFmpeg 命中捆绑二进制；`COMIC_AGENT_PYTHON` 环境变量仍可强制覆盖；开发态（`electron:dev`）行为不变。
+
+本地 API Key、SQLite 数据库、上传文件和缓存不会被打包；后端运行数据写入 Electron
+`userData` 目录。
+
+推送 `v*` 标签时 `.github/workflows/release.yml` 会在 macOS（arm64/x64）与 Windows（x64）
+runner 上成套构建三个平台的安装包并发布到 GitHub Releases（当前为未签名构建）；
+也可通过 `workflow_dispatch` 以 `--publish never` 干跑验证流水线。
 
 开发与 CI 的完整依赖使用 `server/requirements-dev.lock` 安装；两个锁文件均要求
 `python -m pip install --require-hashes -r <lockfile>`，更新直接依赖后需要重新生成锁文件。

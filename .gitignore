@@ -44,6 +44,11 @@ out/
 release/
 *.tgz
 
+# Desktop bundle staging: bundled Python runtime + static ffmpeg produced by
+# client/scripts/build-python-runtime.mjs (client/release/ output likewise).
+client/build/
+client/release/
+
 # Electron
 *.dmg
 *.AppImage

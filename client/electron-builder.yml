@@ -7,13 +7,14 @@ asar: true
 compression: normal
 directories:
   output: release
+artifactName: ${productName}-${version}-${os}-${arch}.${ext}
 files:
   - dist/**/*
   - dist-electron/**/*
   - package.json
   - '!node_modules/**/*'
 extraResources:
-  # The desktop main process starts this source tree with the user's Python
+  # The desktop main process starts this source tree with the bundled Python
   # runtime. Runtime data is redirected to Electron's userData directory.
   - from: ../server
     to: server
@@ -27,10 +28,44 @@ extraResources:
       - '!data/uploads/**'
       - '!**/.env'
       - '!**/.env.*'
+      - '!**/.venv/**'
+      - '!**/venv/**'
       - '!**/__pycache__/**'
       - '!**/*.py[cod]'
+      - '!**/.pytest_cache/**'
+      - '!**/.mypy_cache/**'
+      - '!**/.ruff_cache/**'
       - '!**/.claude/**'
       - '!**/test_*.py'
       - '!**/simple_test.py'
       - '!**/start_test.py'
       - '!scripts/**'
+  # Relocatable python-build-standalone runtime with production dependencies
+  # preinstalled, produced by `node scripts/build-python-runtime.mjs`. The
+  # unpacked size is dominated by native wheels, so never let it enter the
+  # asar (it lives in extraResources by design).
+  - from: build/python
+    to: python
+  # Pinned static ffmpeg per platform; the main process prepends this
+  # directory to PATH so the server's shutil.which("ffmpeg") finds it.
+  - from: build/bin
+    to: bin
+  - from: build/THIRD-PARTY-NOTICES.md
+    to: THIRD-PARTY-NOTICES.md
+# Each matrix runner builds for its own architecture; native Python wheels
+# make a macOS universal2 build impossible.
+mac:
+  target:
+    - dmg
+    - zip
+  category: public.app-category.entertainment
+  # TODO(signing, next stage): set `identity` + notarize credentials here and
+  # remove CSC_IDENTITY_AUTO_DISCOVERY=false from the release workflow.
+win:
+  target:
+    - nsis
+    - zip
+publish:
+  provider: github
+  owner: robiteame
+  repo: ComicAgent

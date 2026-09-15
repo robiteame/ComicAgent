@@ -1,0 +1,87 @@
+name: Release
+
+# Multi-platform desktop release pipeline. Python runtime, ffmpeg and the
+# Electron bundle are built as a matched set on each runner — no cross-arch
+# builds, no macOS universal2 (native wheels do not ship universal2).
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish to GitHub Releases (never = dry-run, artifacts only)'
+        type: choice
+        default: never
+        options: [never, always]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  desktop:
+    name: Desktop (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-13 was retired in 2025-12; macos-15-intel is the last
+          # Intel image. macos-14 deprecation starts 2026-07, so use macos-15.
+          - name: macOS arm64
+            os: macos-15
+          - name: macOS x64
+            os: macos-15-intel
+          - name: Windows x64
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.15.1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.13.0
+          cache: pnpm
+
+      - uses: astral-sh/setup-uv@v10.1.0
+        with:
+          version: 0.12.14
+          enable-cache: true
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build bundled Python runtime and ffmpeg
+        run: pnpm --dir client run build:runtime
+
+      - name: Build renderer and Electron main
+        run: pnpm --dir client exec vite build
+
+      - name: Build installers
+        # Tag pushes publish; workflow_dispatch defaults to a dry-run
+        # (--publish never) so the pipeline can be validated end to end.
+        run: pnpm --dir client exec electron-builder --publish ${{ github.event_name == 'push' && 'always' || inputs.publish }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Unsigned builds: never probe the keychain for a signing identity.
+          # TODO(signing, next stage): replace with CSC_LINK/CSC_KEY_PASSWORD
+          # and notarization credentials.
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+      - name: Upload installers as artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.os }}
+          path: |
+            client/release/*.dmg
+            client/release/*.zip
+            client/release/*.exe
+            client/release/*.blockmap
+          if-no-files-found: error

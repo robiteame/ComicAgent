@@ -80,6 +80,20 @@ function backendRoot() {
   return app.isPackaged ? path.join(process.resourcesPath, 'server') : path.resolve(__dirname, '../../server')
 }
 
+// The installer bundles a relocatable python-build-standalone runtime and a
+// static ffmpeg under Resources/ (see client/scripts/build-python-runtime.mjs).
+function bundledPythonCandidates(): string[] {
+  const pythonDir = path.join(process.resourcesPath, 'python')
+  return process.platform === 'win32'
+    ? [path.join(pythonDir, 'python.exe')]
+    : [path.join(pythonDir, 'bin', 'python3'), path.join(pythonDir, 'bin', 'python')]
+}
+
+function bundledBinDir(): string | null {
+  const binDir = path.join(process.resourcesPath, 'bin')
+  return existsSync(binDir) ? binDir : null
+}
+
 function wait(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms))
 }
@@ -197,16 +211,32 @@ async function startBackend() {
     ...(BACKEND_AUTH_TOKEN ? { COMIC_AGENT_LOCAL_TOKEN: BACKEND_AUTH_TOKEN } : {}),
   }
   const configuredPython = process.env.COMIC_AGENT_PYTHON?.trim()
+  // Priority: explicit override (debug escape hatch) > bundled runtime >
+  // system Python (legacy fallback when the bundle is missing).
+  const systemCandidates = process.platform === 'win32'
+    ? ['python.exe', 'python']
+    : ['python3', 'python']
   const candidates = configuredPython
     ? [configuredPython]
-    : process.platform === 'win32'
-      ? ['python.exe', 'python']
-      : ['python3', 'python']
+    : app.isPackaged
+      ? [...bundledPythonCandidates().filter((candidate) => existsSync(candidate)), ...systemCandidates]
+      : systemCandidates
+
+  // Make shutil.which("ffmpeg") inside the server resolve to the bundled
+  // static binary instead of requiring a system install.
+  const prependToPath = (env: NodeJS.ProcessEnv, dir: string) => {
+    env.PATH = `${dir}${path.delimiter}${env.PATH ?? ''}`
+  }
+  if (app.isPackaged) {
+    const binDir = bundledBinDir()
+    if (binDir) prependToPath(env, binDir)
+  }
 
   let lastError: Error | undefined
   try {
     for (const candidate of candidates) {
       try {
+        console.log(`[backend] 使用解释器: ${candidate}`)
         backendProcess = await spawnBackend(candidate, serverDir, env)
         break
       } catch (error) {
@@ -262,7 +292,11 @@ if (gotSingleInstanceLock) app.whenReady().then(async () => {
       await startBackend()
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error)
-      dialog.showErrorBox('ComicAgent 后端启动失败', `${detail}\n\n可设置 COMIC_AGENT_PYTHON 指向 Python 3.11+。`)
+      const bundledMissing = !existsSync(path.join(process.resourcesPath, 'python'))
+      const hint = bundledMissing
+        ? '安装包似乎缺少自带的 Python 运行时，已尝试回退到系统 Python。\n可设置 COMIC_AGENT_PYTHON 指向 Python 3.11+ 并确认其已安装全部依赖。'
+        : '可设置 COMIC_AGENT_PYTHON 指向 Python 3.11+。'
+      dialog.showErrorBox('ComicAgent 后端启动失败', `${detail}\n\n${hint}`)
     }
   }
   createWindow()
