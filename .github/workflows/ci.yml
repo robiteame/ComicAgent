@@ -20,6 +20,9 @@ jobs:
           cache-dependency-path: server/requirements-dev.lock
       - name: Install server dependencies
         run: python -m pip install --require-hashes -r server/requirements-dev.lock
+      # A few regression tests exercise real encodes via shutil.which("ffmpeg").
+      - name: Install ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
       - name: Compile Python modules
         run: python -m compileall -q server
       - name: Run regression tests
