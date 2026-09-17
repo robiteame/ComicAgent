@@ -167,10 +167,40 @@ def _check_ffmpeg() -> None:
         raise RuntimeError("ffmpeg unavailable") from exc
 
 
+def _start_parent_watchdog() -> None:
+    """Exit when the desktop shell that spawned us disappears.
+
+    The Electron main process keeps our stdin pipe open for its whole
+    lifetime. If it dies without a chance to kill us (crash, SIGKILL), the
+    pipe hits EOF and this daemon thread shuts the server down so a stale
+    backend can never keep holding the database or a loopback port.
+    """
+
+    import threading
+
+    def _watch() -> None:
+        stream = getattr(sys.stdin, "buffer", None)
+        if stream is None:
+            return
+        try:
+            # EOF (and a broken-pipe read error, which is how a dead writer
+            # can surface on Windows) both mean the shell is gone.
+            while stream.read(4096) != b"":
+                pass
+        except Exception:
+            pass
+        os._exit(0)
+
+    threading.Thread(target=_watch, name="parent-watchdog", daemon=True).start()
+
+
 if __name__ == "__main__":
     import os
 
     import uvicorn
+
+    if os.getenv("COMIC_AGENT_PARENT_WATCH", "").strip() == "1":
+        _start_parent_watchdog()
 
     # The desktop client only needs a local API. Allow an explicit HOST for
     # deployments that intentionally expose the service, but keep the default

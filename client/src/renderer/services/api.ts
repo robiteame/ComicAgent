@@ -1,6 +1,21 @@
 import axios from 'axios'
 
-export const API_BASE = import.meta.env?.VITE_API_BASE_URL || 'http://127.0.0.1:8011'
+// The packaged desktop shell spawns the backend on a per-launch random
+// loopback port (main.ts reserveBackendPort) and injects the base URL here;
+// development and plain-web builds keep the documented fixed endpoint.
+function resolveApiBase(): string {
+  if (typeof window !== 'undefined') {
+    try {
+      const injected = window.electronAPI?.getBackendBaseUrl?.()
+      if (injected) return injected
+    } catch {
+      // fall through to the static default
+    }
+  }
+  return import.meta.env?.VITE_API_BASE_URL || 'http://127.0.0.1:8011'
+}
+
+export const API_BASE = resolveApiBase()
 export const WS_BASE = API_BASE.replace(/^http/, 'ws')
 export const API_OUTPUT_BASE = `${API_BASE}/output/`
 
@@ -18,10 +33,11 @@ const LOCAL_AUTH_TOKEN = getLocalAuthToken()
 function isLocalApiOrigin(value: string): boolean {
   try {
     const url = new URL(value)
+    // Loopback host on any port: the local token is only ever meant for the
+    // backend this shell spawned, whose port changes per launch.
     return (
       (url.protocol === 'http:' || url.protocol === 'ws:') &&
-      (url.hostname === '127.0.0.1' || url.hostname === 'localhost') &&
-      url.port === '8011'
+      (url.hostname === '127.0.0.1' || url.hostname === 'localhost' || url.hostname === '[::1]')
     )
   } catch {
     return false

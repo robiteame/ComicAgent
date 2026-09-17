@@ -59,8 +59,19 @@ mac:
     - dmg
     - zip
   category: public.app-category.entertainment
-  # TODO(signing, next stage): set `identity` + notarize credentials here and
-  # remove CSC_IDENTITY_AUTO_DISCOVERY=false from the release workflow.
+  # Notarization rejects the bundle if any nested Mach-O binary is unsigned,
+  # so the bundled Python runtime and ffmpeg must go through codesign too
+  # (paths are relative to the .app Contents/ directory). Signing itself is
+  # driven by CSC_LINK/CSC_KEY_PASSWORD + APPLE_* env vars in the release
+  # workflow; hardening entitlements stay off because the Python child
+  # process is spawned outside the app sandbox.
+  binaries:
+    - Resources/python/bin/python3
+    - Resources/python/lib/libpython3.11.dylib
+    - Resources/python/lib/python3.11/lib-dynload/*.so
+    - Resources/python/lib/python3.11/site-packages/*.so
+    - Resources/python/lib/python3.11/site-packages/*/*.so
+    - Resources/bin/ffmpeg
 win:
   target:
     - nsis

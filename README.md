@@ -340,11 +340,21 @@ ComicAgent/
 | macOS（Intel） | `ComicAgent-<版本>-mac-x64.dmg` | 同上 |
 | Windows（x64） | `ComicAgent-<版本>-win-x64.exe` | NSIS 安装器，另有绿色版 zip |
 
-从 [GitHub Releases](https://github.com/robiteame/ComicAgent/releases) 获取最新版本；每次打 `v*` 标签会自动构建全部三个平台并发布。
+从 [GitHub Releases](https://github.com/robiteame/ComicAgent/releases) 获取最新版本；每次打 `v*` 标签会自动构建全部三个平台并发布。发布流水线自带安全门禁：先跑完整 CI 测试矩阵，再校验签名凭据，产物附 SBOM 与 sha256 校验文件（`SHA256SUMS-<os>.txt`，可用 `shasum -a 256 --check` 验证）。
 
-### macOS 首次启动（未签名应用）
+### 发布前需配置的仓库 Secrets
 
-当前安装包未做开发者签名与公证，首次打开会被 Gatekeeper 拦截（“无法验证开发者”）。两种绕过方式任选：
+正式 Release 必须签名与公证，缺少以下任意 Secret 时打标签会直接失败（防止误发未签名安装包）：
+
+| Secret | 用途 |
+|--------|------|
+| `CSC_LINK` / `CSC_KEY_PASSWORD` | macOS Developer ID 证书（p12 base64 + 密码） |
+| `APPLE_ID` / `APPLE_APP_SPECIFIC_PASSWORD` / `APPLE_TEAM_ID` | macOS 公证（notarization） |
+| `WIN_CSC_LINK` / `WIN_CSC_KEY_PASSWORD` | Windows Authenticode 代码签名证书 |
+
+### macOS 首次启动（仅本地/未签名构建）
+
+本地自行构建或内测 dry-run 产物未做开发者签名与公证，首次打开会被 Gatekeeper 拦截（“无法验证开发者”）。两种绕过方式任选：
 
 ```bash
 # 方式一：命令行清除隔离属性（推荐）
@@ -353,11 +363,11 @@ xattr -cr /Applications/ComicAgent.app
 # 方式二：右键 -> 打开 -> 再点“打开”；或在 系统设置 -> 隐私与安全性 中点“仍要打开”
 ```
 
-### Windows 首次启动（SmartScreen）
+### Windows 首次启动（SmartScreen，仅本地/未签名构建）
 
 未签名 exe 会触发 SmartScreen 蓝色警告：点击 **“更多信息” → “仍要运行”** 即可继续安装。
 
-> 签名与公证（Apple Developer ID / Windows 代码签名证书）规划在后续版本；第三方组件来源与许可见安装包内 `Resources/THIRD-PARTY-NOTICES.md`。
+> 正式 Release 一经配置上述 Secrets 即自动签名 + 公证；第三方组件来源与许可见安装包内 `Resources/THIRD-PARTY-NOTICES.md`。
 
 ---
 

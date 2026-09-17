@@ -1,0 +1,36 @@
+name: Runtime update check
+
+# 月度运行时安全版本检查:pnpm audit 不覆盖 Electron 内嵌 Chromium 的
+# 漏洞,也不跟踪捆绑的 FFmpeg / python-build-standalone 运行时。这里按
+# 上游支持数据对比仓库内钉定的版本,脱离安全维护窗口时自动开 issue 跟踪。
+on:
+  schedule:
+    - cron: '0 2 1 * *' # 每月 1 号 10:00 (Asia/Shanghai)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    name: Compare pinned runtime versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Run version check
+        run: node client/scripts/check-runtime-updates.mjs --report runtime-update-report.md
+
+      - name: Open tracking issue for out-of-support runtimes
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create \
+            --title "运行时安全升级提醒（$(date +%F)）" \
+            --body-file runtime-update-report.md

@@ -3,6 +3,13 @@ name: Release
 # Multi-platform desktop release pipeline. Python runtime, ffmpeg and the
 # Electron bundle are built as a matched set on each runner — no cross-arch
 # builds, no macOS universal2 (native wheels do not ship universal2).
+#
+# Supply-chain gates (see docs/desktop-release-plan.md 阶段3):
+#   1. the CI matrix (tests + typecheck + builds) must pass first;
+#   2. tag releases must carry signing credentials — a public GitHub Release
+#      may never ship unsigned / unnotarized installers;
+#   3. every release carries SBOMs and sha256 checksums alongside the
+#      installers.
 on:
   push:
     tags: ['v*']
@@ -22,8 +29,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  tests:
+    # Security gate: run the full CI matrix before anything is built or
+    # published. Tag pushes bypass branch protection, so this is the only
+    # automated quality bar a release has.
+    name: Test gate (CI matrix)
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   desktop:
     name: Desktop (${{ matrix.name }})
+    needs: tests
     strategy:
       fail-fast: false
       matrix:
@@ -54,6 +71,12 @@ jobs:
           version: 0.12.14
           enable-cache: true
 
+      # FFmpeg is compiled from source on macOS; the x86_64 asm objects need
+      # nasm, which is not part of the runner image.
+      - name: Install assembler toolchain (macOS ffmpeg build)
+        if: runner.os == 'macOS'
+        run: brew install nasm
+
       - name: Install workspace dependencies
         run: pnpm install --frozen-lockfile
 
@@ -63,16 +86,92 @@ jobs:
       - name: Build renderer and Electron main
         run: pnpm --dir client exec vite build
 
+      - name: Verify signing credentials for tag releases
+        # Dry-runs may stay unsigned; a public tag release may not.
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=()
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            for var in CSC_LINK CSC_KEY_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
+              [ -n "${!var}" ] || missing+=("$var")
+            done
+          elif [ "$RUNNER_OS" = "Windows" ]; then
+            for var in WIN_CSC_LINK WIN_CSC_KEY_PASSWORD; do
+              [ -n "${!var}" ] || missing+=("$var")
+            done
+          fi
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Tag releases must be signed/notarized. Missing repo secrets: ${missing[*]}"
+            echo "::error::Configure them in Settings → Secrets and Variables → Actions before pushing the tag."
+            exit 1
+          fi
+          echo "Signing credentials present ($RUNNER_OS)."
+
       - name: Build installers
         # Tag pushes publish; workflow_dispatch defaults to a dry-run
         # (--publish never) so the pipeline can be validated end to end.
         run: pnpm --dir client exec electron-builder --publish ${{ github.event_name == 'push' && 'always' || inputs.publish }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Unsigned builds: never probe the keychain for a signing identity.
-          # TODO(signing, next stage): replace with CSC_LINK/CSC_KEY_PASSWORD
-          # and notarization credentials.
+          # Code signing and notarization are driven entirely by these env
+          # vars (electron-builder imports CSC_LINK into a temp keychain and
+          # notarizes via APPLE_ID/APPLE_APP_SPECIFIC_PASSWORD/APPLE_TEAM_ID).
+          # With no CSC_LINK the explicit 'false' keeps unsigned dry-runs from
+          # probing the runner keychain; when the secrets exist, signing
+          # happens through CSC_LINK regardless of this flag.
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+
+      - name: Generate SBOM for the bundled runtime
+        # Syft inventories the Python runtime, its site-packages and the
+        # compiled ffmpeg — the parts no package manager manifest covers.
+        uses: anchore/sbom-action@v0
+        with:
+          path: client/build
+          format: cyclonedx-json
+          artifact-name: sbom-runtime-${{ matrix.os }}.json
+
+      - name: Generate dependency SBOMs (python lockfile + npm workspace)
+        shell: bash
+        run: |
+          uvx --from cyclonedx-bom cyclonedx-py requirements \
+            --requirement-file server/requirements.lock \
+            --output-format JSON \
+            --output-file server-deps-${{ matrix.os }}.sbom.json
+          pnpm dlx @cyclonedx/cyclonedx-npm --output-file npm-deps-${{ matrix.os }}.sbom.json --omit-dev
+
+      - name: Compute installer checksums
+        shell: bash
+        run: node client/scripts/artifact-hashes.mjs client/release --output "SHA256SUMS-${{ matrix.os }}.txt"
+
+      - name: Attach checksums and SBOMs to the release
+        # Matches the publish condition of the electron-builder step above.
+        if: github.event_name == 'push' || inputs.publish == 'always'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "$GH_REF_NAME" \
+            "client/release/SHA256SUMS-${{ matrix.os }}.txt" \
+            "server-deps-${{ matrix.os }}.sbom.json" \
+            "npm-deps-${{ matrix.os }}.sbom.json" \
+            --clobber
 
       - name: Upload installers as artifacts
         if: always()
@@ -84,4 +183,7 @@ jobs:
             client/release/*.zip
             client/release/*.exe
             client/release/*.blockmap
+            client/release/SHA256SUMS-*.txt
+            server-deps-*.sbom.json
+            npm-deps-*.sbom.json
           if-no-files-found: error

@@ -35,6 +35,7 @@ import {
 } from 'node:fs'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -70,26 +71,29 @@ const PBS_ASSETS = {
   },
 }
 
-// ffmpeg-static publishes single-file static builds for every desktop
-// platform with per-asset checksums. The server encodes with libx264
-// (services/ffmpeg_service.py), so the build must be a GPL flavour that
-// bundles libx264; LGPL-only builds would fail with "Unknown encoder".
-const FFMPEG_TAG = 'b6.1.1'
-const FFMPEG_VERSION = '6.0'
-const FFMPEG_ASSETS = {
-  'darwin-arm64': {
-    name: 'ffmpeg-darwin-arm64',
-    sha256: 'a90e3db6a3fd35f6074b013f948b1aa45b31c6375489d39e572bea3f18336584',
-  },
-  'darwin-x64': {
-    name: 'ffmpeg-darwin-x64',
-    sha256: 'ebdddc936f61e14049a2d4b549a412b8a40deeff6540e58a9f2a2da9e6b18894',
-  },
-  'win32-x64': {
-    name: 'ffmpeg-win32-x64',
-    sha256: '04e1307997530f9cf2fe35cba2ca7e8875ca91da02f89d6c7243df819c94ad00',
-  },
-}
+// ffmpeg: the server encodes with libx264 (services/ffmpeg_service.py), so
+// the build must be a GPL flavour bundling x264. The binary parses uploaded
+// and remotely downloaded media, so it must come from a maintained FFmpeg
+// branch. macOS builds are compiled from the official release tarball plus a
+// pinned x264 snapshot (only system frameworks are linked — see otool -L);
+// Windows uses gyan.dev's versioned essentials build. All artifacts are
+// pinned to exact versions and sha256 constants; never point at rolling
+// "latest" URLs.
+const FFMPEG_VERSION = '9.0.1'
+const FFMPEG_SOURCE_SHA256 = 'cf38e0e28c7e5605942c4a77755349b0145804a397af37eb1fb4c77cb237f635'
+const FFMPEG_SOURCE_URL = `https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz`
+
+// macOS libx264 from the VideoLAN "stable" branch at a pinned commit.
+const X264_COMMIT = 'b35605ace3ddf7c1a5d67a2eb553f034aef41d55'
+const X264_SHA256 = 'cd71a7515b0e9a012e1ac9b1f8415bebcaf6fc97d4db32286642ac4c0fbe24f9'
+const X264_URL = `https://code.videolan.org/videolan/x264/-/archive/${X264_COMMIT}/x264-${X264_COMMIT}.tar.gz`
+
+// Windows: gyan.dev essentials build (GPL, libx264 included), published via
+// the codexffmpeg GitHub release. The sha256 is the release asset digest
+// from the GitHub Releases API.
+const FFMPEG_WIN_URL = `https://github.com/GyanD/codexffmpeg/releases/download/${FFMPEG_VERSION}/ffmpeg-${FFMPEG_VERSION}-essentials_build.zip`
+const FFMPEG_WIN_SHA256 = 'fec81ae03971d9dd4be3ebe02e263bd2ec1d789483f931bdba5f5715e65da2e9'
+const FFMPEG_WIN_ENTRY = `ffmpeg-${FFMPEG_VERSION}-essentials_build/bin/ffmpeg.exe`
 
 function pbsAssetName(asset) {
   return `cpython-${PBS_PYTHON_VERSION}+${PBS_RELEASE_TAG}-${asset.triple}-${PBS_VARIANT}.tar.gz`
@@ -98,10 +102,6 @@ function pbsAssetName(asset) {
 function pbsUrl(asset) {
   const name = pbsAssetName(asset)
   return `https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_RELEASE_TAG}/${encodeURIComponent(name)}`
-}
-
-function ffmpegUrl(asset) {
-  return `https://github.com/eugeneware/ffmpeg-static/releases/download/${FFMPEG_TAG}/${asset.name}`
 }
 
 // ---------------------------------------------------------------------------
@@ -224,7 +224,8 @@ async function fetchVerified(url, dest, expectedSha256) {
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
     stdio: options.stdio ?? 'inherit',
-    env: process.env,
+    cwd: options.cwd,
+    env: options.env ?? process.env,
     shell: false,
   })
   return result
@@ -416,20 +417,151 @@ async function buildPythonRuntime(targetKey) {
 // ffmpeg
 // ---------------------------------------------------------------------------
 
-async function buildFfmpeg(targetKey) {
-  const asset = FFMPEG_ASSETS[targetKey]
-  const targetName = isWindows(targetKey) ? 'ffmpeg.exe' : 'ffmpeg'
-  const cached = path.join(cacheDir, asset.name)
-  await fetchVerified(ffmpegUrl(asset), cached, asset.sha256)
+function ffmpegMarker(targetKey) {
+  return {
+    version: FFMPEG_VERSION,
+    x264Commit: isWindows(targetKey) ? null : X264_COMMIT,
+  }
+}
 
-  mkdirSync(binDir, { recursive: true })
-  const target = path.join(binDir, targetName)
-  copyFileSync(cached, target)
-  chmodSync(target, 0o755)
-
+function verifyFfmpegBinary(target, targetKey) {
   const version = run(target, ['-version'], { stdio: 'pipe' })
   if (version.status !== 0) fail(`捆绑 ffmpeg 无法执行: ${target}`)
-  log(`ffmpeg 就绪: ${String(version.stdout).split('\n')[0]}`)
+  const banner = String(version.stdout)
+  if (!banner.includes(`ffmpeg version ${FFMPEG_VERSION}`)) {
+    fail(`捆绑 ffmpeg 版本异常，期望 ${FFMPEG_VERSION}:\n${banner.split('\n')[0]}`)
+  }
+  if (!/--enable-libx264/.test(banner)) {
+    // 服务端用 libx264 编码（services/ffmpeg_service.py），缺失时会以
+    // "Unknown encoder" 失败。
+    fail('捆绑 ffmpeg 缺少 libx264 编码器（GPL 构建才包含）')
+  }
+  log(`ffmpeg 自检通过: ${banner.split('\n')[0]}`)
+}
+
+async function buildFfmpegFromSource(buildRoot) {
+  const ffmpegSrc = path.join(buildRoot, `ffmpeg-${FFMPEG_VERSION}`)
+  const x264Src = path.join(buildRoot, `x264-${X264_COMMIT}`)
+  const prefix = path.join(buildRoot, 'prefix')
+
+  // x86_64 assembly (x264 + ffmpeg) is assembled with nasm; arm64 uses
+  // intrinsics and the compiler's integrated assembler.
+  if (process.platform === 'darwin' && process.arch === 'x64') {
+    if (run('nasm', ['-v'], { stdio: 'pipe' }).status !== 0) {
+      fail('缺少 nasm（x64 汇编需要）。请先运行: brew install nasm')
+    }
+  }
+
+  const jobs = String(Math.max(2, os.cpus().length))
+  const buildEnv = { ...process.env, MACOSX_DEPLOYMENT_TARGET: '11.0' }
+
+  const x264Prefix = path.join(prefix, 'x264')
+  log(`编译 x264 ${X264_COMMIT.slice(0, 8)} -> ${x264Prefix}`)
+  let result = run(path.join(x264Src, 'configure'), [
+    `--prefix=${x264Prefix}`,
+    '--enable-static',
+    '--disable-cli',
+    '--disable-opencl',
+  ], { cwd: x264Src, stdio: 'inherit', env: buildEnv })
+  if (result.status !== 0) fail('x264 configure 失败')
+  result = run('make', [`-j${jobs}`], { cwd: x264Src, stdio: 'inherit', env: buildEnv })
+  if (result.status !== 0) fail('x264 编译失败')
+  result = run('make', ['install'], { cwd: x264Src, stdio: 'inherit', env: buildEnv })
+  if (result.status !== 0) fail('x264 install 失败')
+
+  log(`编译 ffmpeg ${FFMPEG_VERSION} -> ${binDir}`)
+  result = run(path.join(ffmpegSrc, 'configure'), [
+    `--prefix=${path.join(prefix, 'ffmpeg')}`,
+    '--enable-gpl',
+    '--enable-libx264',
+    // Explicitly opt into zlib (png decode); everything else in-tree is
+    // built by default while --disable-autodetect keeps random host libs
+    // out of the relocatable binary.
+    '--enable-zlib',
+    '--disable-autodetect',
+    '--disable-shared',
+    '--enable-static',
+    '--disable-ffplay',
+    '--disable-ffprobe',
+    '--disable-doc',
+    `--extra-cflags=-I${path.join(x264Prefix, 'include')}`,
+    `--extra-ldflags=-L${path.join(x264Prefix, 'lib')}`,
+  ], {
+    cwd: ffmpegSrc,
+    stdio: 'inherit',
+    env: { ...buildEnv, PKG_CONFIG_PATH: path.join(x264Prefix, 'lib', 'pkgconfig') },
+  })
+  if (result.status !== 0) fail('ffmpeg configure 失败')
+  result = run('make', [`-j${jobs}`, 'ffmpeg'], { cwd: ffmpegSrc, stdio: 'inherit', env: buildEnv })
+  if (result.status !== 0) fail('ffmpeg 编译失败')
+  return path.join(ffmpegSrc, 'ffmpeg')
+}
+
+async function extractTarball(archive, destDir, topLevelExpect) {
+  const result = run('tar', ['-xf', archive, '-C', destDir])
+  if (result.status !== 0) fail(`解压失败: ${archive}`)
+  if (!existsSync(path.join(destDir, topLevelExpect))) {
+    fail(`压缩包布局异常: 未找到 ${topLevelExpect}`)
+  }
+}
+
+async function buildFfmpeg(targetKey) {
+  const targetName = isWindows(targetKey) ? 'ffmpeg.exe' : 'ffmpeg'
+  const target = path.join(binDir, targetName)
+  const markerFile = path.join(binDir, '.ffmpeg-build.json')
+  const marker = { ...ffmpegMarker(targetKey), target: targetKey }
+
+  if (existsSync(markerFile) && existsSync(target)) {
+    try {
+      const current = JSON.parse(readFileSync(markerFile, 'utf8'))
+      const unchanged = JSON.stringify(current) === JSON.stringify(marker)
+      if (unchanged) {
+        try {
+          verifyFfmpegBinary(target, targetKey)
+          log(`ffmpeg 已是最新，跳过 (${FFMPEG_VERSION})`)
+          return
+        } catch {
+          log('现有 ffmpeg 自检失败，重新构建')
+        }
+      }
+    } catch {
+      log('ffmpeg 构建标记损坏，重新构建')
+    }
+  }
+
+  mkdirSync(binDir, { recursive: true })
+
+  if (isWindows(targetKey)) {
+    const cached = path.join(cacheDir, `ffmpeg-${FFMPEG_VERSION}-win64.zip`)
+    await fetchVerified(FFMPEG_WIN_URL, cached, FFMPEG_WIN_SHA256)
+    const extractDir = path.join(buildDir, 'ffmpeg-extract')
+    rmSync(extractDir, { recursive: true, force: true })
+    mkdirSync(extractDir, { recursive: true })
+    await extractTarball(cached, extractDir, FFMPEG_WIN_ENTRY)
+    copyFileSync(path.join(extractDir, FFMPEG_WIN_ENTRY), target)
+    rmSync(extractDir, { recursive: true, force: true })
+  } else {
+    const ffmpegArchive = path.join(cacheDir, `ffmpeg-${FFMPEG_VERSION}.tar.xz`)
+    const x264Archive = path.join(cacheDir, `x264-${X264_COMMIT}.tar.gz`)
+    await fetchVerified(FFMPEG_SOURCE_URL, ffmpegArchive, FFMPEG_SOURCE_SHA256)
+    await fetchVerified(X264_URL, x264Archive, X264_SHA256)
+
+    // One scratch dir per build; both tarballs extract their own top-level
+    // directory into it.
+    const buildRoot = path.join(buildDir, 'ffmpeg-build')
+    rmSync(buildRoot, { recursive: true, force: true })
+    mkdirSync(buildRoot, { recursive: true })
+    await extractTarball(ffmpegArchive, buildRoot, `ffmpeg-${FFMPEG_VERSION}`)
+    await extractTarball(x264Archive, buildRoot, `x264-${X264_COMMIT}`)
+
+    const built = await buildFfmpegFromSource(buildRoot)
+    copyFileSync(built, target)
+    rmSync(buildRoot, { recursive: true, force: true })
+  }
+
+  chmodSync(target, 0o755)
+  verifyFfmpegBinary(target, targetKey)
+  writeFileSync(markerFile, `${JSON.stringify(marker, null, 2)}\n`)
 }
 
 // ---------------------------------------------------------------------------
@@ -452,14 +584,18 @@ Versions and sources are pinned in \`client/scripts/build-python-runtime.mjs\`.
 
 ## FFmpeg
 
-- Artifact: ffmpeg-static ${FFMPEG_TAG} (FFmpeg ${FFMPEG_VERSION}), static single-file builds
-- Source: https://github.com/eugeneware/ffmpeg-static/releases/tag/${FFMPEG_TAG}
-  (macOS x64 builds originate from evermeet.cx; Windows/Linux builds from
-  johnvansickle.com)
-- License: GPL-2.0-or-later WITH GPL-3-0-or-later components (the builds
-  include libx264 and other GPL libraries, which the application's video
-  renderer requires). See https://ffmpeg.org/legal.html
-- Full license texts are published alongside the upstream builds.
+- Artifact: FFmpeg ${FFMPEG_VERSION}
+  - macOS (arm64/x64): compiled from the official release tarball
+    (https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz) together
+    with x264 ${X264_COMMIT} from https://code.videolan.org/videolan/x264
+    (stable branch, pinned commit). The resulting binary links macOS system
+    frameworks only.
+  - Windows (x64): gyan.dev "essentials" build from
+    https://github.com/GyanD/codexffmpeg/releases/tag/${FFMPEG_VERSION}
+- License: GPL-2.0-or-later (the builds include libx264, which the
+  application's video renderer requires). See https://ffmpeg.org/legal.html
+- Source tarballs for the macOS builds are available from ffmpeg.org and
+  https://code.videolan.org/videolan/x264 respectively.
 
 ## Python packages
 

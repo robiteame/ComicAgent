@@ -3,4 +3,6 @@ packages:
 
 allowBuilds:
   electron: true
+  # 仅用于 squirrel.windows 打包目标（本仓库使用 nsis），无需其安装脚本。
+  electron-winstaller: false
   esbuild: true
