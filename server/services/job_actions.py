@@ -13,12 +13,13 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy.orm import Session
 
-from models import BackgroundJob
+from models import BackgroundJob, Shot
 from services import job_center
 from services.job_dispatch import redispatch
 from services.job_types import (
@@ -28,11 +29,14 @@ from services.job_types import (
     ERROR_CODE_NOT_RETRYABLE,
     ERROR_CODE_SCOPE_CONFLICT,
     ERROR_CODE_UNSUPPORTED,
+    JOB_TYPE_SCRIPT_PIPELINE,
+    JOB_TYPE_SHOT_VIDEO,
     RETRYABLE_STATUSES,
     STATUS_CANCELLING,
     TERMINAL_STATUSES,
     parse_job_key,
 )
+from services.provider_readiness import CODE_PROVIDER_NOT_CONFIGURED, format_message, missing_providers
 from services.task_registry import cancel as cancel_job_task
 
 RETRY_MODE = "retry"
@@ -151,6 +155,50 @@ async def resume_job(db: Session, job: BackgroundJob) -> ActionOutcome:
     return await _dispatch(db, job, RESUME_MODE)
 
 
+def _provider_block(db: Session, job: BackgroundJob) -> ActionOutcome | None:
+    """重试 / 续跑前同样做 Provider 预检，避免任务重新排队后在中途再次失败。
+
+    仅覆盖会直接消耗模型能力的任务类型；其余交给各自入口的既有校验。
+    """
+
+    job_type = str(job.job_type or "")
+    identity = parse_job_key(job.idempotency_key)
+    if job_type == JOB_TYPE_SCRIPT_PIPELINE:
+        mode = identity.qualifier if identity.qualifier in {"manual", "auto"} else "manual"
+        missing = missing_providers("script_pipeline", mode=mode)
+    elif job_type == JOB_TYPE_SHOT_VIDEO:
+        shot = db.query(Shot).filter(Shot.id == identity.owner_id).first()
+        if shot is None:
+            return None
+        profile = _json_dict(shot.continuity_profile)
+        missing = missing_providers(
+            "shot_video",
+            has_dialogue=bool((shot.dialogue or "").strip()),
+            audio_mode_override=str(profile.get("audio_mode") or ""),
+        )
+    else:
+        return None
+    if not missing:
+        return None
+    return ActionOutcome(
+        ok=False,
+        http_status=409,
+        status="provider_not_configured",
+        message=format_message(missing),
+        error_code=CODE_PROVIDER_NOT_CONFIGURED,
+    )
+
+
+def _json_dict(raw: Any) -> dict:
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw) if isinstance(raw, (str, bytes)) else dict(raw)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
 async def _dispatch(db: Session, job: BackgroundJob, mode: str) -> ActionOutcome:
     job_type = str(job.job_type or "")
     canonical = parse_job_key(job.idempotency_key).canonical
@@ -207,6 +255,10 @@ async def _dispatch(db: Session, job: BackgroundJob, mode: str) -> ActionOutcome
             job=job_center.job_detail(db, target),
             idempotent=True,
         )
+
+    blocked = _provider_block(db, job)
+    if blocked is not None:
+        return blocked
 
     result = await redispatch(job, mode)
     db.expire_all()

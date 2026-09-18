@@ -522,6 +522,14 @@ export const settingsApi = {
 
   modelConfigs: () => api.get('/api/settings/model-configs').then((r) => r.data),
 
+  discoverModels: (data: {
+    category: 'script' | 'image' | 'video' | 'voice'
+    base_url: string
+    api_key?: string
+    protocol?: string
+    auth_style?: string
+  }) => api.post('/api/settings/model-configs/discover', data).then((r) => r.data),
+
   saveModelConfigs: (data: Record<string, any>) => api.put('/api/settings/model-configs', data).then((r) => r.data),
 }
 

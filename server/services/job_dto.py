@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 import statistics
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from services.error_reporter import summarize
@@ -31,8 +31,24 @@ from services.job_types import (
 MESSAGE_MAX_CHARS = 240
 
 
+def as_utc(value: datetime | None) -> datetime | None:
+    """把存储/传入的时间统一成 UTC 时区感知对象。
+
+    数据库里的历史列都是 naive UTC（SQLite 不保留时区），这里显式补上 UTC，
+    避免序列化成不带时区的 ISO 字符串后被前端按本地时间解释（东八区会差 8 小时）。
+    已带时区的值原样换算到 UTC。
+    """
+
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 def _as_iso(value: datetime | None) -> str | None:
-    return value.isoformat() if isinstance(value, datetime) else None
+    moment = as_utc(value)
+    return moment.isoformat() if moment is not None else None
 
 
 def _clamp_progress(value: Any) -> int:
@@ -61,14 +77,14 @@ def _json_list(value: Any) -> list[str]:
 def job_duration_seconds(job: Any, *, now: datetime | None = None) -> int:
     """已运行时长（秒）。排队中且未开始的按 0 处理。"""
 
-    moment = now or datetime.utcnow()
-    started = job.started_at or job.created_at
+    moment = as_utc(now) if now is not None else datetime.now(timezone.utc)
+    started = as_utc(job.started_at or job.created_at)
     if started is None:
         return 0
-    end = job.finished_at if job.status in TERMINAL_STATUSES and job.finished_at else moment
+    end = as_utc(job.finished_at) if job.status in TERMINAL_STATUSES and job.finished_at else moment
     try:
         return max(0, int((end - started).total_seconds()))
-    except TypeError:  # 混用 tz-aware / naive 时间戳时不要让列表接口 500
+    except TypeError:  # 防御：意外类型组合时不要让列表接口 500
         return 0
 
 
@@ -169,7 +185,7 @@ def job_dto(
 ) -> dict[str, Any]:
     """把一条任务行转成稳定 DTO。绝不包含 run_token。"""
 
-    moment = now or datetime.utcnow()
+    moment = now if now is not None else datetime.now(timezone.utc)
     status = str(job.status or "")
     job_type = str(job.job_type or JOB_TYPE_UNKNOWN)
     error_message = _short_message(job.error_message or job.error)
@@ -239,6 +255,7 @@ def job_dto(
 __all__ = [
     "MESSAGE_MAX_CHARS",
     "action_flags",
+    "as_utc",
     "cost_dto",
     "estimate_eta_seconds",
     "job_dto",

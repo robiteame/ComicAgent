@@ -179,6 +179,20 @@ createWebSocket(projectId, onMessage) → WebSocket
 - **地址**: `ws://localhost:8000/ws/{project_id}`
 - **心跳**: 每 30 秒发送 `ping`
 - **监听事件**: `progress` / `complete` / `shot_update` / `render_complete` / `error`
+- **complete 事件携带 `title`**: 剧本解析完成后后端已根据剧本自动命名项目，
+  MainWorkspace 收到后同步标题输入框并派发 `PROJECTS_REFRESHED_EVENT`
+  （`constants/events.ts`）刷新侧边栏项目列表。
+
+### 任务启动闸门（与后端 409 约定）
+
+提交任务的入口在失败时先解析两类结构化拦截（HTTP 409 + `detail` 对象），命中则弹
+通知并短路，不再走通用错误提示：
+
+- `budget_exceeded`（硬预算不足）→ `notifyBudgetBlocked`；
+- `provider_not_configured`（模型端点未配置 API Key）→ `notifyProviderBlocked`，
+  通知附「去系统设置」按钮，跳转模型服务配置页。
+  解析函数在 `services/costModel.ts`（`providerBlockedFromError`），展示在
+  `components/TaskEstimateModal.tsx`。
 
 ### 完整生成流程
 

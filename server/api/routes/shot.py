@@ -48,6 +48,7 @@ from services.tts_service import TTSService
 from services.video_service import SeedanceVideoService
 from services.security import existing_file, validate_identifier
 from api.claim_guard import budget_notice, claim_or_block
+from api.provider_guard import ensure_providers_ready
 from services.task_registry import (
     cancel as cancel_task,
     cancel_scopes,
@@ -455,6 +456,14 @@ async def generate_shot_video(shot_id: str, data: ShotVideoGenerateRequest, db: 
     if _can_reuse_existing_video(shot, data.force):
         return {"id": shot.id, "status": shot.status, "video_path": shot.video_path, "audio_path": shot.audio_path}
 
+    # 启动前预检：视频端点必配；配音端点默认必配，但视频模型具备原生对白语音
+    # 能力（或镜头无台词 / 镜头级显式指定 native）时不强制要求 TTS。
+    ensure_providers_ready(
+        "shot_video",
+        has_dialogue=bool((shot.dialogue or "").strip()),
+        audio_mode_override=str(_json_dict(shot.continuity_profile).get("audio_mode") or ""),
+    )
+
     expected_version = shot.version or 1
     claim = claim_or_block(
         task_key,
@@ -495,6 +504,8 @@ async def generate_shot_audio(shot_id: str, data: ShotAudioGenerateRequest, db: 
     expected_version = shot.version or 1
     if data.reuse_existing and _reusable_audio_path(shot_id, expected_version, shot.audio_path):
         return {"id": shot.id, "status": shot.status, "audio_path": shot.audio_path, "skipped": True}
+    # 纯配音任务本身就是 TTS 调用：语音端点未配置时直接拒绝（已有可复用配音除外）。
+    ensure_providers_ready("shot_audio")
     claim = claim_or_block(
         task_key,
         f"shot:{shot_id}",

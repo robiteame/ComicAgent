@@ -141,6 +141,20 @@ function asIsoOrNull(value: unknown): string | null {
 }
 
 /**
+ * 把服务端时间戳解析成绝对时刻（毫秒）。
+ *
+ * 服务端历史数据可能仍返回不带时区的 naive UTC 字符串；`new Date` 会把它当本地
+ * 时间解释（东八区显示会偏差 8 小时）。因此这里显式补 `Z`：带时区（`Z` 或
+ * `±hh:mm`）的交给标准解析，naive 的一律按 UTC 解释。无法解析返回 null。
+ */
+export function parseServerTime(iso: string | null | undefined): number | null {
+  if (!iso) return null
+  const hasZone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(iso)
+  const time = new Date(hasZone ? iso : iso + 'Z').getTime()
+  return Number.isNaN(time) ? null : time
+}
+
+/**
  * 把服务端返回的对象归一化成 DTO。
  *
  * 缺字段、类型不对或没有 id 的数据一律返回 null：宁可少显示一条任务，也不能让
@@ -218,11 +232,11 @@ export function normalizeJobList(raw: unknown): JobDto[] {
   return jobs
 }
 
-/** 时间戳比较：同一服务端格式下字符串比较等价于时间先后。 */
+/** 时间戳比较：统一解析成绝对时刻再比，兼容带时区与历史 naive 两种格式。 */
 function isOlderThan(incoming: JobDto, current: JobDto): boolean {
-  const a = incoming.updated_at || ''
-  const b = current.updated_at || ''
-  if (a && b) return a < b
+  const a = parseServerTime(incoming.updated_at)
+  const b = parseServerTime(current.updated_at)
+  if (a !== null && b !== null) return a < b
   return false
 }
 
@@ -304,8 +318,9 @@ export function filterJobs(jobs: JobDto[], filters: JobFilters): JobDto[] {
 }
 
 function compareByUpdatedDesc(a: JobDto, b: JobDto): number {
-  const left = a.updated_at || a.created_at || ''
-  const right = b.updated_at || b.created_at || ''
+  // 缺失/无法解析的时间按“最旧”处理，沉到列表末尾。
+  const left = parseServerTime(a.updated_at || a.created_at) ?? Number.NEGATIVE_INFINITY
+  const right = parseServerTime(b.updated_at || b.created_at) ?? Number.NEGATIVE_INFINITY
   if (left === right) return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
   return left < right ? 1 : -1
 }
@@ -328,8 +343,8 @@ export function sortJobs(jobs: JobDto[], key: JobSortKey = 'updated'): JobDto[] 
   }
   if (key === 'created') {
     sorted.sort((a, b) => {
-      const left = a.created_at || ''
-      const right = b.created_at || ''
+      const left = parseServerTime(a.created_at) ?? Number.NEGATIVE_INFINITY
+      const right = parseServerTime(b.created_at) ?? Number.NEGATIVE_INFINITY
       if (left === right) return compareByUpdatedDesc(a, b)
       return left < right ? 1 : -1
     })
@@ -411,23 +426,22 @@ export function formatDuration(seconds: number): string {
 }
 
 export function formatRelativeTime(iso: string | null, now: number = Date.now()): string {
-  if (!iso) return '—'
-  const value = new Date(iso)
-  const time = value.getTime()
-  if (Number.isNaN(time)) return '—'
+  const time = parseServerTime(iso)
+  if (time === null) return '—'
   const diff = Math.round((now - time) / 1000)
   if (diff < 10) return '刚刚'
   if (diff < 60) return diff + ' 秒前'
   if (diff < 3600) return Math.floor(diff / 60) + ' 分钟前'
   if (diff < 86400) return Math.floor(diff / 3600) + ' 小时前'
   if (diff < 172800) return '昨天'
+  const value = new Date(time)
   return String(value.getMonth() + 1).padStart(2, '0') + '-' + String(value.getDate()).padStart(2, '0')
 }
 
 export function formatClock(iso: string | null): string {
-  if (!iso) return '—'
-  const value = new Date(iso)
-  if (Number.isNaN(value.getTime())) return '—'
+  const time = parseServerTime(iso)
+  if (time === null) return '—'
+  const value = new Date(time)
   return (
     String(value.getHours()).padStart(2, '0') +
     ':' +

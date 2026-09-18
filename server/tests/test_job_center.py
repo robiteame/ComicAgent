@@ -20,7 +20,7 @@ import json
 import sys
 import time
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -144,7 +144,11 @@ class JobListApiTests(JobCenterTestCase):
         # 默认按 updated_at DESC
         self.assertEqual(page["items"][0]["project_id"], "p-other")
         self.assertEqual(page["items"][0]["job_type"], "script_pipeline")
-        self.assertEqual(page["items"][1]["updated_at"], (base - timedelta(minutes=2)).isoformat())
+        # DTO 时刻必须带 UTC 时区（历史 naive 行按 UTC 解释，见 test_job_dto_timezone）。
+        self.assertEqual(
+            page["items"][1]["updated_at"],
+            (base - timedelta(minutes=2)).replace(tzinfo=timezone.utc).isoformat(),
+        )
 
         second = self.client.get("/api/jobs", params={"page": 2, "page_size": 2}).json()
         self.assertEqual(len(second["items"]), 2)

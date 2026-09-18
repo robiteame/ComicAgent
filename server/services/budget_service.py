@@ -689,19 +689,37 @@ def evaluate_limits(
         if soft_cost is not None and (committed_cost >= int(soft_cost) or projected_cost > int(soft_cost)):
             level, code = LEVEL_SOFT_EXCEEDED, CODE_BUDGET_SOFT_EXCEEDED
             reason = "cost"
-            message = (
-                f"项目软预算 {_cents_label(int(soft_cost), currency)} 已超支"
-                f"（已用 {_cents_label(committed_cost, currency)}，本次预计 "
-                f"{_cents_label(estimate_cost_micro, currency)}），任务仍会继续执行"
-            )
+            if committed_cost >= int(soft_cost):
+                # 已用金额本身已达/超出软预算：这是「实际超支」，不是预测。
+                message = (
+                    f"项目软预算 {_cents_label(int(soft_cost), currency)} 已超支"
+                    f"（已用 {_cents_label(committed_cost, currency)}，本次预计 "
+                    f"{_cents_label(estimate_cost_micro, currency)}），任务仍会继续执行"
+                )
+            else:
+                # 已用尚未超支，只是「已用 + 本次预计」的投影会超：文案必须区分，
+                # 并明确给出已用、本次预计与预算上限。
+                message = (
+                    f"项目软预算 {_cents_label(int(soft_cost), currency)} 预计将超支"
+                    f"（已用 {_cents_label(committed_cost, currency)}，本次预计 "
+                    f"{_cents_label(estimate_cost_micro, currency)}，预算上限 "
+                    f"{_cents_label(int(soft_cost), currency)}），任务仍会继续执行"
+                )
         elif soft_seconds is not None and (
             committed_seconds >= int(soft_seconds) or projected_seconds > int(soft_seconds)
         ):
             level, code = LEVEL_SOFT_EXCEEDED, CODE_BUDGET_SOFT_EXCEEDED
             reason = "seconds"
-            message = (
-                f"项目软时长预算 {int(soft_seconds)} 秒已超支（已用 {committed_seconds} 秒），任务仍会继续执行"
-            )
+            if committed_seconds >= int(soft_seconds):
+                message = (
+                    f"项目软时长预算 {int(soft_seconds)} 秒已超支（已用 {committed_seconds} 秒），任务仍会继续执行"
+                )
+            else:
+                message = (
+                    f"项目软时长预算 {int(soft_seconds)} 秒预计将超支"
+                    f"（已用 {committed_seconds} 秒，本次预计 {projected_seconds - committed_seconds} 秒，"
+                    f"预算上限 {int(soft_seconds)} 秒），任务仍会继续执行"
+                )
 
     if level in (LEVEL_OK, LEVEL_UNLIMITED) and not cost_known:
         level = LEVEL_OK

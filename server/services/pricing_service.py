@@ -276,9 +276,9 @@ def resolve_price(
 # 这样默认安装不会凭空产生金额，界面会明确显示「未配置价格 → 成本未知」。
 DEFAULT_PRICING_PROVIDERS: dict[str, tuple[str, ...]] = {
     CAPABILITY_LLM: ("openai-chat",),
-    CAPABILITY_IMAGE: ("ark-seedream", "stability", "placeholder"),
-    CAPABILITY_VIDEO: ("ark-seedance", "native-audio"),
-    CAPABILITY_TTS: ("mimo-tts",),
+    CAPABILITY_IMAGE: ("ark-seedream", "qwen-image", "stability", "placeholder"),
+    CAPABILITY_VIDEO: ("ark-seedance", "native-audio", "dashscope-wanx"),
+    CAPABILITY_TTS: ("mimo-tts", "tencent-tts", "dashscope-tts"),
     CAPABILITY_FFMPEG: ("local",),
 }
 

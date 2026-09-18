@@ -662,9 +662,15 @@ def start(key: str, coroutine: Coroutine[Any, Any, Any]) -> asyncio.Task:
     if current is not None and not current.done():
         coroutine.close()
         raise RuntimeError("后台任务注册失败")
+    # 显式保存包装协程：create_task 失败时它和原始协程都还没启动，必须分别关闭，
+    # 否则 GC 时会留下 "coroutine was never awaited" 的 RuntimeWarning。
+    wrapper = _with_usage_scope(key, coroutine)
     try:
-        task = asyncio.create_task(_with_usage_scope(key, coroutine))
+        task = asyncio.create_task(wrapper)
     except BaseException as exc:
+        # create_task 抛错说明任务从未被调度，包装协程体（含 await coroutine）
+        # 没有执行过，因此这里关闭两个协程各一次，既不重复也不执行原始协程。
+        wrapper.close()
         coroutine.close()
         finish(key, "failed", f"background task could not be created: {exc}", run_token=run_token)
         raise

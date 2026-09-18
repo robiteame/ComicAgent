@@ -319,5 +319,86 @@ class BudgetGuardTests(unittest.TestCase):
         self.assertEqual(unlimited["level"], budget_service.LEVEL_UNLIMITED)
 
 
+class SoftBudgetSemanticsTests(unittest.TestCase):
+    """软预算必须区分「实际已超支」与「预计将超支」（金额与时长同语义）。
+
+    边界：实际 < 软预算但投影 > 软预算、实际 == 软预算、实际 > 软预算、
+    投影 == 软预算、成本未知但时长超限。
+    """
+
+    MONEY_LIMITS = {
+        "currency": "CNY",
+        "soft_cost_micro": 1 * MICRO,
+        "source": "project",
+        "source_label": "项目预算",
+    }
+    SECONDS_LIMITS = {
+        "currency": "CNY",
+        "soft_seconds": 100,
+        "source": "project",
+        "source_label": "项目预算",
+    }
+
+    def test_projection_over_soft_warns_pending_not_exceeded(self) -> None:
+        # 实际 0.4 元 < 软预算 1 元，但「已用 + 本次预计 0.8 元」的投影会超。
+        state = budget_service.evaluate_limits(
+            self.MONEY_LIMITS, used_cost_micro=400_000, estimate_cost_micro=800_000
+        )
+        self.assertEqual(state["level"], budget_service.LEVEL_SOFT_EXCEEDED)
+        self.assertEqual(state["reason"], "cost")
+        self.assertIn("预计将超支", state["message"])
+        self.assertNotIn("已超支", state["message"])
+        # 预计超支文案必须交代：已用、本次预计、预算上限。
+        self.assertIn("预算上限", state["message"])
+        self.assertIn("本次预计", state["message"])
+
+    def test_actual_equal_to_soft_counts_as_exceeded(self) -> None:
+        state = budget_service.evaluate_limits(
+            self.MONEY_LIMITS, used_cost_micro=1 * MICRO, estimate_cost_micro=None
+        )
+        self.assertEqual(state["level"], budget_service.LEVEL_SOFT_EXCEEDED)
+        self.assertIn("已超支", state["message"])
+        self.assertNotIn("预计将超支", state["message"])
+
+    def test_actual_over_soft_counts_as_exceeded(self) -> None:
+        state = budget_service.evaluate_limits(
+            self.MONEY_LIMITS, used_cost_micro=1_500_000, estimate_cost_micro=200_000
+        )
+        self.assertEqual(state["level"], budget_service.LEVEL_SOFT_EXCEEDED)
+        self.assertIn("已超支", state["message"])
+        self.assertNotIn("预计将超支", state["message"])
+
+    def test_projection_equal_to_soft_stays_ok(self) -> None:
+        # 投影恰好等于软预算不算超支（严格大于才触发提示）。
+        state = budget_service.evaluate_limits(
+            self.MONEY_LIMITS, used_cost_micro=400_000, estimate_cost_micro=600_000
+        )
+        self.assertEqual(state["level"], budget_service.LEVEL_OK)
+        self.assertEqual(state["message"], "")
+
+    def test_seconds_projection_over_soft_warns_pending(self) -> None:
+        state = budget_service.evaluate_limits(
+            self.SECONDS_LIMITS, used_cost_micro=0, used_seconds=40, estimate_seconds=90
+        )
+        self.assertEqual(state["level"], budget_service.LEVEL_SOFT_EXCEEDED)
+        self.assertEqual(state["reason"], "seconds")
+        self.assertIn("预计将超支", state["message"])
+        self.assertNotIn("已超支", state["message"])
+        self.assertIn("已用 40 秒", state["message"])
+        self.assertIn("本次预计 90 秒", state["message"])
+        self.assertIn("预算上限 100 秒", state["message"])
+
+    def test_unknown_cost_with_seconds_over_soft_is_reported(self) -> None:
+        # 成本未知不掩盖时长软预算提示；文案也不能声称金额超支。
+        limits = dict(self.MONEY_LIMITS, soft_seconds=100)
+        state = budget_service.evaluate_limits(
+            limits, used_cost_micro=0, used_seconds=150, estimate_seconds=None, cost_known=False
+        )
+        self.assertEqual(state["level"], budget_service.LEVEL_SOFT_EXCEEDED)
+        self.assertEqual(state["reason"], "seconds")
+        self.assertIn("已超支", state["message"])
+        self.assertIn("已用 150 秒", state["message"])
+
+
 if __name__ == "__main__":
     unittest.main()

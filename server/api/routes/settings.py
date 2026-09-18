@@ -9,6 +9,8 @@ from api.schemas import StyleKeywords, StyleLabel
 from config import settings
 from services.atomic_json import read_json_file
 from services.model_config_service import get_model_config, save_model_config
+from services.model_discovery_service import ModelDiscoveryError, discover_models
+from services.providers.endpoint import endpoint_identity, get_endpoint
 from services.skill_config_service import list_skill_templates, save_skill_template, set_skill_bindings
 from services.style_templates import create_custom_style_template, style_options
 
@@ -40,6 +42,14 @@ class ModelConfigSave(BaseModel):
     image: dict | None = None
     video: dict | None = None
     voice: dict | None = None
+
+
+class ModelDiscoveryRequest(BaseModel):
+    category: str
+    base_url: str
+    api_key: str = ""
+    protocol: str = ""
+    auth_style: str = "bearer"
 
 
 @router.get("/style-templates")
@@ -92,6 +102,24 @@ async def get_model_configs():
 async def update_model_configs(data: ModelConfigSave):
     try:
         return save_model_config(data.model_dump(exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/model-configs/discover")
+async def discover_model_configs(data: ModelDiscoveryRequest):
+    try:
+        payload = data.model_dump()
+        # GET /model-configs intentionally masks secrets. Reuse the stored key
+        # only when the caller is still targeting the same endpoint, so a URL
+        # change can never accidentally send credentials to a new host.
+        if not str(payload.get("api_key") or "").strip() or payload["api_key"].strip() == "********":
+            configured = get_endpoint(payload["category"])
+            if endpoint_identity(configured.base_url) == endpoint_identity(payload["base_url"]):
+                payload["api_key"] = configured.api_key
+        return await discover_models(**payload)
+    except ModelDiscoveryError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

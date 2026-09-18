@@ -17,6 +17,7 @@ import message from 'antd/es/message'
 import Modal from 'antd/es/modal'
 import Tooltip from 'antd/es/tooltip'
 import { characterApi, projectApi, shotApi } from '../services/api'
+import { PROJECTS_REFRESHED_EVENT } from '../constants/events'
 import { beginProjectNavigationIntent, requestProjectNavigation } from '../services/projectNavigationGuard'
 import { useProjectStore } from '../stores/projectStore'
 import { useShotStore } from '../stores/shotStore'
@@ -113,6 +114,13 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
     refreshProjects()
     projectContextEpochRef.current += 1
   }, [projectId])
+
+  // 后端改了项目标题（如剧本解析按剧本自动命名）后刷新项目列表，保证名称实时。
+  useEffect(() => {
+    const refresh = () => refreshProjects()
+    window.addEventListener(PROJECTS_REFRESHED_EVENT, refresh)
+    return () => window.removeEventListener(PROJECTS_REFRESHED_EVENT, refresh)
+  }, [])
 
   // 任务中心的「跳转到对应项目」：复用项目切换的全部守卫（导航意图 + 请求竞态）。
   useEffect(() => {

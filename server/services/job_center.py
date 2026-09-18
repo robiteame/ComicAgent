@@ -15,7 +15,7 @@ services.job_actions，重新派发在 services.job_dispatch；这里不复制�
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import func, or_
@@ -24,7 +24,7 @@ from sqlalchemy.orm import Query, Session
 from config import settings
 from models import BackgroundJob
 from services import usage_service
-from services.job_dto import estimate_eta_seconds, job_dto
+from services.job_dto import as_utc, estimate_eta_seconds, job_dto
 from services.job_types import (
     ACTIVE_STATUSES,
     DISPATCHABLE_JOB_TYPES,
@@ -46,6 +46,13 @@ _ESCAPE_CHAR = "!"
 
 def _escape_like(term: str) -> str:
     return term.replace(_ESCAPE_CHAR, _ESCAPE_CHAR * 2).replace("%", f"{_ESCAPE_CHAR}%").replace("_", f"{_ESCAPE_CHAR}_")
+
+
+def _iso_utc(value: datetime | None) -> str | None:
+    """任务中心对外的时刻一律带 UTC 时区（历史 naive 行按 UTC 解释）。"""
+
+    moment = as_utc(value)
+    return moment.isoformat() if moment is not None else None
 
 
 def _not_scope_block(query: Query) -> Query:
@@ -202,7 +209,7 @@ def list_jobs(db: Session, query: JobQuery) -> dict[str, Any]:
     successors = active_successor_ids(db, [row.id for row in rows])
     samples = _eta_samples(db, {str(row.job_type) for row in rows if str(row.status) in ACTIVE_STATUSES})
     usages, estimates = _cost_maps(db, rows)
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     items = [
         _dto(row, now=now, successors=successors, samples=samples, usages=usages, estimates=estimates)
         for row in rows
@@ -253,7 +260,7 @@ def job_stats(db: Session, *, project_id: str = "") -> dict[str, Any]:
     }
     latest = query.order_by(*_LIST_ORDER).first()
     usages, estimates = _cost_maps(db, [latest] if latest is not None else [])
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     usage_summary = usage_service.summarize(db, project_id=project_id) if project_id else usage_service.summarize(db)
     return {
         "project_id": project_id,
@@ -302,9 +309,9 @@ def attempt_history(db: Session, job: BackgroundJob) -> list[dict[str, Any]]:
             "status": str(row.status),
             "error_code": str(row.error_code or ""),
             "error_message": str(row.error_message or row.error or "")[:240],
-            "started_at": row.started_at.isoformat() if row.started_at else None,
-            "finished_at": row.finished_at.isoformat() if row.finished_at else None,
-            "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+            "started_at": _iso_utc(row.started_at),
+            "finished_at": _iso_utc(row.finished_at),
+            "updated_at": _iso_utc(row.updated_at),
             "duration_seconds": max(
                 0,
                 int(((row.finished_at or now) - (row.started_at or row.created_at or now)).total_seconds()),
@@ -336,7 +343,7 @@ def job_detail(db: Session, job: BackgroundJob) -> dict[str, Any]:
     usages, estimates = _cost_maps(db, [job])
     dto = _dto(
         job,
-        now=datetime.utcnow(),
+        now=datetime.now(timezone.utc),
         successors={str(row[0]) for row in successor_rows},
         samples=samples,
         usages=usages,

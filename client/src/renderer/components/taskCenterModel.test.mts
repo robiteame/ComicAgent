@@ -8,6 +8,7 @@ import {
   emptyStateText,
   errorSummary,
   filterJobs,
+  formatClock,
   matchesFilters,
   formatDuration,
   formatRelativeTime,
@@ -17,6 +18,7 @@ import {
   nextReconnectDelay,
   normalizeJob,
   normalizeJobList,
+  parseServerTime,
   progressText,
   projectJumpDetail,
   queryFromFilters,
@@ -197,11 +199,11 @@ assert.equal(formatDuration(65), '1 分 05 秒')
 assert.equal(formatDuration(3725), '1 小时 02 分')
 assert.equal(formatRelativeTime(null), '—')
 assert.equal(formatRelativeTime('not-a-date'), '—')
-const now = new Date('2025-01-01T12:00:00').getTime()
+const now = Date.parse('2025-01-01T12:00:00Z')
 assert.equal(formatRelativeTime('2025-01-01T11:59:30', now), '30 秒前')
 assert.equal(formatRelativeTime('2025-01-01T11:30:00', now), '30 分钟前')
 assert.equal(formatRelativeTime('2025-01-01T09:00:00', now), '3 小时前')
-assert.equal(formatRelativeTime('2024-12-30T09:00:00', now), '12-30')
+assert.equal(formatRelativeTime('2024-12-30T12:00:00', now), '12-30')
 assert.equal(progressText(makeJob({ progress: 37 })), '37%')
 assert.equal(progressText(makeJob({ status: 'completed', progress: 0 })), '100%')
 assert.equal(errorSummary(failed).startsWith('job_failed'), false)
@@ -242,5 +244,67 @@ assert.equal(projectJumpDetail(makeJob({ project_id: '' })), null, '没有项目
 
 assert.equal(emptyStateText(false, false).includes('还没有'), true, '空状态文案应稳定')
 assert.equal(emptyStateText(true, true), EMPTY_FILTERED_TEXT, '筛选无结果应给出区分文案')
+
+// --- 跨时区：服务端 naive UTC 时间必须按 UTC 解释（修复「8 小时前」） -------
+
+const ORIGINAL_TZ = process.env.TZ
+try {
+  process.env.TZ = 'UTC'
+  assert.equal(new Date().getTimezoneOffset(), 0, '测试环境必须支持切换到 UTC 时区')
+  assert.equal(parseServerTime('2025-01-01T10:00:00'), Date.parse('2025-01-01T10:00:00Z'), 'UTC 环境下 naive 与 Z 等价')
+  assert.equal(parseServerTime(null), null)
+  assert.equal(parseServerTime('not-a-date'), null)
+  assert.equal(parseServerTime('2025-01-01T18:00:00+08:00'), Date.parse('2025-01-01T10:00:00Z'), '带时区偏移按标准解析')
+  assert.equal(formatRelativeTime('2025-01-01T10:00:00', Date.parse('2025-01-01T10:00:30Z')), '30 秒前')
+
+  process.env.TZ = 'Asia/Shanghai'
+  assert.equal(new Date().getTimezoneOffset(), -480, '测试环境必须支持切换到 Asia/Shanghai 时区')
+  assert.equal(
+    parseServerTime('2025-01-01T10:00:00'),
+    Date.parse('2025-01-01T10:00:00Z'),
+    'naive 不得被当作本地时间（否则刚创建的任务显示 8 小时前）',
+  )
+  assert.equal(
+    parseServerTime('2025-01-01T10:00:00Z'),
+    parseServerTime('2025-01-01T18:00:00+08:00'),
+    'Z 与 +08:00 是同一时刻',
+  )
+  assert.equal(
+    parseServerTime('2025-01-01T10:00:00'),
+    parseServerTime('2025-01-01T10:00:00Z'),
+    '历史 naive 与新带时区格式指向同一时刻',
+  )
+  assert.equal(formatRelativeTime('2025-01-01T10:00:00', Date.parse('2025-01-01T10:00:05Z')), '刚刚')
+  assert.equal(formatRelativeTime('2025-01-01T10:00:00', Date.parse('2025-01-01T10:00:30Z')), '30 秒前')
+  assert.equal(formatRelativeTime('2025-01-01T10:00:00Z', Date.parse('2025-01-01T10:30:00Z')), '30 分钟前')
+  assert.equal(formatClock('2025-01-01T10:00:00Z'), '18:00:00', '详情时钟显示上海墙钟')
+  assert.equal(formatClock('2025-01-01T10:00:00'), '18:00:00', '历史 naive 数据的详情时钟同样正确')
+
+  // 排序：naive 与带时区混排时按绝对时刻比较，同一时刻由 id 决定次序。
+  const mixed = sortJobs(
+    [
+      makeJob({ id: 'job-z', updated_at: '2025-01-01T10:05:00Z' }),
+      makeJob({ id: 'job-naive', updated_at: '2025-01-01T10:05:00' }),
+      makeJob({ id: 'job-old', updated_at: '2025-01-01T09:00:00' }),
+    ],
+    'updated',
+  )
+  assert.deepEqual(
+    mixed.map((job) => job.id),
+    ['job-naive', 'job-z', 'job-old'],
+    '混排格式必须按绝对时刻排序',
+  )
+  const sameInstantBase = makeJob({ id: 'job-same', updated_at: '2025-01-01T10:05:00Z', progress: 10 })
+  const sameInstantUpdate = makeJob({ id: 'job-same', updated_at: '2025-01-01T18:05:00+08:00', progress: 20 })
+  assert.equal(
+    upsertJob([sameInstantBase], sameInstantUpdate)[0].progress,
+    20,
+    '同一时刻不同格式的更新不得被误判为过期事件',
+  )
+  const missingTime = sortJobs([makeJob({ id: 'job-a', updated_at: '2025-01-01T10:05:00Z' }), makeJob({ id: 'job-b', updated_at: null })], 'updated')
+  assert.equal(missingTime[0].id, 'job-a', '缺少时间戳的任务沉底')
+} finally {
+  process.env.TZ = ORIGINAL_TZ
+}
 
 console.log('taskCenterModel.test.mts ok')

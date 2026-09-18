@@ -18,7 +18,7 @@ import InputNumber from 'antd/es/input-number'
 import message from 'antd/es/message'
 import Select from 'antd/es/select'
 import { assetApi, shotApi, toOutputUrl } from '../services/api'
-import { notifyBudgetBlocked, notifyBudgetWarning, useTaskEstimateGate } from './TaskEstimateModal'
+import { notifyBudgetBlocked, notifyBudgetWarning, notifyProviderBlocked, useTaskEstimateGate } from './TaskEstimateModal'
 import {
   drainPendingSaves,
   hasPendingChanges,
@@ -603,7 +603,8 @@ const RightSidebar: React.FC<RightSidebarProps> = ({ collapsed, onToggleCollapse
     } catch (err: any) {
       if (requestId !== regenerateRequestRef.current || !isCurrentShotContext(entryProjectId, shot.id)) return
       // 硬预算拦截（HTTP 409 / budget_exceeded）单独提示，不混进通用错误文案。
-      if (!notifyBudgetBlocked(err)) message.error('镜头重生成失败：' + (err.message || '未知错误'))
+      if (!notifyBudgetBlocked(err) && !notifyProviderBlocked(err))
+        message.error('镜头重生成失败：' + (err.message || '未知错误'))
       setGenerating(false)
     } finally {
       if (requestId === regenerateRequestRef.current && mountedRef.current) setRegeneratingShot(false)

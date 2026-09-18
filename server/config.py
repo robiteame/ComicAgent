@@ -37,8 +37,33 @@ class Settings(BaseSettings):
     SEEDREAM_MODEL: str = "doubao-seedream-5.0-lite"
     SEEDREAM_IMAGE_SIZE: str = "1440x2560"
 
+    # 阿里云百炼 DashScope (通义万相视频; VIDEO_PROVIDER 填 wanx/dashscope 时启用)
+    DASHSCOPE_API_KEY: str = ""
+    DASHSCOPE_BASE_URL: str = "https://dashscope.aliyuncs.com/api/v1"
+    DASHSCOPE_VIDEO_MODEL: str = "wan2.5-i2v-plus"
+
+    # 阿里云百炼 Qwen-Image（IMAGE_PROVIDER=qwen-image 时启用）
+    QWEN_IMAGE_API_KEY: str = ""
+    QWEN_IMAGE_BASE_URL: str = "https://dashscope.aliyuncs.com/api/v1"
+    QWEN_IMAGE_MODEL: str = "qwen-image-plus"
+    QWEN_IMAGE_SIZE: str = "1440x2560"
+
+    # 阿里云百炼语音合成 CosyVoice（TTS_PROVIDER 填 dashscope/bailian/cosyvoice 时启用）
+    DASHSCOPE_TTS_API_KEY: str = ""
+    DASHSCOPE_TTS_BASE_URL: str = "https://dashscope.aliyuncs.com/api/v1"
+    DASHSCOPE_TTS_MODEL: str = "cosyvoice-v2"
+    DASHSCOPE_TTS_VOICE: str = "longwan_v2"
+    DASHSCOPE_TTS_FORMAT: str = "wav"
+
+    # 腾讯云语音合成 (配置 SecretId/Key 后语音端点默认切换到 tencent-tts 协议)
+    TENCENT_SECRET_ID: str = ""
+    TENCENT_SECRET_KEY: str = ""
+    TENCENT_TTS_URL: str = "https://tts.tencentcloudapi.com"
+    TENCENT_TTS_VOICE: str = "101001"
+    TENCENT_TTS_FORMAT: str = "wav"
+
     # 图像生成配置
-    # local = 无密钥占位图 stub(PIL 生成,使全流程可离线跑通); stability / doubao-seedream-5.0-lite = 真实云端服务
+    # local = 无密钥占位图 stub(PIL 生成,使全流程可离线跑通); stability / doubao-seedream-5.0-lite / qwen-image = 真实云端服务
     # 配置真实 provider 但缺少对应 API Key 时,会自动回退到占位图,不再报错中断
     IMAGE_PROVIDER: str = "local"
     STABILITY_API_KEY: str = ""
@@ -46,7 +71,7 @@ class Settings(BaseSettings):
     SD_LOCAL_URL: str = "http://127.0.0.1:7860"
 
     # TTS 配置
-    TTS_PROVIDER: str = "mimo"  # legacy field; TTSService always uses Mimo built-in TTS
+    TTS_PROVIDER: str = "mimo"  # 语音协议选择：mimo / tencent / dashscope（bailian、cosyvoice 等别名亦可）
     TTS_DEFAULT_VOICE: str = "zh-CN-XiaoyiNeural"
 
     # ChromaDB 配置

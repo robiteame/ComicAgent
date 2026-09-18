@@ -12,9 +12,12 @@ isolated from a developer's local runtime data.
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import sys
+import types
 import unittest
+import warnings
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -887,6 +890,60 @@ class BackgroundJobRegressionTests(DatabaseTestCase):
         self.assertEqual(current.storyboard_status, "failed")
         self.assertTrue(claim(key, f"shot:{shot.id}", version=shot.version))
         finish(key, "completed")
+
+    def test_create_task_failure_closes_wrapper_without_coroutine_leak(self) -> None:
+        """create_task 抛错时包装协程也必须被关闭：不留 never-awaited 警告与泄漏。"""
+        project = Project(id="wrapper-leak-project", title="Wrapper leak")
+        self.db.add(project)
+        self.db.commit()
+        key = f"project:{project.id}:render"
+        self.assertTrue(claim(key, f"project:{project.id}"))
+        executed: list[bool] = []
+
+        async def scenario() -> list[warnings.WarningMessage]:
+            async def worker() -> None:
+                executed.append(True)
+
+            coroutine = worker()
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                with patch.object(task_registry.asyncio, "create_task", side_effect=RuntimeError("loop stopped")):
+                    try:
+                        task_registry.start(key, coroutine)
+                    except RuntimeError:
+                        pass
+                # start() 抛出的异常在 except 块结束时已释放；此处强制回收，
+                # 任何未关闭的协程都会在这时发出 "never awaited" RuntimeWarning。
+                gc.collect()
+                self.assertIsNone(coroutine.cr_frame, "原始协程应被恰好关闭一次")
+            return caught
+
+        caught = asyncio.run(scenario())
+        never_awaited = [
+            warning
+            for warning in caught
+            if issubclass(warning.category, RuntimeWarning) and "never awaited" in str(warning.message)
+        ]
+        self.assertEqual(never_awaited, [], "create_task 失败时包装协程不得泄漏 never-awaited 警告")
+        leaked = [
+            obj
+            for obj in gc.get_objects()
+            if isinstance(obj, types.CoroutineType)
+            and obj.cr_code.co_name == "_with_usage_scope"
+            and obj.cr_frame is not None
+        ]
+        self.assertEqual(leaked, [], "create_task 失败后不得残留未完成的包装协程")
+        self.assertEqual(executed, [], "关闭路径不得执行原始协程")
+        # 既有语义不变：失败状态落库、claim 可回收、run token 防旧任务回写。
+        self.db.expire_all()
+        job = self.db.query(BackgroundJob).filter_by(idempotency_key=key).one()
+        self.assertEqual(job.status, "failed")
+        failed_token = task_registry.snapshot(key)["run_token"]
+        self.assertTrue(claim(key, f"project:{project.id}"))
+        new_token = task_registry.snapshot(key)["run_token"]
+        self.assertNotEqual(failed_token, new_token)
+        self.assertFalse(task_registry.update_progress(key, 50, run_token=failed_token))
+        self.assertTrue(task_registry.finish(key, "completed", run_token=new_token))
 
     def test_scope_cancel_blocks_reclaim_and_resets_business_state(self) -> None:
         project = Project(id="cancel-project", title="Cancel", status="storyboard_generating")

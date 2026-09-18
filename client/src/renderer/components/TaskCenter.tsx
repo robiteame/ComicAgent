@@ -422,16 +422,18 @@ const TaskCenter: React.FC<TaskCenterProps> = ({ open, onClose }) => {
   const hasVisible = visibleJobs.length > 0
 
   return (
-    <aside
-      className="task-center"
-      role="dialog"
-      aria-label="后台任务中心"
-      aria-modal="false"
-      ref={panelRef}
-      tabIndex={-1}
-    >
+    <div className="task-center-backdrop" role="presentation">
+      <aside
+        className="task-center"
+        role="dialog"
+        aria-label="后台任务中心"
+        aria-modal="true"
+        ref={panelRef}
+        tabIndex={-1}
+      >
       <header className="task-center-head">
         <div>
+          <span className="task-center-eyebrow">后台工作流</span>
           <h2 className="task-center-title">任务中心</h2>
           <p className="task-center-sub" aria-live="polite">
             {connectionLabel(connectionState)}
@@ -447,7 +449,7 @@ const TaskCenter: React.FC<TaskCenterProps> = ({ open, onClose }) => {
               disabled={loading}
               aria-label="刷新任务列表"
             >
-              刷新
+              <span className="task-head-action-label">刷新</span>
             </Button>
           </Tooltip>
           <Tooltip title="清理已结束的历史任务">
@@ -458,7 +460,7 @@ const TaskCenter: React.FC<TaskCenterProps> = ({ open, onClose }) => {
               disabled={busyJobId === '__cleanup__'}
               aria-label="清理历史任务"
             >
-              清理历史
+              <span className="task-head-action-label">清理历史</span>
             </Button>
           </Tooltip>
           <Tooltip title="关闭任务中心（任务会继续在后台运行）">
@@ -468,13 +470,25 @@ const TaskCenter: React.FC<TaskCenterProps> = ({ open, onClose }) => {
       </header>
 
       <div className="task-center-summary" role="status" aria-live="polite">
-        <span className="task-summary-chip">活动 {summary.activeCount}</span>
-        <span className="task-summary-chip">失败 {summary.failedCount}</span>
-        <span className="task-summary-chip">可重试 {summary.retryableCount}</span>
-        <span className="task-summary-chip">共 {summary.total}</span>
+        <span className="task-summary-chip task-summary-chip-active">
+          <strong>{summary.activeCount}</strong>
+          <small>活动中</small>
+        </span>
+        <span className="task-summary-chip task-summary-chip-failed">
+          <strong>{summary.failedCount}</strong>
+          <small>失败</small>
+        </span>
         <span className="task-summary-chip">
-          项目累计成本{' '}
-          {statsCost ? formatCostValue(statsCost.cost_micro, statsCost.cost_known, statsCost.currency) : '—'}
+          <strong>{summary.retryableCount}</strong>
+          <small>可重试</small>
+        </span>
+        <span className="task-summary-chip">
+          <strong>{summary.total}</strong>
+          <small>全部任务</small>
+        </span>
+        <span className="task-summary-chip task-summary-chip-cost">
+          <strong>{statsCost ? formatCostValue(statsCost.cost_micro, statsCost.cost_known, statsCost.currency) : '—'}</strong>
+          <small>项目累计成本</small>
         </span>
         {statsCost && statsCost.unknown_call_count > 0 && (
           <span className="task-summary-chip task-summary-chip-warn">
@@ -484,69 +498,75 @@ const TaskCenter: React.FC<TaskCenterProps> = ({ open, onClose }) => {
       </div>
 
       <div className="task-center-filters">
-        <label className="task-filter-field">
-          <span className="task-filter-label">项目</span>
-          <Select
-            size="small"
-            value={filters.projectId}
-            options={projectOptions}
-            onChange={(value: string) => setFilters({ projectId: value || '' })}
-            aria-label="按项目筛选任务"
-          />
-        </label>
-        <label className="task-filter-field">
-          <span className="task-filter-label">状态</span>
-          <Select
-            size="small"
-            mode="multiple"
-            allowClear
-            value={filters.statuses}
-            options={statusOptions}
-            placeholder="全部状态"
-            onChange={(value: JobStatus[]) => setFilters({ statuses: value || [] })}
-            aria-label="按状态筛选任务"
-          />
-        </label>
-        <label className="task-filter-field">
-          <span className="task-filter-label">类型</span>
-          <Select
-            size="small"
-            mode="multiple"
-            allowClear
-            value={filters.jobTypes}
-            options={typeOptions}
-            placeholder="全部类型"
-            onChange={(value: JobType[]) => setFilters({ jobTypes: value || [] })}
-            aria-label="按类型筛选任务"
-          />
-        </label>
-        <label className="task-filter-field">
-          <span className="task-filter-label">排序</span>
-          <Select
-            size="small"
-            value={sortKey}
-            options={(Object.keys(SORT_LABELS) as JobSortKey[]).map((key) => ({ value: key, label: SORT_LABELS[key] }))}
-            onChange={(value: JobSortKey) => setSortKey(value)}
-            aria-label="任务排序方式"
-          />
-        </label>
-        <label className="task-filter-field task-filter-search">
-          <span className="task-filter-label">搜索</span>
-          <Input
-            size="small"
-            value={filters.search}
-            allowClear
-            placeholder="任务名称 / 项目 / 错误信息"
-            onChange={(event) => setFilters({ search: event.target.value })}
-            aria-label="搜索任务"
-          />
-        </label>
-        <Button size="small" onClick={() => setFilters({ onlyActive: !filters.onlyActive })} aria-pressed={filters.onlyActive}>
-          仅看进行中
-        </Button>
-        <Button size="small" onClick={resetFilters} disabled={!filtersActive} aria-label="重置筛选条件">
-          重置
-        </Button>
+        <div className="task-filter-row task-filter-row-primary">
+          <label className="task-filter-field task-filter-project">
+            <span className="task-filter-label">项目范围</span>
+            <Select
+              size="small"
+              value={filters.projectId}
+              options={projectOptions}
+              onChange={(value: string) => setFilters({ projectId: value || '' })}
+              aria-label="按项目筛选任务"
+            />
+          </label>
+          <label className="task-filter-field task-filter-search">
+            <span className="task-filter-label">搜索任务</span>
+            <Input
+              size="small"
+              value={filters.search}
+              allowClear
+              placeholder="名称、项目或错误信息"
+              onChange={(event) => setFilters({ search: event.target.value })}
+              aria-label="搜索任务"
+            />
+          </label>
+        </div>
+        <div className="task-filter-row task-filter-row-secondary">
+          <label className="task-filter-field">
+            <span className="task-filter-label">状态</span>
+            <Select
+              size="small"
+              mode="multiple"
+              allowClear
+              value={filters.statuses}
+              options={statusOptions}
+              placeholder="全部状态"
+              onChange={(value: JobStatus[]) => setFilters({ statuses: value || [] })}
+              aria-label="按状态筛选任务"
+            />
+          </label>
+          <label className="task-filter-field">
+            <span className="task-filter-label">任务类型</span>
+            <Select
+              size="small"
+              mode="multiple"
+              allowClear
+              value={filters.jobTypes}
+              options={typeOptions}
+              placeholder="全部类型"
+              onChange={(value: JobType[]) => setFilters({ jobTypes: value || [] })}
+              aria-label="按类型筛选任务"
+            />
+          </label>
+          <label className="task-filter-field">
+            <span className="task-filter-label">排序方式</span>
+            <Select
+              size="small"
+              value={sortKey}
+              options={(Object.keys(SORT_LABELS) as JobSortKey[]).map((key) => ({ value: key, label: SORT_LABELS[key] }))}
+              onChange={(value: JobSortKey) => setSortKey(value)}
+              aria-label="任务排序方式"
+            />
+          </label>
+          <div className="task-filter-actions">
+            <Button size="small" type={filters.onlyActive ? 'primary' : 'default'} onClick={() => setFilters({ onlyActive: !filters.onlyActive })} aria-pressed={filters.onlyActive}>
+              仅看进行中
+            </Button>
+            <Button size="small" onClick={resetFilters} disabled={!filtersActive} aria-label="重置筛选条件">
+              重置
+            </Button>
+          </div>
+        </div>
       </div>
 
       <div className="task-center-tabs" role="tablist" aria-label="任务分组">
@@ -588,36 +608,39 @@ const TaskCenter: React.FC<TaskCenterProps> = ({ open, onClose }) => {
         aria-labelledby={SECTION_TAB_ID_PREFIX + section}
         tabIndex={0}
       >
-        {loading && !jobs.length && (
-          <div className="task-center-status" role="status">
-            <Spin size="small" /> 正在加载任务…
-          </div>
-        )}
+        <div className="task-center-list-column">
+          {loading && !jobs.length && (
+            <div className="task-center-status" role="status">
+              <Spin size="small" /> 正在加载任务…
+            </div>
+          )}
 
-        {!loading && !hasVisible && (
-          <Empty
-            image={Empty.PRESENTED_IMAGE_SIMPLE}
-            description={emptyStateText(jobs.length > 0, filtersActive)}
-          />
-        )}
+          {!loading && !hasVisible && (
+            <Empty
+              image={Empty.PRESENTED_IMAGE_SIMPLE}
+              description={emptyStateText(jobs.length > 0, filtersActive)}
+            />
+          )}
 
-        {visibleSections.map((key) => {
-          const items = sections[key]
-          if (items.length === 0) return null
-          return (
-            <section key={key} className="task-section" aria-label={SECTION_TITLES[key]}>
-              <h3 className="task-section-title">
-                {SECTION_TITLES[key]}
-                <span className="task-section-count">{items.length}</span>
-              </h3>
-              <ul className="task-list" role="list">
-                {items.map(renderJob)}
-              </ul>
-            </section>
-          )
-        })}
+          {visibleSections.map((key) => {
+            const items = sections[key]
+            if (items.length === 0) return null
+            return (
+              <section key={key} className="task-section" aria-label={SECTION_TITLES[key]}>
+                <h3 className="task-section-title">
+                  {SECTION_TITLES[key]}
+                  <span className="task-section-count">{items.length}</span>
+                </h3>
+                <ul className="task-list" role="list">
+                  {items.map(renderJob)}
+                </ul>
+              </section>
+            )
+          })}
+        </div>
 
-        {selectedJobId && (
+        <div className="task-center-detail-column">
+          {selectedJobId ? (
           <section className="task-detail" id="task-center-detail" aria-label="任务详情" tabIndex={0}>
             <h3 className="task-section-title">任务详情</h3>
             {detailLoading && <div className="task-center-status"><Spin size="small" /> 正在加载详情…</div>}
@@ -840,9 +863,17 @@ const TaskCenter: React.FC<TaskCenterProps> = ({ open, onClose }) => {
               </>
             )}
           </section>
-        )}
+          ) : (
+            <div className="task-detail-empty">
+              <InfoCircleOutlined aria-hidden="true" />
+              <strong>选择一个任务</strong>
+              <span>查看进度、尝试记录与成本明细</span>
+            </div>
+          )}
+        </div>
       </div>
-    </aside>
+      </aside>
+    </div>
   )
 }
 

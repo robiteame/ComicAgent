@@ -35,6 +35,7 @@ import type {
   PricingCapabilityDto,
   PricingItemDto,
   PricingTableDto,
+  ProviderBlockedDetail,
   RemainingWorkloadDto,
   TaskEstimateDto,
   UsageGroupDto,
@@ -943,6 +944,43 @@ export function budgetWarningFromResponse(response: unknown): string {
   const warning = asString(source.budget_warning).trim()
   if (warning) return warning
   return asString(source.budget_level) === 'soft_exceeded' ? '本次任务已超出项目软预算，任务仍会继续执行。' : ''
+}
+
+/**
+ * 模型端点未配置拦截：HTTP 409 且 `detail` 是对象（error_code=`provider_not_configured`）。
+ *
+ * 返回 null 表示这只是一次普通失败，调用方按原有错误提示处理。
+ */
+export function providerBlockedFromError(error: unknown): ProviderBlockedDetail | null {
+  const data = errorResponseData(error)
+  if (!data || typeof data !== 'object') return null
+  const detail = (data as { detail?: unknown }).detail
+  if (!detail || typeof detail !== 'object') return null
+  const source = detail as Record<string, unknown>
+  const message = asString(source.message).trim()
+  if (!message) return null
+  if (asString(source.status) !== 'provider_not_configured' && asString(source.error_code) !== 'provider_not_configured')
+    return null
+  const rawMissing = Array.isArray(source.missing) ? source.missing : []
+  const missing = rawMissing
+    .map((item) => {
+      const entry = (item || {}) as Record<string, unknown>
+      const capability = asString(entry.capability).trim()
+      if (!capability) return null
+      return {
+        capability,
+        label: asString(entry.label).trim() || capability,
+        message: asString(entry.message).trim(),
+      }
+    })
+    .filter((item): item is { capability: string; label: string; message: string } => item !== null)
+  return {
+    ok: false,
+    status: asString(source.status, 'provider_not_configured'),
+    error_code: asString(source.error_code, 'provider_not_configured'),
+    message,
+    missing,
+  }
 }
 
 function errorResponseData(error: unknown): unknown {

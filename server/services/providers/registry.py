@@ -9,10 +9,14 @@ from __future__ import annotations
 from services.providers.base import BaseAdapter
 from services.providers.image_ark_seedream import ArkSeedreamImageAdapter
 from services.providers.image_placeholder import PlaceholderImageAdapter
+from services.providers.image_qwen import QwenImageAdapter
 from services.providers.image_stability import StabilityImageAdapter
 from services.providers.llm_openai_chat import OpenAIChatAdapter
+from services.providers.tts_dashscope import DashscopeTTSAdapter
 from services.providers.tts_mimo import MimoTTSAdapter
+from services.providers.tts_tencent import TencentTTSAdapter
 from services.providers.video_ark_seedance import ArkSeedanceVideoAdapter
+from services.providers.video_dashscope_wanx import DashscopeWanxVideoAdapter
 from services.providers.video_native_audio import NativeAudioVideoAdapter
 
 ADAPTERS: dict[tuple[str, str], type[BaseAdapter]] = {
@@ -20,9 +24,13 @@ ADAPTERS: dict[tuple[str, str], type[BaseAdapter]] = {
     ("image", "placeholder"): PlaceholderImageAdapter,
     ("image", "stability"): StabilityImageAdapter,
     ("image", "ark-seedream"): ArkSeedreamImageAdapter,
+    ("image", "qwen-image"): QwenImageAdapter,
     ("video", "ark-seedance"): ArkSeedanceVideoAdapter,
+    ("video", "dashscope-wanx"): DashscopeWanxVideoAdapter,
     ("video", "native-audio"): NativeAudioVideoAdapter,
+    ("voice", "dashscope-tts"): DashscopeTTSAdapter,
     ("voice", "mimo-tts"): MimoTTSAdapter,
+    ("voice", "tencent-tts"): TencentTTSAdapter,
 }
 
 

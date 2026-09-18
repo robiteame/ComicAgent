@@ -21,7 +21,7 @@ AI漫剧Agent 是一套"全流程自动化+轻量化人工干预"的漫剧生产
 | Web 框架 | FastAPI | REST API + WebSocket |
 | Agent 框架 | LangGraph | 自动模式状态图编排（手动模式不经过图） |
 | LLM | Mimo（小米 MiMo，OpenAI 兼容；可切 OpenAI/DeepSeek 兜底） | 脚本生成、解析、分镜决策 |
-| 图像生成 | Seedream（火山方舟）/ Stability AI / **local 占位 stub** | 角色三视图、场景基准图、定稿故事板 |
+| 图像生成 | Seedream（火山方舟）/ Qwen-Image（阿里云百炼）/ Stability AI / **local 占位 stub** | 角色三视图、场景基准图、定稿故事板 |
 | 视频生成 | SeedDance（火山方舟，首帧图驱动） | 逐镜头视频生成 |
 | TTS | Mimo 内置 TTS | 角色配音 |
 | 视频渲染 | FFmpeg (ffmpeg-python) | 成片合成、转场、字幕、Ken Burns、音频混流 |
@@ -56,7 +56,7 @@ server/
 │
 ├── services/                  # 外部服务封装
 │   ├── llm_service.py         # Mimo/OpenAI 兼容 LLM 调用 (含兜底链)
-│   ├── image_service.py       # 图像生成 (Seedream/Stability/占位 stub, 角色卡片注入)
+│   ├── image_service.py       # 图像生成 (Seedream/Qwen-Image/Stability/占位 stub, 角色卡片注入)
 │   ├── video_service.py       # SeedDance 逐镜头视频生成 (任务轮询)
 │   ├── tts_service.py         # Mimo 内置 TTS 配音
 │   ├── ffmpeg_service.py      # FFmpeg 成片合成
@@ -252,7 +252,7 @@ ws://localhost:8011/ws/{project_id}
 
 ```json
 {"type": "progress", "step": "parse_script", "progress": 20, "message": "..."}
-{"type": "complete", "project_id": "...", "shots": [...], "asset_board_ready": true}
+{"type": "complete", "project_id": "...", "title": "根据剧本自动命名的项目标题", "shots": [...], "asset_board_ready": true}
 {"type": "shot_update", "shot_id": "...", "status": "video_done", "image_path": "...", "storyboard_path": "...", "video_path": "..."}
 {"type": "storyboard_ready", "project_id": "..."}
 {"type": "render_complete", "video_url": "...", "duration": 30}
@@ -268,6 +268,30 @@ ws://localhost:8011/ws/{project_id}
 ```json
 "ping"  → 服务端回复 {"type": "pong"}
 ```
+
+### 任务启动 Provider 预检
+
+所有会消耗模型能力的任务入口在抢占任务槽位前先做配置预检（`api/provider_guard.py`
+调 `services/provider_readiness.py`），缺配置时任务根本不启动：HTTP 409 +
+`detail.error_code=provider_not_configured`，`detail.missing` 逐项列出缺失端点。
+
+| 任务入口 | 预检的 job_type | 必需端点 |
+|----------|----------------|----------|
+| `POST /api/script/parse`、`/upload`（手动模式） | script_pipeline | script（LLM） |
+| 同上（auto 模式） | script_pipeline | script + video + voice |
+| `POST /api/shot/{id}/generate-video` | shot_video | video + voice（见下方豁免） |
+| `POST /api/shot/{id}/generate-audio` | shot_audio | voice（纯 TTS 任务） |
+| 任务中心「重试 / 续跑」（`services/job_actions.py`） | 按任务类型映射 | 同上对应规则 |
+
+- **script**：主/备端点至少一个配置了 API Key（备端点需与主端点不同址）；
+- **video**：必须配置 API Key（视频没有本地回退）；
+- **image**：永不拦截 —— 缺 Key 自动回退占位图（既有约定）；
+- **voice 豁免**：视频适配器具备真正可用的原生音频能力
+  （`native_audio` + `production_ready`，如接入 Veo 3 / Sora 2 厂商实现后）时
+  不强制要求 TTS；镜头无台词、或镜头级 `audio_mode=native` 时同样豁免；
+  镜头级显式 `audio_mode=tts` 仍要求配置语音端点。
+
+前端用 `notifyProviderBlocked` 解析同一 409 结构并引导去「系统设置 → 模型服务」。
 
 ---
 

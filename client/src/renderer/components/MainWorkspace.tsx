@@ -31,7 +31,7 @@ import {
 } from '../services/projectNavigationGuard'
 import { isCurrentProjectAsyncSnapshot, isLatestResourceResponse } from '../services/asyncGuard'
 import { STYLE_DESCRIPTIONS, STYLE_OPTIONS } from '../constants/styleTemplates'
-import { STYLE_TEMPLATES_UPDATED_EVENT } from '../constants/events'
+import { PROJECTS_REFRESHED_EVENT, STYLE_TEMPLATES_UPDATED_EVENT } from '../constants/events'
 import {
   getWorkspacePanelAriaProps,
   getWorkspaceTabAriaProps,
@@ -40,7 +40,7 @@ import {
 
 const AvWorkbench = React.lazy(() => import('./AvWorkbench'))
 import BudgetSummaryPanel from './BudgetSummaryPanel'
-import { notifyBudgetBlocked, notifyBudgetWarning, useTaskEstimateGate } from './TaskEstimateModal'
+import { notifyBudgetBlocked, notifyBudgetWarning, notifyProviderBlocked, useTaskEstimateGate } from './TaskEstimateModal'
 
 const { TextArea } = Input
 const PARSE_SCRIPT_EVENT = 'pipeline:parse-script'
@@ -578,6 +578,7 @@ const MainWorkspace: React.FC = () => {
 
       if (data.type === 'complete') {
         appendLog(`[${ts}] 流程执行完成`)
+        applyServerProjectTitle(pid, data.title)
 
         if (data.asset_board_ready) {
           if (autoMode) {
@@ -729,6 +730,16 @@ const MainWorkspace: React.FC = () => {
     })()
     projectCreationPromiseRef.current = operation
     return operation
+  }
+
+  /** 剧本解析完成后，后端已根据剧本自动命名：同步标题输入框并刷新侧边栏项目列表。 */
+  const applyServerProjectTitle = (pid: string, nextTitle: unknown) => {
+    const title = typeof nextTitle === 'string' ? nextTitle.trim() : ''
+    if (!title) return
+    if (useProjectStore.getState().projectId === pid && useProjectStore.getState().title !== title) {
+      setProject({ title })
+    }
+    window.dispatchEvent(new CustomEvent(PROJECTS_REFRESHED_EVENT))
   }
 
   const updateProjectField = async (field: 'style' | 'resolution' | 'title', value: string) => {
@@ -942,7 +953,7 @@ const MainWorkspace: React.FC = () => {
       )
     } catch (err: any) {
       if (!isCurrentOperation(operation)) return
-      if (!notifyBudgetBlocked(err)) message.error('提交失败：' + (err.message || '未知错误'))
+      if (!notifyBudgetBlocked(err) && !notifyProviderBlocked(err)) message.error('提交失败：' + (err.message || '未知错误'))
       setGenerating(false)
       setLoading(false)
     }
@@ -1031,7 +1042,7 @@ const MainWorkspace: React.FC = () => {
       message.success('剧本上传成功')
     } catch (err: any) {
       if (!isCurrentOperation(operation)) return
-      if (!notifyBudgetBlocked(err)) message.error('上传失败：' + (err.message || '未知错误'))
+      if (!notifyBudgetBlocked(err) && !notifyProviderBlocked(err)) message.error('上传失败：' + (err.message || '未知错误'))
       setGenerating(false)
     } finally {
       if (isLatestOperation(operation) && mountedRef.current) setUploading(false)
@@ -1067,7 +1078,7 @@ const MainWorkspace: React.FC = () => {
       message.success('当前镜头视频生成已启动')
     } catch (err: any) {
       if (!isCurrentOperation(operation)) return
-      if (!notifyBudgetBlocked(err)) message.error('镜头视频生成失败：' + (err.message || '未知错误'))
+      if (!notifyBudgetBlocked(err) && !notifyProviderBlocked(err)) message.error('镜头视频生成失败：' + (err.message || '未知错误'))
       setGenerating(false)
     } finally {
       if (isLatestOperation(operation) && mountedRef.current) setConfirming(false)
@@ -1098,7 +1109,7 @@ const MainWorkspace: React.FC = () => {
       message.success('成片合成已启动')
     } catch (err: any) {
       if (!isCurrentOperation(operation)) return
-      if (!notifyBudgetBlocked(err)) message.error('成片合成失败：' + (err.message || '未知错误'))
+      if (!notifyBudgetBlocked(err) && !notifyProviderBlocked(err)) message.error('成片合成失败：' + (err.message || '未知错误'))
       setGenerating(false)
     } finally {
       if (isLatestOperation(operation) && mountedRef.current) setComposing(false)
@@ -1162,7 +1173,7 @@ const MainWorkspace: React.FC = () => {
       message.success('故事板任务已启动')
     } catch (err: any) {
       if (!isCurrentOperation(operation)) return
-      if (!notifyBudgetBlocked(err)) message.error('故事板生成失败：' + (err.message || '未知错误'))
+      if (!notifyBudgetBlocked(err) && !notifyProviderBlocked(err)) message.error('故事板生成失败：' + (err.message || '未知错误'))
       setGenerating(false)
     } finally {
       if (isLatestOperation(operation) && mountedRef.current) setGeneratingStoryboard(false)

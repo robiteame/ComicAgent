@@ -26,9 +26,9 @@ API_KEY_REQUIRED = "api_key_required"
 # 只需改端点配置，接入全新协议需新增适配器并注册到 providers.registry。
 KNOWN_PROTOCOLS: dict[str, tuple[str, ...]] = {
     "script": ("openai-chat",),
-    "image": ("placeholder", "stability", "ark-seedream"),
-    "video": ("ark-seedance", "native-audio"),
-    "voice": ("mimo-tts",),
+    "image": ("placeholder", "stability", "ark-seedream", "qwen-image"),
+    "video": ("ark-seedance", "native-audio", "dashscope-wanx"),
+    "voice": ("mimo-tts", "tencent-tts", "dashscope-tts"),
 }
 
 DEFAULT_PROTOCOLS = {capability: protocols[0] for capability, protocols in KNOWN_PROTOCOLS.items()}
@@ -49,10 +49,20 @@ LEGACY_PROTOCOL_ALIASES: dict[str, dict[str, str]] = {
         "seedream": "ark-seedream",
         "volcengine": "ark-seedream",
         "ark": "ark-seedream",
+        "qwen": "qwen-image",
+        "qwen-image": "qwen-image",
+        "qwen-image-plus": "qwen-image",
+        "dashscope-qwen-image": "qwen-image",
     },
     "video": {
         "seedance": "ark-seedance",
         "ark": "ark-seedance",
+        "dashscope": "dashscope-wanx",
+        "dashscope-wanx": "dashscope-wanx",
+        "wanx": "dashscope-wanx",
+        "wan": "dashscope-wanx",
+        "bailian": "dashscope-wanx",
+        "aliyun": "dashscope-wanx",
         "native": "native-audio",
         "native-audio": "native-audio",
         "veo3": "native-audio",
@@ -61,6 +71,14 @@ LEGACY_PROTOCOL_ALIASES: dict[str, dict[str, str]] = {
     "voice": {
         "mimo": "mimo-tts",
         "mimo-tts": "mimo-tts",
+        "tencent": "tencent-tts",
+        "tencent-tts": "tencent-tts",
+        "dashscope": "dashscope-tts",
+        "dashscope-tts": "dashscope-tts",
+        "bailian": "dashscope-tts",
+        "aliyun": "dashscope-tts",
+        "cosyvoice": "dashscope-tts",
+        "qwen-tts": "dashscope-tts",
     },
 }
 
@@ -106,8 +124,12 @@ def normalize_protocol(capability: str, value: str) -> str:
     # 旧版允许把完整模型名填进 provider（如 Doubao-Seedream-4.5 / Doubao-Seedance-1.5-pro）。
     if capability == "image" and "seedream" in text:
         return "ark-seedream"
-    if capability == "video" and ("seedance" in text or "veo" in text or "sora" in text):
-        return "ark-seedance" if "seedance" in text else "native-audio"
+    if capability == "video" and ("seedance" in text or "veo" in text or "sora" in text or "wan" in text):
+        if "seedance" in text:
+            return "ark-seedance"
+        if "wan" in text:
+            return "dashscope-wanx"
+        return "native-audio"
     return text
 
 
@@ -208,6 +230,15 @@ def _image_defaults() -> dict:
             "auth_style": "bearer",
             "params": {},
         }
+    if protocol == "qwen-image":
+        return {
+            "protocol": "qwen-image",
+            "base_url": settings.QWEN_IMAGE_BASE_URL,
+            "api_key": settings.QWEN_IMAGE_API_KEY or settings.DASHSCOPE_API_KEY,
+            "model": settings.QWEN_IMAGE_MODEL,
+            "auth_style": "bearer",
+            "params": {"image_size": settings.QWEN_IMAGE_SIZE},
+        }
     return {
         "protocol": "ark-seedream",
         "base_url": settings.SEEDDANCE_BASE_URL,
@@ -219,8 +250,18 @@ def _image_defaults() -> dict:
 
 
 def _video_defaults() -> dict:
+    protocol = normalize_protocol("video", settings.VIDEO_PROVIDER)
+    if protocol == "dashscope-wanx":
+        return {
+            "protocol": "dashscope-wanx",
+            "base_url": settings.DASHSCOPE_BASE_URL,
+            "api_key": settings.DASHSCOPE_API_KEY,
+            "model": settings.DASHSCOPE_VIDEO_MODEL,
+            "auth_style": "bearer",
+            "params": {},
+        }
     return {
-        "protocol": normalize_protocol("video", settings.VIDEO_PROVIDER),
+        "protocol": protocol,
         "base_url": settings.SEEDDANCE_BASE_URL,
         "api_key": settings.SEEDDANCE_API_KEY or settings.ARK_API_KEY,
         "model": settings.SEEDDANCE_MODEL,
@@ -230,6 +271,26 @@ def _video_defaults() -> dict:
 
 
 def _voice_defaults() -> dict:
+    # 配置了腾讯云凭据时，语音端点默认切到腾讯云（tencent-tts 协议）。
+    if settings.TENCENT_SECRET_ID and settings.TENCENT_SECRET_KEY:
+        return {
+            "protocol": "tencent-tts",
+            "base_url": settings.TENCENT_TTS_URL,
+            "api_key": f"{settings.TENCENT_SECRET_ID}:{settings.TENCENT_SECRET_KEY}",
+            "model": "",
+            "auth_style": "bearer",
+            "params": {"voice": settings.TENCENT_TTS_VOICE, "format": settings.TENCENT_TTS_FORMAT},
+        }
+    # TTS_PROVIDER 显式填 dashscope / bailian / cosyvoice 时切到百炼语音合成。
+    if normalize_protocol("voice", settings.TTS_PROVIDER) == "dashscope-tts":
+        return {
+            "protocol": "dashscope-tts",
+            "base_url": settings.DASHSCOPE_TTS_BASE_URL,
+            "api_key": settings.DASHSCOPE_TTS_API_KEY or settings.DASHSCOPE_API_KEY,
+            "model": settings.DASHSCOPE_TTS_MODEL,
+            "auth_style": "bearer",
+            "params": {"voice": settings.DASHSCOPE_TTS_VOICE, "format": settings.DASHSCOPE_TTS_FORMAT},
+        }
     return {
         "protocol": "mimo-tts",
         "base_url": settings.MIMO_BASE_URL,

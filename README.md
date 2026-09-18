@@ -81,7 +81,7 @@
 | ORM | SQLAlchemy 2.0 | — | 数据模型与查询 |
 | 数据库 | SQLite | — | Demo 阶段零运维本地持久化 |
 | LLM | Mimo（小米 MiMo）/ OpenAI 兼容 | — | 剧本生成、剧本解析、分镜决策、自然语言交互 |
-| 图像生成 | Seedream（火山方舟）/ Stability / PIL 占位 | — | 角色三视图、场景基准图、定稿故事板 |
+| 图像生成 | Seedream（火山方舟）/ Qwen-Image（阿里云百炼）/ Stability / PIL 占位 | — | 角色三视图、场景基准图、定稿故事板 |
 | 视频生成 | SeedDance（火山方舟） | 1.5 pro | 首帧图驱动的逐镜头视频生成 |
 | 配音 | Mimo 内置 TTS | — | 角色对白语音合成 |
 | 渲染 | FFmpeg | — | 成片合成、Ken Burns、转场、混音 |
@@ -158,7 +158,7 @@ ComicAgent/
 │   │       └── chat.py                  # 自然语言交互
 │   ├── services/                        # 外部服务封装
 │   │   ├── llm_service.py               # Mimo/OpenAI 兼容 LLM 调用（含兜底链）
-│   │   ├── image_service.py             # 图像生成（Seedream/Stability/PIL 占位，含角色卡片注入）
+│   │   ├── image_service.py             # 图像生成（Seedream/Qwen-Image/Stability/PIL 占位，含角色卡片注入）
 │   │   ├── video_service.py             # SeedDance 视频生成（异步任务轮询）
 │   │   ├── tts_service.py               # Mimo 内置 TTS 配音
 │   │   ├── ffmpeg_service.py            # FFmpeg 成片合成（Ken Burns/字幕/转场/混音）
@@ -502,13 +502,17 @@ runner 上成套构建三个平台的安装包并发布到 GitHub Releases（当
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `IMAGE_PROVIDER` | `local` | 图像生成提供商：`local`（PIL 占位图）/ `stability` / `doubao-seedream-5.0-lite` |
+| `IMAGE_PROVIDER` | `local` | 图像生成提供商：`local`（PIL 占位图）/ `stability` / `doubao-seedream-5.0-lite` / `qwen-image` |
 | `STABILITY_API_KEY` | — | Stability AI API Key |
 | `STABILITY_API_URL` | `https://api.stability.ai/v2beta` | Stability API 地址 |
 | `ARK_API_KEY` | — | 火山方舟 API Key（Seedream 图像 + SeedDance 视频共用）；**视频生成必填** |
 | `SEEDREAM_API_KEY` | — | Seedream 专用 API Key |
 | `SEEDREAM_MODEL` | `doubao-seedream-5.0-lite` | Seedream 模型 |
 | `SEEDREAM_IMAGE_SIZE` | `1440x2560` | 默认出图尺寸（宽x高） |
+| `QWEN_IMAGE_API_KEY` | — | 阿里云百炼 Qwen-Image API Key（留空则复用 `DASHSCOPE_API_KEY`） |
+| `QWEN_IMAGE_BASE_URL` | `https://dashscope.aliyuncs.com/api/v1` | Qwen-Image 原生 API 地址 |
+| `QWEN_IMAGE_MODEL` | `qwen-image-plus` | Qwen-Image 模型 |
+| `QWEN_IMAGE_SIZE` | `1440x2560` | 默认出图尺寸（宽x高） |
 
 > `IMAGE_PROVIDER=local` 或缺少对应 API Key 时，系统自动使用 PIL 生成纯色占位图，图像阶段可离线跑通。但剧本解析、配音和视频生成仍需对应 API Key。
 
@@ -516,10 +520,13 @@ runner 上成套构建三个平台的安装包并发布到 GitHub Releases（当
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `VIDEO_PROVIDER` | `Doubao-Seedance-1.5-pro` | 视频生成提供商 |
+| `VIDEO_PROVIDER` | `Doubao-Seedance-1.5-pro` | 视频生成提供商；填 `wanx` / `dashscope` 切换到阿里云百炼通义万相 |
 | `SEEDDANCE_API_KEY` | — | SeedDance 专用 API Key（可选，留空回退 `ARK_API_KEY`） |
 | `SEEDDANCE_BASE_URL` | `https://ark.cn-beijing.volces.com/api/v3` | SeedDance API 地址 |
 | `SEEDDANCE_MODEL` | `doubao-seedance-1-5-pro-251215` | SeedDance 模型 |
+| `DASHSCOPE_API_KEY` | — | 阿里云百炼 API Key（`dashscope-wanx` 协议，Bearer 鉴权） |
+| `DASHSCOPE_BASE_URL` | `https://dashscope.aliyuncs.com/api/v1` | 百炼 DashScope API 地址 |
+| `DASHSCOPE_VIDEO_MODEL` | `wan2.5-i2v-plus` | 通义万相模型：图生视频（首帧驱动）用 `wan2.5-i2v-plus`，文生视频用 `wan2.5-t2v-plus` |
 
 #### TTS 配音配置
 
@@ -528,7 +535,16 @@ runner 上成套构建三个平台的安装包并发布到 GitHub Releases（当
 | `MIMO_TTS_MODEL` | `mimo-v2.5-tts` | Mimo TTS 模型 |
 | `MIMO_TTS_VOICE` | `冰糖` | 默认音色 |
 | `MIMO_TTS_FORMAT` | `wav` | 音频格式 |
-| `TTS_PROVIDER` | `mimo` | 历史字段，仅保留兼容；配音固定走 Mimo 内置 TTS（复用 `MIMO_API_KEY` + `MIMO_BASE_URL`） |
+| `TENCENT_SECRET_ID` | — | 腾讯云 SecretId（配置后语音端点默认切换到 `tencent-tts` 协议） |
+| `TENCENT_SECRET_KEY` | — | 腾讯云 SecretKey |
+| `TENCENT_TTS_URL` | `https://tts.tencentcloudapi.com` | 腾讯云语音合成 API 地址 |
+| `TENCENT_TTS_VOICE` | `101001` | 默认音色（VoiceType 数字 ID，`101001`=智瑜·情感女声） |
+| `TENCENT_TTS_FORMAT` | `wav` | 音频格式（wav / mp3 / opus） |
+| `TTS_PROVIDER` | `mimo` | 语音协议选择器：`mimo` / `tencent` / `dashscope`（`bailian`、`cosyvoice` 等别名亦可） |
+| `DASHSCOPE_TTS_API_KEY` | — | 百炼语音合成 API Key（`dashscope-tts` 协议，留空复用 `DASHSCOPE_API_KEY`） |
+| `DASHSCOPE_TTS_MODEL` | `cosyvoice-v2` | 百炼 CosyVoice 模型 |
+| `DASHSCOPE_TTS_VOICE` | `longwan_v2` | 默认音色（CosyVoice 音色 ID，`longwan_v2`=龙婉·温柔女声） |
+| `DASHSCOPE_TTS_FORMAT` | `wav` | 音频格式 |
 | `TTS_DEFAULT_VOICE` | `zh-CN-XiaoyiNeural` | 历史字段（旧 edge-tts 音色名），已被 `MIMO_TTS_VOICE` 取代 |
 
 #### 渲染与数据库配置

@@ -26,6 +26,7 @@ from services.style_templates import style_prompt_params, style_template
 from services.tts_service import normalize_mimo_voice
 from services.security import UploadLimitExceeded, safe_filename, save_upload_stream, validate_identifier, validate_script_upload
 from api.claim_guard import budget_notice, claim_or_block
+from api.provider_guard import ensure_providers_ready
 from services.task_registry import claim as claim_task, start as start_task, update_progress as update_job_progress
 
 router = APIRouter(prefix="/api/script", tags=["script"])
@@ -78,6 +79,8 @@ async def parse_script(data: ScriptParseRequest):
     if len(data.user_input) > settings.MAX_SCRIPT_TEXT_CHARS:
         raise HTTPException(status_code=413, detail="剧本文本超过长度限制")
     _require_project(data.project_id)
+    # 启动前预检：LLM（手动模式）/ 全链路 Provider（自动模式）未配置时直接拒绝。
+    ensure_providers_ready("script_pipeline", mode=data.mode)
     task = _spawn_pipeline(
         data.project_id,
         _initial_state(data.model_dump(), _resolved_skill_config(data.project_id)),
@@ -155,6 +158,12 @@ async def upload_script(
         "platform": platform,
         "target_duration": 45,
     }
+    # 与 /parse 同口径的启动预检：缺 Provider 配置时拒绝排队，删除临时上传文件。
+    try:
+        ensure_providers_ready("script_pipeline", mode=mode)
+    except HTTPException:
+        file_path.unlink(missing_ok=True)
+        raise
     task = _spawn_pipeline(safe_project_id, _initial_state(payload, _resolved_skill_config(safe_project_id)), mode, output_format, resolution)
     if task is None:
         return {"status": "already_running", "project_id": safe_project_id, "mode": mode, "deduplicated": True}
@@ -351,7 +360,7 @@ async def _run_storyboard_phase(project_id: str, state: dict):
 
         db = SessionLocal()
         try:
-            _persist_phase1(db, project_id, state, status="assets_ready")
+            project_title = _persist_phase1(db, project_id, state, status="assets_ready")
         finally:
             db.close()
         await _progress(project_id, "wait_asset_confirm", 45, "角色板、场景板与分镜已生成，请确认素材后生成故事板")
@@ -360,6 +369,8 @@ async def _run_storyboard_phase(project_id: str, state: dict):
             {
                 "type": "complete",
                 "project_id": project_id,
+                # 根据剧本自动命名的项目标题：客户端据此同步项目名与项目列表。
+                "title": project_title,
                 "shots": state.get("shots", []),
                 "video_path": "",
                 "asset_board_ready": True,
@@ -384,12 +395,13 @@ async def _run_storyboard_phase(project_id: str, state: dict):
         raise
 
 
-def _persist_phase1(db, project_id: str, state: dict, status: str = "assets_ready") -> None:
+def _persist_phase1(db, project_id: str, state: dict, status: str = "assets_ready") -> str:
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise RuntimeError("项目不存在")
     asset_project_id = project.parent_project_id or project.id
 
+    # 根据剧本自动命名：优先用 LLM 解析出的剧名，其次回退到剧本文本本身的标题行。
     project.title = state.get("script_title") or _script_title(state.get("user_input", "")) or project.title
     project.genre = state.get("genre") or project.genre
     project.style = state.get("style") or project.style
@@ -417,6 +429,7 @@ def _persist_phase1(db, project_id: str, state: dict, status: str = "assets_read
         create_version(db, model, "import")
 
     db.commit()
+    return project.title
 
 
 async def _ensure_character_reference_images(asset_project_id: str, state: dict) -> None:

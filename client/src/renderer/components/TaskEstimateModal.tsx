@@ -21,9 +21,11 @@ import {
   estimateCostText,
   formatDurationText,
   formatMicroAmount,
+  providerBlockedFromError,
   unknownCostReason,
   usedCostText,
 } from '../services/costModel'
+import { OPEN_SETTINGS_EVENT } from './TopBar'
 
 export interface TaskEstimateRequest extends EstimateRequest {
   /** 展示用的入口名称，例如「生成故事板」。 */
@@ -352,6 +354,40 @@ export function notifyBudgetBlocked(error: unknown): string {
     message: '已超出硬预算，任务未启动',
     description: blocked.message,
     duration: 10,
+    placement: 'bottomRight',
+  })
+  return blocked.message
+}
+
+/**
+ * 提交失败时先看是不是模型端点未配置拦截（HTTP 409 + provider_not_configured）。
+ *
+ * 返回被拦截的中文原因；返回空串表示这不是配置问题，调用方按原有错误提示处理。
+ * 通知里附「去系统设置」按钮，直接跳到模型服务配置页。
+ */
+export function notifyProviderBlocked(error: unknown): string {
+  const blocked = providerBlockedFromError(error)
+  if (!blocked) return ''
+  const missingLabels = (blocked.missing || []).map((item) => item.label).filter(Boolean)
+  notification.error({
+    message: '模型服务未配置，任务未启动',
+    description: missingLabels.length
+      ? blocked.message + '（缺少：' + missingLabels.join('、') + '）'
+      : blocked.message,
+    btn: (
+      <Button
+        type="primary"
+        size="small"
+        onClick={() => {
+          notification.destroy('provider-blocked')
+          window.dispatchEvent(new CustomEvent(OPEN_SETTINGS_EVENT))
+        }}
+      >
+        去系统设置
+      </Button>
+    ),
+    key: 'provider-blocked',
+    duration: 12,
     placement: 'bottomRight',
   })
   return blocked.message

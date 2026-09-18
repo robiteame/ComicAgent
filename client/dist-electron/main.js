@@ -1,4 +1,29 @@
-"use strict";const n=require("electron"),j=require("child_process"),m=require("fs"),q=require("crypto"),M=require("http"),H=require("net"),o=require("path"),U=require("url"),R="comic-agent";function $(e){let t;try{t=JSON.parse(e)}catch{return!1}if(typeof t!="object"||t===null||Array.isArray(t))return!1;const r=t;return r.status==="ok"&&r.service===R}function S(e){return e.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;")}function F(e,t){return`<!doctype html>
+"use strict";
+const electron = require("electron");
+const child_process = require("child_process");
+const fs = require("fs");
+const crypto = require("crypto");
+const http = require("http");
+const net = require("net");
+const path = require("path");
+const url = require("url");
+const BACKEND_SERVICE = "comic-agent";
+function isComicAgentHealthResponse(body) {
+  let payload;
+  try {
+    payload = JSON.parse(body);
+  } catch {
+    return false;
+  }
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return false;
+  const health = payload;
+  return health.status === "ok" && health.service === BACKEND_SERVICE;
+}
+function escapeHtml(value) {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+function renderBackendFailurePage(detail, hint) {
+  return `<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -48,8 +73,8 @@
 <div class="card">
   <div class="title"><span class="dot"></span>后端服务启动失败</div>
   <p id="status" class="status">渲染引擎未连接到本地后端，工作台不可用。</p>
-  <div id="detail" class="detail">${S(e)}</div>
-  <div class="hint">${S(t)}</div>
+  <div id="detail" class="detail">${escapeHtml(detail)}</div>
+  <div class="hint">${escapeHtml(hint)}</div>
   <div class="actions">
     <button id="retry" class="primary" type="button">重试启动</button>
     <button id="copy" class="secondary" type="button">复制错误信息</button>
@@ -111,5 +136,339 @@
 })()
 <\/script>
 </body>
-</html>`}function L(e,t){return`data:text/html;charset=utf-8,${encodeURIComponent(F(e,t))}`}let s=null,u=null,C=!1,g=null;const k="127.0.0.1";let b=null;const w=n.app.isPackaged?q.randomBytes(32).toString("hex"):"",E=n.app.requestSingleInstanceLock();E||n.app.quit();n.app.setName("ComicAgent");n.app.setPath("userData",o.join(n.app.getPath("appData"),"ComicAgent"));function _(e){const t={width:1400,height:900,minWidth:1200,minHeight:800,title:"漫剧智能办公台",transparent:!0,backgroundColor:"#00000000",autoHideMenuBar:!0,webPreferences:{preload:o.join(__dirname,"preload.js"),contextIsolation:!0,nodeIntegration:!1,sandbox:!0}};process.platform==="win32"?t.backgroundMaterial="acrylic":process.platform==="darwin"&&(t.titleBarStyle="hiddenInset",t.vibrancy="under-window",t.visualEffectState="active"),s=new n.BrowserWindow(t),s.webContents.setWindowOpenHandler(()=>({action:"deny"}));const r=U.pathToFileURL(o.join(__dirname,"../dist/index.html")).toString(),a=i=>i===r||i.startsWith("http://127.0.0.1:5173/"),c=(i,d)=>{a(d)||i.preventDefault()};s.webContents.on("will-navigate",c),s.webContents.on("will-redirect",c),s.on("closed",()=>{s=null}),s.setMenuBarVisibility(!1),e?s.loadURL(L(e.detail,e.hint)):B()}function B(){s&&(process.env.NODE_ENV==="development"||!n.app.isPackaged?s.loadURL("http://127.0.0.1:5173"):s.loadFile(o.join(__dirname,"../dist/index.html")))}function W(){return n.app.isPackaged?o.join(process.resourcesPath,"server"):o.resolve(__dirname,"../../server")}function z(){const e=o.join(process.resourcesPath,"python");return process.platform==="win32"?[o.join(e,"python.exe")]:[o.join(e,"bin","python3"),o.join(e,"bin","python")]}function K(){const e=o.join(process.resourcesPath,"bin");return m.existsSync(e)?e:null}function G(e){return new Promise(t=>setTimeout(t,e))}function T(e,t,r={},a=1200){return new Promise(c=>{let i=!1;const d=l=>{i||(i=!0,c(l))},f=M.get({hostname:k,port:e,path:t,headers:r},l=>{let y="";l.setEncoding("utf8"),l.on("data",h=>{y+=h,y.length>8192&&(l.destroy(),d(null))}),l.on("end",()=>d({statusCode:l.statusCode||0,body:y})),l.on("error",()=>d(null))});f.setTimeout(a,()=>{f.destroy(),d(null)}),f.on("error",()=>d(null))})}async function V(e,t=1200){const r=await T(e,"/health",{},t),a=!!(r&&r.statusCode>=200&&r.statusCode<300);if(!r||!a||!$(r.body))return!1;if(w){const c=await T(e,"/",{"X-Comic-Agent-Token":w},t);return!!(c&&c.statusCode>=200&&c.statusCode<300)}return!0}function Y(){return new Promise((e,t)=>{const r=H.createServer();r.unref(),r.once("error",t),r.listen(0,k,()=>{const a=r.address(),c=typeof a=="object"&&a!==null?a.port:null;r.close(()=>{c?e(c):t(new Error("无法预留本地后端端口"))})})})}function J(e,t,r){return new Promise((a,c)=>{var l,y;const i=j.spawn(e,[o.join(t,"main.py")],{cwd:t,env:r,stdio:["pipe","pipe","pipe"],windowsHide:!0}),d=h=>{i.removeListener("spawn",f),c(h)},f=()=>{i.removeListener("error",d),a(i)};i.once("error",d),i.once("spawn",f),(l=i.stdout)==null||l.on("data",h=>console.log(`[backend] ${String(h).trimEnd()}`)),(y=i.stderr)==null||y.on("data",h=>console.error(`[backend] ${String(h).trimEnd()}`))})}function D(){return g||(g=X().finally(()=>{g=null}),g)}async function X(){var A;if(!n.app.isPackaged)return;const e=W(),t=o.join(e,"main.py");if(!m.existsSync(t))throw new Error(`未找到后端入口: ${t}`);const r=n.app.getPath("userData"),a=o.join(r,"data"),c=o.join(r,"output"),i=o.join(a,"checkpoints"),d=o.join(a,"chromadb");for(const p of[a,c,i,d])m.mkdirSync(p,{recursive:!0});const f=await Y();b=f;const l={...process.env,PYTHONUNBUFFERED:"1",HOST:k,PORT:String(f),DATA_DIR:a,OUTPUT_DIR:c,DATABASE_URL:`sqlite:///${o.join(a,"comic_agent.db")}`,CHROMADB_PATH:d,CHECKPOINT_PATH:i,COMIC_AGENT_PARENT_WATCH:"1",...w?{COMIC_AGENT_LOCAL_TOKEN:w}:{}},y=(A=process.env.COMIC_AGENT_PYTHON)==null?void 0:A.trim(),h=process.platform==="win32"?["python.exe","python"]:["python3","python"],I=y?[y]:n.app.isPackaged?[...z().filter(p=>m.existsSync(p)),...h]:h,N=(p,x)=>{p.PATH=`${x}${o.delimiter}${p.PATH??""}`};if(n.app.isPackaged){const p=K();p&&N(l,p)}let P;try{for(const x of I)try{console.log(`[backend] 使用解释器: ${x}`),u=await J(x,e,l);break}catch(v){P=v instanceof Error?v:new Error(String(v))}if(!u)throw new Error(`无法启动 Python 后端${P?`: ${P.message}`:""}`);const p=Date.now()+3e4;for(;Date.now()<p;){if(await V(f))return;if(u.exitCode!==null)throw new Error(`后端进程提前退出 (code ${u.exitCode})`);await G(300)}throw new Error("后端健康检查超时，请确认已安装 Python 依赖和 FFmpeg")}catch(p){throw u&&u.exitCode===null&&u.kill(),u=null,b=null,p}}function O(){C=!0,u&&u.exitCode===null&&u.kill(),u=null,b=null}n.ipcMain.on("get-local-auth-token",e=>{e.returnValue=w});n.ipcMain.on("get-backend-base-url",e=>{e.returnValue=b?`http://${k}:${b}`:""});n.ipcMain.on("app-quit",()=>{n.app.quit()});n.ipcMain.handle("backend-retry",async()=>{if(!n.app.isPackaged)return{ok:!0};try{return O(),C=!1,await D(),B(),{ok:!0}}catch(e){return{ok:!1,detail:e instanceof Error?e.message:String(e)}}});E&&n.app.on("second-instance",()=>{s&&(s.isMinimized()&&s.restore(),s.focus())});E&&n.app.whenReady().then(async()=>{n.Menu.setApplicationMenu(null);let e;if(n.app.isPackaged)try{await D()}catch(t){const r=t instanceof Error?t.message:String(t),a=!m.existsSync(o.join(process.resourcesPath,"python"));e={detail:r,hint:a?`安装包似乎缺少自带的 Python 运行时，已尝试回退到系统 Python。
-可设置 COMIC_AGENT_PYTHON 指向 Python 3.11+ 并确认其已安装全部依赖，或在故障页点击“重试启动”。`:"可在下方点击“重试启动”，或设置 COMIC_AGENT_PYTHON 指向 Python 3.11+ 后重试。"}}_(e)});n.app.on("before-quit",O);n.app.on("child-process-gone",(e,t)=>{!C&&t.type==="Utility"&&t.reason!=="clean-exit"&&console.error(`[electron] 子进程异常退出: ${t.reason}`)});n.app.on("window-all-closed",()=>{process.platform!=="darwin"&&n.app.quit()});n.app.on("activate",()=>{n.BrowserWindow.getAllWindows().length===0&&_()});n.ipcMain.handle("select-file",async()=>{const e=await n.dialog.showOpenDialog(s,{properties:["openFile"],filters:[{name:"文本文件",extensions:["txt"]},{name:"Word文档",extensions:["docx"]},{name:"所有文件",extensions:["*"]}]});return e.canceled?null:e.filePaths[0]});n.ipcMain.handle("select-directory",async()=>{const e=await n.dialog.showOpenDialog(s,{properties:["openDirectory"]});return e.canceled?null:e.filePaths[0]});
+</html>`;
+}
+function backendFailurePageUrl(detail, hint) {
+  return `data:text/html;charset=utf-8,${encodeURIComponent(renderBackendFailurePage(detail, hint))}`;
+}
+let mainWindow = null;
+let backendProcess = null;
+let shuttingDown = false;
+let backendStartInFlight = null;
+const BACKEND_HOST = "127.0.0.1";
+let backendPort = null;
+const BACKEND_AUTH_TOKEN = electron.app.isPackaged ? crypto.randomBytes(32).toString("hex") : "";
+const gotSingleInstanceLock = electron.app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) electron.app.quit();
+electron.app.setName("ComicAgent");
+electron.app.setPath("userData", path.join(electron.app.getPath("appData"), "ComicAgent"));
+function createWindow(failure) {
+  const winOpts = {
+    width: 1400,
+    height: 900,
+    minWidth: 1200,
+    minHeight: 800,
+    title: "漫剧智能办公台",
+    transparent: true,
+    backgroundColor: "#00000000",
+    autoHideMenuBar: true,
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true
+    }
+  };
+  if (process.platform === "win32") {
+    winOpts.backgroundMaterial = "acrylic";
+  } else if (process.platform === "darwin") {
+    winOpts.titleBarStyle = "hiddenInset";
+    winOpts.vibrancy = "under-window";
+    winOpts.visualEffectState = "active";
+  }
+  mainWindow = new electron.BrowserWindow(winOpts);
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  const appEntryUrl = url.pathToFileURL(path.join(__dirname, "../dist/index.html")).toString();
+  const isAllowedRendererUrl = (url2) => url2 === appEntryUrl || url2.startsWith("http://127.0.0.1:5173/");
+  const rejectUnexpectedNavigation = (event, url2) => {
+    const allowed = isAllowedRendererUrl(url2);
+    if (!allowed) event.preventDefault();
+  };
+  mainWindow.webContents.on("will-navigate", rejectUnexpectedNavigation);
+  mainWindow.webContents.on("will-redirect", rejectUnexpectedNavigation);
+  mainWindow.on("closed", () => {
+    mainWindow = null;
+  });
+  mainWindow.setMenuBarVisibility(false);
+  if (failure) {
+    mainWindow.loadURL(backendFailurePageUrl(failure.detail, failure.hint));
+  } else {
+    loadAppEntry();
+  }
+}
+function loadAppEntry() {
+  if (!mainWindow) return;
+  if (process.env.NODE_ENV === "development" || !electron.app.isPackaged) {
+    mainWindow.loadURL("http://127.0.0.1:5173");
+  } else {
+    mainWindow.loadFile(path.join(__dirname, "../dist/index.html"));
+  }
+}
+function backendRoot() {
+  return electron.app.isPackaged ? path.join(process.resourcesPath, "server") : path.resolve(__dirname, "../../server");
+}
+function bundledPythonCandidates() {
+  const pythonDir = path.join(process.resourcesPath, "python");
+  return process.platform === "win32" ? [path.join(pythonDir, "python.exe")] : [path.join(pythonDir, "bin", "python3"), path.join(pythonDir, "bin", "python")];
+}
+function bundledBinDir() {
+  const binDir = path.join(process.resourcesPath, "bin");
+  return fs.existsSync(binDir) ? binDir : null;
+}
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+function probeEndpoint(port, pathname, headers = {}, timeoutMs = 1200) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+    const request = http.get(
+      { hostname: BACKEND_HOST, port, path: pathname, headers },
+      (response) => {
+        let body = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk) => {
+          body += chunk;
+          if (body.length > 8192) {
+            response.destroy();
+            finish(null);
+          }
+        });
+        response.on("end", () => finish({ statusCode: response.statusCode || 0, body }));
+        response.on("error", () => finish(null));
+      }
+    );
+    request.setTimeout(timeoutMs, () => {
+      request.destroy();
+      finish(null);
+    });
+    request.on("error", () => finish(null));
+  });
+}
+async function probeBackend(port, timeoutMs = 1200) {
+  const health = await probeEndpoint(port, "/health", {}, timeoutMs);
+  const healthStatusOk = Boolean(health && health.statusCode >= 200 && health.statusCode < 300);
+  if (!health || !healthStatusOk || !isComicAgentHealthResponse(health.body)) return false;
+  if (BACKEND_AUTH_TOKEN) {
+    const authenticated = await probeEndpoint(
+      port,
+      "/",
+      { "X-Comic-Agent-Token": BACKEND_AUTH_TOKEN },
+      timeoutMs
+    );
+    return Boolean(authenticated && authenticated.statusCode >= 200 && authenticated.statusCode < 300);
+  }
+  return true;
+}
+function reserveBackendPort() {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.unref();
+    server.once("error", reject);
+    server.listen(0, BACKEND_HOST, () => {
+      const address = server.address();
+      const port = typeof address === "object" && address !== null ? address.port : null;
+      server.close(() => {
+        if (port) resolve(port);
+        else reject(new Error("无法预留本地后端端口"));
+      });
+    });
+  });
+}
+function spawnBackend(python, serverDir, env) {
+  return new Promise((resolve, reject) => {
+    var _a, _b;
+    const child = child_process.spawn(python, [path.join(serverDir, "main.py")], {
+      cwd: serverDir,
+      env,
+      // stdin stays open: the server runs a watchdog thread that exits when
+      // stdin reaches EOF, so the backend can never outlive a hard crash of
+      // the Electron shell (a normal quit already kills it explicitly).
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true
+    });
+    const onError = (error) => {
+      child.removeListener("spawn", onSpawn);
+      reject(error);
+    };
+    const onSpawn = () => {
+      child.removeListener("error", onError);
+      resolve(child);
+    };
+    child.once("error", onError);
+    child.once("spawn", onSpawn);
+    (_a = child.stdout) == null ? void 0 : _a.on("data", (chunk) => console.log(`[backend] ${String(chunk).trimEnd()}`));
+    (_b = child.stderr) == null ? void 0 : _b.on("data", (chunk) => console.error(`[backend] ${String(chunk).trimEnd()}`));
+  });
+}
+function startBackend() {
+  if (backendStartInFlight) return backendStartInFlight;
+  backendStartInFlight = startBackendUnchecked().finally(() => {
+    backendStartInFlight = null;
+  });
+  return backendStartInFlight;
+}
+async function startBackendUnchecked() {
+  var _a;
+  if (!electron.app.isPackaged) return;
+  const serverDir = backendRoot();
+  const entrypoint = path.join(serverDir, "main.py");
+  if (!fs.existsSync(entrypoint)) {
+    throw new Error(`未找到后端入口: ${entrypoint}`);
+  }
+  const userData = electron.app.getPath("userData");
+  const dataDir = path.join(userData, "data");
+  const outputDir = path.join(userData, "output");
+  const checkpointDir = path.join(dataDir, "checkpoints");
+  const chromaDir = path.join(dataDir, "chromadb");
+  for (const directory of [dataDir, outputDir, checkpointDir, chromaDir]) {
+    fs.mkdirSync(directory, { recursive: true });
+  }
+  const port = await reserveBackendPort();
+  backendPort = port;
+  const env = {
+    ...process.env,
+    PYTHONUNBUFFERED: "1",
+    // Never inherit a broad bind address from the user's shell. The desktop
+    // backend is private to this application and its token is not a LAN auth
+    // boundary.
+    HOST: BACKEND_HOST,
+    PORT: String(port),
+    DATA_DIR: dataDir,
+    OUTPUT_DIR: outputDir,
+    DATABASE_URL: `sqlite:///${path.join(dataDir, "comic_agent.db")}`,
+    CHROMADB_PATH: chromaDir,
+    CHECKPOINT_PATH: checkpointDir,
+    COMIC_AGENT_PARENT_WATCH: "1",
+    ...BACKEND_AUTH_TOKEN ? { COMIC_AGENT_LOCAL_TOKEN: BACKEND_AUTH_TOKEN } : {}
+  };
+  const configuredPython = (_a = process.env.COMIC_AGENT_PYTHON) == null ? void 0 : _a.trim();
+  const systemCandidates = process.platform === "win32" ? ["python.exe", "python"] : ["python3", "python"];
+  const candidates = configuredPython ? [configuredPython] : electron.app.isPackaged ? [...bundledPythonCandidates().filter((candidate) => fs.existsSync(candidate)), ...systemCandidates] : systemCandidates;
+  const prependToPath = (env2, dir) => {
+    env2.PATH = `${dir}${path.delimiter}${env2.PATH ?? ""}`;
+  };
+  if (electron.app.isPackaged) {
+    const binDir = bundledBinDir();
+    if (binDir) prependToPath(env, binDir);
+  }
+  let lastError;
+  try {
+    for (const candidate of candidates) {
+      try {
+        console.log(`[backend] 使用解释器: ${candidate}`);
+        backendProcess = await spawnBackend(candidate, serverDir, env);
+        break;
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+      }
+    }
+    if (!backendProcess) {
+      throw new Error(`无法启动 Python 后端${lastError ? `: ${lastError.message}` : ""}`);
+    }
+    const readyUntil = Date.now() + 3e4;
+    while (Date.now() < readyUntil) {
+      if (await probeBackend(port)) return;
+      if (backendProcess.exitCode !== null) {
+        throw new Error(`后端进程提前退出 (code ${backendProcess.exitCode})`);
+      }
+      await wait(300);
+    }
+    throw new Error("后端健康检查超时，请确认已安装 Python 依赖和 FFmpeg");
+  } catch (error) {
+    if (backendProcess && backendProcess.exitCode === null) backendProcess.kill();
+    backendProcess = null;
+    backendPort = null;
+    throw error;
+  }
+}
+function stopBackend() {
+  shuttingDown = true;
+  if (backendProcess && backendProcess.exitCode === null) {
+    backendProcess.kill();
+  }
+  backendProcess = null;
+  backendPort = null;
+}
+electron.ipcMain.on("get-local-auth-token", (event) => {
+  event.returnValue = BACKEND_AUTH_TOKEN;
+});
+electron.ipcMain.on("get-backend-base-url", (event) => {
+  event.returnValue = backendPort ? `http://${BACKEND_HOST}:${backendPort}` : "";
+});
+electron.ipcMain.on("app-quit", () => {
+  electron.app.quit();
+});
+electron.ipcMain.handle("backend-retry", async () => {
+  if (!electron.app.isPackaged) return { ok: true };
+  try {
+    stopBackend();
+    shuttingDown = false;
+    await startBackend();
+    loadAppEntry();
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, detail: error instanceof Error ? error.message : String(error) };
+  }
+});
+if (gotSingleInstanceLock) {
+  electron.app.on("second-instance", () => {
+    if (!mainWindow) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.focus();
+  });
+}
+if (gotSingleInstanceLock) electron.app.whenReady().then(async () => {
+  electron.Menu.setApplicationMenu(null);
+  let backendFailure;
+  if (electron.app.isPackaged) {
+    try {
+      await startBackend();
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      const bundledMissing = !fs.existsSync(path.join(process.resourcesPath, "python"));
+      backendFailure = {
+        detail,
+        hint: bundledMissing ? "安装包似乎缺少自带的 Python 运行时，已尝试回退到系统 Python。\n可设置 COMIC_AGENT_PYTHON 指向 Python 3.11+ 并确认其已安装全部依赖，或在故障页点击“重试启动”。" : "可在下方点击“重试启动”，或设置 COMIC_AGENT_PYTHON 指向 Python 3.11+ 后重试。"
+      };
+    }
+  }
+  createWindow(backendFailure);
+});
+electron.app.on("before-quit", stopBackend);
+electron.app.on("child-process-gone", (_event, details) => {
+  if (!shuttingDown && details.type === "Utility" && details.reason !== "clean-exit") {
+    console.error(`[electron] 子进程异常退出: ${details.reason}`);
+  }
+});
+electron.app.on("window-all-closed", () => {
+  if (process.platform !== "darwin") {
+    electron.app.quit();
+  }
+});
+electron.app.on("activate", () => {
+  if (electron.BrowserWindow.getAllWindows().length === 0) {
+    createWindow();
+  }
+});
+electron.ipcMain.handle("select-file", async () => {
+  const result = await electron.dialog.showOpenDialog(mainWindow, {
+    properties: ["openFile"],
+    filters: [
+      { name: "文本文件", extensions: ["txt"] },
+      { name: "Word文档", extensions: ["docx"] },
+      { name: "所有文件", extensions: ["*"] }
+    ]
+  });
+  return result.canceled ? null : result.filePaths[0];
+});
+electron.ipcMain.handle("select-directory", async () => {
+  const result = await electron.dialog.showOpenDialog(mainWindow, {
+    properties: ["openDirectory"]
+  });
+  return result.canceled ? null : result.filePaths[0];
+});

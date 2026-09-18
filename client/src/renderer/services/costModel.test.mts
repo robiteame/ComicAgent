@@ -34,6 +34,7 @@ import {
   normalizeJobCostDetail,
   normalizeJobStatsCost,
   normalizePricingTable,
+  providerBlockedFromError,
   usedCostText,
   unknownCostReason,
 } from './costModel.ts'
@@ -343,5 +344,33 @@ assert.equal(describeBudgetError({ response: { status: 400, data: { detail: '软
 assert.equal(describeBudgetError({ response: { status: 500, data: 'boom' } }, '保存失败'), '保存失败（HTTP 500）')
 assert.equal(describeBudgetError(new Error('Network Error'), '保存失败'), '保存失败（网络不可用）')
 assert.match(describeBudgetError(new Error('boom'), '保存失败'), /保存失败/)
+
+// --- 模型端点未配置拦截（provider_not_configured） ---------------------------
+
+const providerBlockedError = {
+  response: {
+    status: 409,
+    data: {
+      detail: {
+        ok: false,
+        status: 'provider_not_configured',
+        error_code: 'provider_not_configured',
+        message: '以下模型端点尚未配置 API Key：视频生成模型、配音（TTS）。',
+        missing: [
+          { capability: 'video', label: '视频生成模型', message: '视频生成模型未配置 API Key' },
+          { capability: 'voice', label: '配音（TTS）', message: '配音（TTS）未配置 API Key' },
+          { capability: '', label: '坏数据要丢弃' },
+        ],
+      },
+    },
+  },
+}
+const providerBlocked = providerBlockedFromError(providerBlockedError)
+assert.equal(providerBlocked?.status, 'provider_not_configured')
+assert.equal(providerBlocked?.message, '以下模型端点尚未配置 API Key：视频生成模型、配音（TTS）。')
+assert.equal(providerBlocked?.missing?.length, 2, '缺 capability 的缺失项必须丢弃')
+assert.equal(providerBlocked?.missing?.[0]?.label, '视频生成模型')
+assert.equal(providerBlockedFromError({ response: { status: 500, data: { detail: '内部错误' } } }), null, '普通失败不能被误判成配置拦截')
+assert.equal(providerBlockedFromError(blockedError), null, '预算拦截不能被误判成配置拦截')
 
 console.log('costModel.test.mts ok')

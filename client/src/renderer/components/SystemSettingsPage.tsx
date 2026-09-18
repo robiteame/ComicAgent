@@ -10,6 +10,7 @@ import {
   SaveOutlined,
   UploadOutlined,
 } from '@ant-design/icons'
+import AutoComplete from 'antd/es/auto-complete'
 import Button from 'antd/es/button'
 import Input from 'antd/es/input'
 import InputNumber from 'antd/es/input-number'
@@ -59,20 +60,33 @@ type SkillTemplate = {
 type ModelCategory = 'script' | 'image' | 'video' | 'voice'
 type ModelConfig = Record<string, any>
 type ModelConfigState = Record<ModelCategory, ModelConfig>
+type DiscoveredModel = {
+  id: string
+  label: string
+  owned_by?: string
+  capabilities?: { audio_modes?: string[] }
+}
+type DiscoveredModelState = Record<ModelCategory, DiscoveredModel[]>
 
 // 协议即代码路径：script 固定 openai-chat 不露出；其余类别提供下拉选择。
 // 接入同协议新服务只需改 base_url/api_key/model；全新协议需后端新增适配器。
 const PROTOCOL_OPTIONS: Partial<Record<ModelCategory, { value: string; label: string }[]>> = {
   image: [
     { value: 'ark-seedream', label: '火山方舟 Seedream（支持参考图）' },
+    { value: 'qwen-image', label: '阿里云百炼 Qwen-Image（异步任务）' },
     { value: 'stability', label: 'Stability AI' },
     { value: 'placeholder', label: '本地占位图（离线/免密钥）' },
   ],
   video: [
     { value: 'ark-seedance', label: '火山方舟 Seedance（无声视频 + TTS）' },
+    { value: 'dashscope-wanx', label: '阿里云百炼 通义万相（无声视频 + TTS）' },
     { value: 'native-audio', label: '原生音视频（对白直出，厂商接入中）' },
   ],
-  voice: [{ value: 'mimo-tts', label: 'Mimo 内置 TTS' }],
+  voice: [
+    { value: 'mimo-tts', label: 'Mimo 内置 TTS' },
+    { value: 'tencent-tts', label: '腾讯云语音合成（Key 填 SecretId:SecretKey）' },
+    { value: 'dashscope-tts', label: '阿里云百炼 CosyVoice 语音合成' },
+  ],
 }
 
 const AUDIO_MODE_OPTIONS = [
@@ -92,7 +106,7 @@ const SHOT_AUDIO_MODE_OPTIONS = [
 const VENDOR_PRESETS: Record<ModelCategory, { label: string; patch: ModelConfig }[]> = {
   script: [
     { label: 'OpenAI', patch: { base_url: 'https://api.openai.com/v1', model: 'gpt-4o', auth_style: 'bearer' } },
-    { label: 'DeepSeek', patch: { base_url: 'https://api.deepseek.com', model: 'deepseek-chat', auth_style: 'bearer' } },
+    { label: 'DeepSeek V4.1 Flash', patch: { base_url: 'https://api.deepseek.com', model: 'deepseek-flash', auth_style: 'bearer' } },
     { label: '小米 MiMo', patch: { base_url: 'https://token-plan-cn.xiaomimimo.com/v1', model: 'mimo-v2.5', auth_style: 'api-key-header' } },
     { label: '硅基流动', patch: { base_url: 'https://api.siliconflow.cn/v1', model: '', auth_style: 'bearer' } },
   ],
@@ -103,6 +117,15 @@ const VENDOR_PRESETS: Record<ModelCategory, { label: string; patch: ModelConfig 
         protocol: 'ark-seedream',
         base_url: 'https://ark.cn-beijing.volces.com/api/v3',
         model: 'doubao-seedream-5.0-lite',
+        image_size: '1440x2560',
+      },
+    },
+    {
+      label: '阿里百炼 Qwen-Image',
+      patch: {
+        protocol: 'qwen-image',
+        base_url: 'https://dashscope.aliyuncs.com/api/v1',
+        model: 'qwen-image-plus',
         image_size: '1440x2560',
       },
     },
@@ -118,11 +141,33 @@ const VENDOR_PRESETS: Record<ModelCategory, { label: string; patch: ModelConfig 
         model: 'doubao-seedance-1-5-pro-251215',
       },
     },
+    {
+      label: '阿里百炼 Wan2.5',
+      patch: {
+        protocol: 'dashscope-wanx',
+        base_url: 'https://dashscope.aliyuncs.com/api/v1',
+        model: 'wan2.5-i2v-plus',
+      },
+    },
   ],
   voice: [
     {
       label: '小米 MiMo TTS',
       patch: { protocol: 'mimo-tts', base_url: 'https://token-plan-cn.xiaomimimo.com/v1', model: 'mimo-v2.5-tts', voice: '冰糖', format: 'wav' },
+    },
+    {
+      label: '腾讯云 TTS',
+      patch: { protocol: 'tencent-tts', base_url: 'https://tts.tencentcloudapi.com', model: '', voice: '101001', format: 'wav' },
+    },
+    {
+      label: '阿里百炼 CosyVoice',
+      patch: {
+        protocol: 'dashscope-tts',
+        base_url: 'https://dashscope.aliyuncs.com/api/v1',
+        model: 'cosyvoice-v2',
+        voice: 'longwan_v2',
+        format: 'wav',
+      },
     },
   ],
 }
@@ -160,6 +205,13 @@ const EMPTY_MODEL_CONFIG: ModelConfigState = {
   voice: {},
 }
 
+const EMPTY_DISCOVERED_MODELS: DiscoveredModelState = {
+  script: [],
+  image: [],
+  video: [],
+  voice: [],
+}
+
 const TAB_ITEMS: { key: SettingsTab; label: string; desc: string; icon: React.ReactNode }[] = [
   { key: 'appearance', label: '外观与画风', desc: '画风模板与全局生成规格', icon: <BgColorsOutlined /> },
   { key: 'models', label: '模型与 API 配置', desc: '剧本 / 图像 / 视频 / 配音接口', icon: <ApiOutlined /> },
@@ -184,6 +236,8 @@ const SystemSettingsPage: React.FC<SystemSettingsPageProps> = ({ onBack }) => {
   const [episodeBindings, setEpisodeBindings] = useState<Record<string, string>>({})
   const [savingSkill, setSavingSkill] = useState(false)
   const [modelConfig, setModelConfig] = useState<ModelConfigState>(EMPTY_MODEL_CONFIG)
+  const [discoveredModels, setDiscoveredModels] = useState<DiscoveredModelState>(EMPTY_DISCOVERED_MODELS)
+  const [discoveringCategory, setDiscoveringCategory] = useState<ModelCategory | null>(null)
   const [savingModel, setSavingModel] = useState(false)
   const skillImportRef = useRef<HTMLInputElement>(null)
 
@@ -365,6 +419,39 @@ const SystemSettingsPage: React.FC<SystemSettingsPageProps> = ({ onBack }) => {
       ...current,
       [category]: { ...current[category], [field]: value },
     }))
+    if (field === 'base_url' || field === 'protocol') {
+      setDiscoveredModels((current) => ({ ...current, [category]: [] }))
+    }
+  }
+
+  const handleDiscoverModels = async (category: ModelCategory) => {
+    const config = modelConfig[category]
+    if (!String(config.base_url || '').trim()) {
+      message.warning('请先填写 Base URL，再获取模型')
+      return
+    }
+    try {
+      setDiscoveringCategory(category)
+      const result = await settingsApi.discoverModels({
+        category,
+        base_url: String(config.base_url || ''),
+        // GET /model-configs masks persisted secrets. An empty value tells the
+        // server to reuse the saved key for this unchanged endpoint.
+        api_key: config.api_key === '********' ? '' : String(config.api_key || ''),
+        protocol: String(config.protocol || config.provider || ''),
+        auth_style: String(config.auth_style || 'bearer'),
+      })
+      const models = Array.isArray(result.models) ? (result.models as DiscoveredModel[]) : []
+      setDiscoveredModels((current) => ({ ...current, [category]: models }))
+      if (models.length && !String(config.model || '').trim()) {
+        updateModelField(category, 'model', models[0].id)
+      }
+      message.success(`已获取 ${models.length} 个可用模型`)
+    } catch (err: any) {
+      message.error('获取模型失败：' + (err.response?.data?.detail || err.message || '请检查地址和密钥'))
+    } finally {
+      setDiscoveringCategory(null)
+    }
   }
 
   const handleSaveModelConfig = async () => {
@@ -549,6 +636,9 @@ const SystemSettingsPage: React.FC<SystemSettingsPageProps> = ({ onBack }) => {
                     category="script"
                     config={modelConfig.script}
                     onChange={updateModelField}
+                    discoveredModels={discoveredModels.script}
+                    discovering={discoveringCategory === 'script'}
+                    onDiscover={handleDiscoverModels}
                     extraFields={[{ key: 'max_tokens', label: '最大 Token', type: 'number' }]}
                     showAuthStyle
                   />
@@ -558,6 +648,9 @@ const SystemSettingsPage: React.FC<SystemSettingsPageProps> = ({ onBack }) => {
                     category="image"
                     config={modelConfig.image}
                     onChange={updateModelField}
+                    discoveredModels={discoveredModels.image}
+                    discovering={discoveringCategory === 'image'}
+                    onDiscover={handleDiscoverModels}
                     extraFields={[{ key: 'image_size', label: '出图尺寸', type: 'text', placeholder: '例如 1440x2560' }]}
                   />
                   <ModelConfigCard
@@ -566,6 +659,9 @@ const SystemSettingsPage: React.FC<SystemSettingsPageProps> = ({ onBack }) => {
                     category="video"
                     config={modelConfig.video}
                     onChange={updateModelField}
+                    discoveredModels={discoveredModels.video}
+                    discovering={discoveringCategory === 'video'}
+                    onDiscover={handleDiscoverModels}
                     showAudioMode
                   />
                   <ModelConfigCard
@@ -574,8 +670,11 @@ const SystemSettingsPage: React.FC<SystemSettingsPageProps> = ({ onBack }) => {
                     category="voice"
                     config={modelConfig.voice}
                     onChange={updateModelField}
+                    discoveredModels={discoveredModels.voice}
+                    discovering={discoveringCategory === 'voice'}
+                    onDiscover={handleDiscoverModels}
                     extraFields={[
-                      { key: 'voice', label: '默认音色', type: 'text', placeholder: '例如 冰糖' },
+                      { key: 'voice', label: '默认音色', type: 'text', placeholder: '例如 冰糖、101001 或 longwan_v2' },
                       { key: 'format', label: '音频格式', type: 'text', placeholder: '例如 wav' },
                     ]}
                   />
@@ -688,6 +787,9 @@ function ModelConfigCard({
   extraFields,
   showAuthStyle,
   showAudioMode,
+  discoveredModels,
+  discovering,
+  onDiscover,
 }: {
   title: string
   subtitle: string
@@ -697,10 +799,24 @@ function ModelConfigCard({
   extraFields?: { key: string; label: string; type: 'text' | 'number'; placeholder?: string }[]
   showAuthStyle?: boolean
   showAudioMode?: boolean
+  discoveredModels: DiscoveredModel[]
+  discovering: boolean
+  onDiscover: (category: ModelCategory) => void
 }) {
   const protocolOptions = PROTOCOL_OPTIONS[category]
   const currentProtocol = String(config.protocol || config.provider || '').toLowerCase()
   const audioMode = String(config.audio_mode || '').toLowerCase()
+  const selectedModel = discoveredModels.find((item) => item.id === String(config.model || ''))
+  const audioModes = selectedModel?.capabilities?.audio_modes || []
+  const [modelDropdownOpen, setModelDropdownOpen] = useState(false)
+  const audioModeOptions = AUDIO_MODE_OPTIONS.map((option) => ({
+    ...option,
+    disabled: Boolean(audioModes.length) && option.value === 'native' && !audioModes.includes('native'),
+  }))
+
+  useEffect(() => {
+    if (discoveredModels.length > 0) setModelDropdownOpen(true)
+  }, [discoveredModels.length])
   return (
     <div className="model-config-card">
       <div className="model-config-head">
@@ -763,10 +879,42 @@ function ModelConfigCard({
           onChange={(event) => onChange(category, 'api_key', event.target.value)}
         />
       </div>
+      <div className="model-discovery-row">
+        <Button
+          icon={<ReloadOutlined />}
+          loading={discovering}
+          onClick={() => onDiscover(category)}
+        >
+          获取可用模型
+        </Button>
+        <span>{discoveredModels.length ? `已发现 ${discoveredModels.length} 个模型` : '输入地址和密钥后，从服务端读取模型列表'}</span>
+      </div>
       <div className="settings-field">
         <span>模型名称</span>
-        <Input value={config.model || ''} onChange={(event) => onChange(category, 'model', event.target.value)} />
+        <AutoComplete
+          value={config.model || ''}
+          open={modelDropdownOpen && discoveredModels.length > 0}
+          options={discoveredModels.map((item) => ({ value: item.id, label: item.label === item.id ? item.id : `${item.label} · ${item.id}` }))}
+          onChange={(value) => onChange(category, 'model', value)}
+          onFocus={() => {
+            if (discoveredModels.length > 0) setModelDropdownOpen(true)
+          }}
+          onOpenChange={setModelDropdownOpen}
+          onSelect={() => setModelDropdownOpen(false)}
+          placeholder={discoveredModels.length ? '搜索或输入模型名称' : '可手动输入模型名称'}
+          filterOption={(inputValue, option) => String(option?.value || '').toLowerCase().includes(inputValue.toLowerCase())}
+        />
       </div>
+      {showAudioMode && selectedModel ? (
+        <div className="model-capability-row" aria-label="模型能力">
+          <span>模型能力</span>
+          <div className="model-capability-tags">
+            {audioModes.includes('native') && <span className="model-capability-tag">有声视频</span>}
+            {audioModes.includes('silent') && <span className="model-capability-tag">无声视频</span>}
+            {!audioModes.length && <span className="model-capability-tag unknown">未声明</span>}
+          </div>
+        </div>
+      ) : null}
       {showAudioMode && (
         <>
           <div className="settings-field">
@@ -774,7 +922,7 @@ function ModelConfigCard({
             <Select
               value={['tts', 'native', 'auto'].includes(audioMode) ? audioMode : 'tts'}
               onChange={(value) => onChange(category, 'audio_mode', value)}
-              options={AUDIO_MODE_OPTIONS}
+              options={audioModeOptions}
             />
           </div>
           <div className="asset-board-note">

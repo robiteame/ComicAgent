@@ -448,3 +448,15 @@ export interface BudgetBlockedDetail {
 export const BUDGET_BLOCKED_STATUS = 'budget_blocked'
 export const BUDGET_EXCEEDED_CODE = 'budget_exceeded'
 export const BUDGET_SOFT_EXCEEDED_CODE = 'budget_soft_exceeded'
+
+/** 模型端点未配置时 HTTP 409 的响应体（detail 为对象），任务不会启动。 */
+export interface ProviderBlockedDetail {
+  ok: false
+  status: string
+  error_code: string
+  message: string
+  missing?: Array<{ capability: string; label?: string; message?: string }>
+}
+
+export const PROVIDER_BLOCKED_STATUS = 'provider_not_configured'
+export const PROVIDER_NOT_CONFIGURED_CODE = 'provider_not_configured'
