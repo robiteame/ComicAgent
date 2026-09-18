@@ -9,13 +9,20 @@
 import asyncio
 import logging
 import re
+import time
 from pathlib import Path
 
 from config import settings
+from services import usage_service
 from services.consistency_service import ConsistencyService
 from services.providers.base import Dialogue, VideoRequest
 from services.providers.endpoint import get_endpoint
 from services.providers.registry import get_adapter
+from services.providers.usage import (
+    CAPABILITY_VIDEO,
+    ERROR_CODE_PROVIDER_CALL_FAILED,
+    adapter_usage_for_request,
+)
 from services.reference_asset_service import ReferenceAssetService
 from services.security import safe_path, validate_identifier
 from services.style_templates import style_prompt_params
@@ -76,7 +83,34 @@ class VideoService:
             output_video_path=video_path,
             output_frame_path=frame_path,
         )
-        result = await adapter.generate(request)
+        # 视频按「秒 x 分辨率」记账；轮询式协议耗时很长，调用耗时单独记录。
+        metadata = adapter_usage_for_request(adapter, CAPABILITY_VIDEO, request)
+        scope = usage_service.current_scope().merged(project_id=safe_project_id, shot_id=safe_shot_id)
+        started = time.monotonic()
+        try:
+            result = await adapter.generate(request)
+        except asyncio.CancelledError:
+            # 轮询式视频任务被取消：调用确实发生过，留痕但不虚增金额。
+            usage_service.record_cancelled(
+                metadata,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                scope=scope,
+            )
+            raise
+        except Exception:
+            usage_service.record_failure(
+                metadata,
+                error_code=ERROR_CODE_PROVIDER_CALL_FAILED,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                scope=scope,
+            )
+            raise
+        usage_service.record_metadata(
+            metadata,
+            duration_ms=int((time.monotonic() - started) * 1000),
+            extra_units={"task_id": str(result.task_id or "")},
+            scope=scope,
+        )
 
         if result.native_audio:
             # 原生音频契约校验：不允许产出无声成品。

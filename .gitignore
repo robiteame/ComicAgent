@@ -60,6 +60,8 @@ client/release/
 
 # pnpm
 pnpm-debug.yaml
+# pnpm 内容寻址缓存:全局 store 与项目不在同一卷时会在项目根目录生成
+.pnpm-store/
 
 # ---- Environment & Secrets ----
 .env

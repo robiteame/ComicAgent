@@ -13,6 +13,7 @@ from __future__ import annotations
 from openai import AsyncOpenAI
 
 from services.providers.base import BaseAdapter, LLMCapabilities
+from services.providers.usage import CAPABILITY_LLM, UsageMetadata, usage_from_chat_response
 
 
 class OpenAIChatAdapter(BaseAdapter):
@@ -36,6 +37,27 @@ class OpenAIChatAdapter(BaseAdapter):
                 default_headers=default_headers,
             )
         return self._client
+
+    def usage_from_response(
+        self,
+        capability: str,
+        response: object | None = None,
+        *,
+        request: object | None = None,
+        model: str = "",
+        duration_ms: int = 0,
+    ) -> UsageMetadata:
+        """Chat Completions 的 usage 映射：prompt_tokens / completion_tokens。
+
+        供应商没有返回 usage 时标记为「未知」，由记账层显示「成本未知」。
+        """
+
+        return usage_from_chat_response(
+            response,
+            provider=self.endpoint.protocol,
+            model=model or self.endpoint.model,
+            duration_ms=duration_ms,
+        )
 
     async def complete(
         self,

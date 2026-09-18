@@ -1,16 +1,24 @@
+import asyncio
 import base64  # noqa: F401  (kept for reference-asset data URLs)
 import logging
 import re
+import time
 
 from PIL import Image
 from io import BytesIO
 
 from config import settings
+from services import usage_service
 from services.consistency_service import ConsistencyService
 from services.providers.base import ImageRequest
 from services.providers.endpoint import EndpointConfig, get_endpoint
 from services.providers.image_placeholder import PlaceholderImageAdapter
 from services.providers.registry import UnknownProtocolError, get_adapter
+from services.providers.usage import (
+    CAPABILITY_IMAGE,
+    ERROR_CODE_PROVIDER_CALL_FAILED,
+    adapter_usage_for_request,
+)
 from services.reference_asset_service import ReferenceAssetService
 from services.security import atomic_write_bytes, safe_path, validate_identifier
 from services.storage_service import StorageQuotaExceeded, StorageService
@@ -48,7 +56,17 @@ class ImageService:
             return PlaceholderImageAdapter(EndpointConfig(protocol="placeholder")), endpoint
         return adapter_cls(endpoint), endpoint
 
-    async def _generate(self, *, prompt: str, negative_prompt: str, seed: int, reference_images: list[str], preferred_size: str, label: str) -> bytes:
+    async def _generate(
+        self,
+        *,
+        prompt: str,
+        negative_prompt: str,
+        seed: int,
+        reference_images: list[str],
+        preferred_size: str,
+        label: str,
+        shot_id: str = "",
+    ) -> bytes:
         adapter, endpoint = self._resolve_route()
         size = preferred_size or str(endpoint.param("image_size") or "")
         request = ImageRequest(
@@ -60,9 +78,42 @@ class ImageService:
             size=size,
             label=label,
         )
-        image_data = await adapter.generate(request)
+        # 用量按「实际调用的适配器」记账：回退到占位图时 provider 记为 placeholder，
+        # 不会被误记成已配置但未真正调用的云端 provider。
+        metadata = adapter_usage_for_request(adapter, CAPABILITY_IMAGE, request)
+        scope = usage_service.current_scope().merged(shot_id=shot_id)
+        started = time.monotonic()
+        try:
+            image_data = await adapter.generate(request)
+        except asyncio.CancelledError:
+            # 任务被取消：调用已经发出，同样要留痕（金额未知，不虚增）。
+            usage_service.record_cancelled(
+                metadata,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                scope=scope,
+            )
+            raise
+        except Exception:
+            usage_service.record_failure(
+                metadata,
+                error_code=ERROR_CODE_PROVIDER_CALL_FAILED,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                scope=scope,
+            )
+            raise
         if not image_data:
+            usage_service.record_failure(
+                metadata,
+                error_code=ERROR_CODE_PROVIDER_CALL_FAILED,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                scope=scope,
+            )
             raise RuntimeError("图像生成接口未返回图片数据")
+        usage_service.record_metadata(
+            metadata,
+            duration_ms=int((time.monotonic() - started) * 1000),
+            scope=scope,
+        )
         return image_data
 
     async def generate_shot_image(
@@ -92,6 +143,7 @@ class ImageService:
             reference_images=reference_images,
             preferred_size=preferred_size,
             label="SHOT PLACEHOLDER",
+            shot_id=safe_shot_id,
         )
 
         self._validate_image(image_data)

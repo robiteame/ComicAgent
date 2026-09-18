@@ -4,6 +4,7 @@ import {
   CodeOutlined,
   DownOutlined,
   FieldTimeOutlined,
+  HistoryOutlined,
   LeftOutlined,
   ReloadOutlined,
   RightOutlined,
@@ -17,6 +18,7 @@ import InputNumber from 'antd/es/input-number'
 import message from 'antd/es/message'
 import Select from 'antd/es/select'
 import { assetApi, shotApi, toOutputUrl } from '../services/api'
+import { notifyBudgetBlocked, notifyBudgetWarning, useTaskEstimateGate } from './TaskEstimateModal'
 import {
   drainPendingSaves,
   hasPendingChanges,
@@ -29,6 +31,7 @@ import { useShotStore } from '../stores/shotStore'
 
 const { TextArea } = Input
 const FlowGraph = React.lazy(() => import('./FlowGraph'))
+const ShotVersionHistory = React.lazy(() => import('./ShotVersionHistory'))
 
 // 镜头级音频路径覆盖：空=继承系统设置的全局 audio_mode。
 const SHOT_AUDIO_MODE_OPTIONS = [
@@ -80,6 +83,9 @@ const RightSidebar: React.FC<RightSidebarProps> = ({ collapsed, onToggleCollapse
   const [shotDraft, setShotDraft] = useState<Record<string, any>>({})
   const [shotDirty, setShotDirty] = useState(false)
   const [shotSaveState, setShotSaveState] = useState<'idle' | 'dirty' | 'saving' | 'error'>('idle')
+  const [versionHistoryOpen, setVersionHistoryOpen] = useState(false)
+  // 提交前估算闸门：重新生成镜头会真实调用图像接口，需要先确认成本与耗时。
+  const estimateGate = useTaskEstimateGate()
   const shotDraftRef = useRef<Record<string, any>>({})
   const shotSaveEntriesRef = useRef(new Map<string, ShotSaveEntry>())
   const flushShotDraftRef = useRef<(projectId: string, shotId: string) => Promise<boolean>>(async () => true)
@@ -290,6 +296,50 @@ const RightSidebar: React.FC<RightSidebarProps> = ({ collapsed, onToggleCollapse
     flushProjectBeforeNavigation(fromProjectId),
   ), [])
 
+  const flushAllShotSaves = async (): Promise<boolean> => {
+    const entries = [...shotSaveEntriesRef.current.values()]
+    if (!entries.length) return true
+    const results = await Promise.all(entries.map((entry) => flushAndRetireShotSave(entry)))
+    return results.every(Boolean)
+  }
+
+  // 版本恢复成功：把服务端返回的最新镜头状态合并回全局 store，工作区与
+  // 草稿表单随后按 store 值刷新；版本时间线由抽屉自己重拉。
+  const handleVersionRestored = (shotPayload: Record<string, any>) => {
+    if (!shotPayload || typeof shotPayload.id !== 'string') return
+    updateShot(shotPayload.id, {
+      shot_type: shotPayload.shot_type || 'medium',
+      scene_description: shotPayload.scene_description || '',
+      character_action: shotPayload.character_action || '',
+      dialogue: shotPayload.dialogue || '',
+      camera_angle: shotPayload.camera_angle || '正面',
+      camera_movement: shotPayload.camera_movement || '静止',
+      duration: Number(shotPayload.duration || 3),
+      emotion: shotPayload.emotion || 'neutral',
+      transition: shotPayload.transition || 'cut',
+      visual_notes: shotPayload.visual_notes || '',
+      image_path: shotPayload.image_path || '',
+      storyboard_path: shotPayload.storyboard_path || '',
+      video_path: shotPayload.video_path || '',
+      audio_path: shotPayload.audio_path || '',
+      status: shotPayload.status || 'pending',
+      storyboard_status: shotPayload.storyboard_status || 'pending',
+      version: Number(shotPayload.version || 1),
+      confirmed: Boolean(shotPayload.confirmed),
+      scene_asset_id: shotPayload.scene_asset_id || '',
+      scene_group_id: shotPayload.scene_group_id || '',
+      characters_in_scene: Array.isArray(shotPayload.characters_in_scene) ? shotPayload.characters_in_scene : [],
+      character_asset_ids: Array.isArray(shotPayload.character_asset_ids) ? shotPayload.character_asset_ids : [],
+      consistency_context: shotPayload.consistency_context || '',
+      reference_weights: shotPayload.reference_weights || {},
+      continuity_profile: shotPayload.continuity_profile || {},
+      continuity_reference_path: shotPayload.continuity_reference_path || '',
+      pose_reference_path: shotPayload.pose_reference_path || '',
+      depth_reference_path: shotPayload.depth_reference_path || '',
+      last_frame_path: shotPayload.last_frame_path || '',
+    })
+  }
+
   useEffect(() => {
     const preventUnsavedUnload = (event: BeforeUnloadEvent) => {
       const hasUnsavedChanges = [...shotSaveEntriesRef.current.values()].some(
@@ -498,6 +548,18 @@ const RightSidebar: React.FC<RightSidebarProps> = ({ collapsed, onToggleCollapse
     const fullPrompt = String(draft.visual_notes || '').trim() || await fillGenerationPrompt()
     if (!fullPrompt || requestId !== regenerateRequestRef.current || !isCurrentShotContext(entryProjectId, shot.id)) return
 
+    // 单镜头重生成同样是付费任务：先给出成本 / 耗时估算，用户确认后再提交；
+    // 硬预算不足时弹窗会禁用确认按钮（后端抢占时还会再拦一次）。
+    const confirmedByEstimate = await estimateGate.confirm({
+      job_type: 'shot_image',
+      project_id: entryProjectId,
+      shot_id: shot.id,
+      entryLabel: '重新生成镜头 ' + shot.sequence + ' 故事板',
+    })
+    if (!confirmedByEstimate || requestId !== regenerateRequestRef.current || !isCurrentShotContext(entryProjectId, shot.id)) {
+      return
+    }
+
     try {
       setRegeneratingShot(true)
       setGenerating(true)
@@ -511,7 +573,7 @@ const RightSidebar: React.FC<RightSidebarProps> = ({ collapsed, onToggleCollapse
         setGenerating(false)
         return
       }
-      await shotApi.regenerate(shot.id, {
+      const regenerateResult = await shotApi.regenerate(shot.id, {
         prompt: fullPrompt,
         visual_notes: fullPrompt,
         new_scene: draft.scene_description ?? shot.scene_description,
@@ -523,6 +585,7 @@ const RightSidebar: React.FC<RightSidebarProps> = ({ collapsed, onToggleCollapse
         duration: draft.duration ?? shot.duration,
         reason: fullPrompt,
       })
+      notifyBudgetWarning(regenerateResult)
       if (requestId !== regenerateRequestRef.current || !isCurrentShotContext(entryProjectId, shot.id)) return
       updateShot(shot.id, {
         confirmed: false,
@@ -539,7 +602,8 @@ const RightSidebar: React.FC<RightSidebarProps> = ({ collapsed, onToggleCollapse
       message.success('当前镜头重生成已启动')
     } catch (err: any) {
       if (requestId !== regenerateRequestRef.current || !isCurrentShotContext(entryProjectId, shot.id)) return
-      message.error('镜头重生成失败：' + (err.message || '未知错误'))
+      // 硬预算拦截（HTTP 409 / budget_exceeded）单独提示，不混进通用错误文案。
+      if (!notifyBudgetBlocked(err)) message.error('镜头重生成失败：' + (err.message || '未知错误'))
       setGenerating(false)
     } finally {
       if (requestId === regenerateRequestRef.current && mountedRef.current) setRegeneratingShot(false)
@@ -845,6 +909,13 @@ const RightSidebar: React.FC<RightSidebarProps> = ({ collapsed, onToggleCollapse
                       </span>
                       <Button
                         size="small"
+                        icon={<HistoryOutlined />}
+                        onClick={() => setVersionHistoryOpen(true)}
+                      >
+                        版本历史
+                      </Button>
+                      <Button
+                        size="small"
                         loading={shotSaveState === 'saving'}
                         disabled={!shotDirty || shotSaveState === 'saving'}
                         onClick={() => projectId && selectedShot && void flushShotDraftRef.current(projectId, selectedShot.id)}
@@ -1007,6 +1078,18 @@ const RightSidebar: React.FC<RightSidebarProps> = ({ collapsed, onToggleCollapse
           </div>
         </div>
       )}
+
+      <React.Suspense fallback={null}>
+        <ShotVersionHistory
+          open={versionHistoryOpen && Boolean(selectedShot)}
+          shot={selectedShot || null}
+          onClose={() => setVersionHistoryOpen(false)}
+          onRestored={handleVersionRestored}
+          beforeRestore={flushAllShotSaves}
+        />
+      </React.Suspense>
+
+      {estimateGate.modal}
     </aside>
   )
 }

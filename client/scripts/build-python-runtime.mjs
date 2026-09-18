@@ -39,6 +39,8 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+import { createRuntimeMarker, markerMatches } from './runtimeMarker.mjs'
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const clientRoot = path.resolve(__dirname, '..')
 const serverRoot = path.resolve(clientRoot, '..', 'server')
@@ -343,25 +345,40 @@ function installDependencies(interpreter) {
   if (result.status !== 0) fail('pip install 失败')
 }
 
+async function requirementsLockFingerprint() {
+  // 锁文件决定了 site-packages 的内容,必须进入缓存标记:否则改了
+  // requirements.lock 之后仍会命中旧标记、跳过重装。文件缺失时不抛错,
+  // 交给 createRuntimeMarker 记录哨兵值(后面 installDependencies 会明确报错)。
+  const lockFile = path.join(serverRoot, 'requirements.lock')
+  if (!existsSync(lockFile)) {
+    log('未找到 server/requirements.lock,依赖指纹记为占位值')
+    return ''
+  }
+  return sha256File(lockFile)
+}
+
 async function buildPythonRuntime(targetKey) {
   const asset = PBS_ASSETS[targetKey]
   const assetName = pbsAssetName(asset)
-  const marker = {
+  const marker = createRuntimeMarker({
     asset: assetName,
-    sha256: asset.sha256,
-    lockFile: 'server/requirements.lock',
-  }
-  const markerExists = existsSync(runtimeMarker)
-  if (markerExists) {
+    assetSha256: asset.sha256,
+    requirementsLockSha256: await requirementsLockFingerprint(),
+  })
+  if (existsSync(runtimeMarker)) {
     try {
       const current = JSON.parse(readFileSync(runtimeMarker, 'utf8'))
-      if (current.asset === marker.asset && current.sha256 === marker.sha256) {
+      if (markerMatches(current, marker)) {
         const check = runInterpreter(pythonExecutable(pythonDir, targetKey), interpreterCheckCode(pythonDir))
         if (check.status === 0) {
           log(`python 运行时已是最新,跳过 (${assetName})`)
           return
         }
         log('现有 python 运行时自检失败,重新构建')
+      } else {
+        // 资产、锁文件、标记版本任一变化都会走到这里;旧版本标记缺少新增
+        // 字段时同样判为过期,必须重装依赖而不是复用。
+        log('运行时标记已过期(资产或依赖锁变化),重新构建')
       }
     } catch {
       log('运行时标记损坏,重新构建')

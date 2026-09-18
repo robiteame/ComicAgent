@@ -9,11 +9,15 @@
 注:各步骤函数沿用其手动模式的 WebSocket 进度百分比,自动模式下数值会跳变,属已知 cosmetic。
 """
 
-import traceback
+import logging
 
 from langgraph.graph import END, START, StateGraph
 
+from services.error_reporter import ERROR_PIPELINE, log_failure, new_error_id, redact
+
 from .state import AgentState
+
+logger = logging.getLogger(__name__)
 
 # 节点可视化元数据(供 /api/graph/structure 派生中文标签/类型/描述)
 GRAPH_NODE_META: dict[str, dict] = {
@@ -160,8 +164,18 @@ async def _compose(state: AgentState) -> dict:
 
 
 def _abort(node: str, exc) -> dict:
-    detail = f"{exc}\n{traceback.format_exc()}" if isinstance(exc, Exception) else str(exc)
-    return {"errors": [f"[{node}] {detail}"], "current_step": "aborted"}
+    """记录完整异常，只把可读的一行摘要交给状态机。
+
+    state 里的 errors 会经 WebSocket / 任务表回显给前端，因此这里不写入堆栈、
+    本地路径或供应商原始响应；完整堆栈留在服务端日志里，用错误编号关联。
+    """
+
+    if isinstance(exc, BaseException):
+        error_id = log_failure(exc, error_type=ERROR_PIPELINE, context={"node": node}, log=logger)
+    else:
+        error_id = new_error_id()
+        logger.error("自动流程节点失败 [%s] node=%s reason=%s", error_id, node, redact(exc))
+    return {"errors": [f"[{node}] 执行失败（错误编号 {error_id}）"], "current_step": "aborted"}
 
 
 def _shot_ids(project_id: str) -> list[str]:

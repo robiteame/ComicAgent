@@ -482,15 +482,17 @@ runner 上成套构建三个平台的安装包并发布到 GitHub Releases（当
 
 所有配置项定义在 `server/config.py`（Pydantic Settings），可通过 `.env` 文件或环境变量覆盖。配置优先级：**应用内保存的模型配置 > .env 文件 > config.py 默认值**。
 
+完整模板见 `server/.env.example`。其中**运行生成流程必须配置**的是 `MIMO_API_KEY`（剧本/分镜 LLM，或改用 `OPENAI_API_KEY`）与 `ARK_API_KEY`（视频生成）；其余项都有可用默认值：图像默认走 `local` 占位图，服务端口、数据库路径、渲染参数等均可留空。模板中的占位 Key 一律留空，避免被程序误判为「已配置」。
+
 #### LLM 配置
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `LLM_PROVIDER` | `openai` | LLM 提供商：`openai` / `deepseek` / `mimo` |
+| `LLM_PROVIDER` | `openai` | LLM 提供商：`openai` / `deepseek` / `mimo`（推荐 `mimo`，见下方 Mimo 配置） |
 | `OPENAI_API_KEY` | — | OpenAI API Key |
 | `OPENAI_BASE_URL` | — | OpenAI 兼容接口地址 |
 | `OPENAI_MODEL` | `gpt-4o` | OpenAI 模型名称 |
-| `MIMO_API_KEY` | — | Mimo API Key（通过硅基流动调用） |
+| `MIMO_API_KEY` | — | Mimo API Key（小米 MiMo 官方接口）；**生成流程必填**，留空则剧本解析直接报错 |
 | `MIMO_BASE_URL` | `https://token-plan-cn.xiaomimimo.com/v1` | Mimo 接口地址 |
 | `MIMO_MODEL` | `mimo-v2.5` | Mimo 模型名称 |
 | `MIMO_MULTIMODAL_MODEL` | `mimo-v2-omni` | 图像理解/诊断用多模态模型 |
@@ -503,7 +505,7 @@ runner 上成套构建三个平台的安装包并发布到 GitHub Releases（当
 | `IMAGE_PROVIDER` | `local` | 图像生成提供商：`local`（PIL 占位图）/ `stability` / `doubao-seedream-5.0-lite` |
 | `STABILITY_API_KEY` | — | Stability AI API Key |
 | `STABILITY_API_URL` | `https://api.stability.ai/v2beta` | Stability API 地址 |
-| `ARK_API_KEY` | — | 火山方舟 API Key（Seedream + SeedDance 共用） |
+| `ARK_API_KEY` | — | 火山方舟 API Key（Seedream 图像 + SeedDance 视频共用）；**视频生成必填** |
 | `SEEDREAM_API_KEY` | — | Seedream 专用 API Key |
 | `SEEDREAM_MODEL` | `doubao-seedream-5.0-lite` | Seedream 模型 |
 | `SEEDREAM_IMAGE_SIZE` | `1440x2560` | 默认出图尺寸（宽x高） |
@@ -515,7 +517,7 @@ runner 上成套构建三个平台的安装包并发布到 GitHub Releases（当
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `VIDEO_PROVIDER` | `Doubao-Seedance-1.5-pro` | 视频生成提供商 |
-| `SEEDDANCE_API_KEY` | — | SeedDance API Key |
+| `SEEDDANCE_API_KEY` | — | SeedDance 专用 API Key（可选，留空回退 `ARK_API_KEY`） |
 | `SEEDDANCE_BASE_URL` | `https://ark.cn-beijing.volces.com/api/v3` | SeedDance API 地址 |
 | `SEEDDANCE_MODEL` | `doubao-seedance-1-5-pro-251215` | SeedDance 模型 |
 
@@ -526,6 +528,8 @@ runner 上成套构建三个平台的安装包并发布到 GitHub Releases（当
 | `MIMO_TTS_MODEL` | `mimo-v2.5-tts` | Mimo TTS 模型 |
 | `MIMO_TTS_VOICE` | `冰糖` | 默认音色 |
 | `MIMO_TTS_FORMAT` | `wav` | 音频格式 |
+| `TTS_PROVIDER` | `mimo` | 历史字段，仅保留兼容；配音固定走 Mimo 内置 TTS（复用 `MIMO_API_KEY` + `MIMO_BASE_URL`） |
+| `TTS_DEFAULT_VOICE` | `zh-CN-XiaoyiNeural` | 历史字段（旧 edge-tts 音色名），已被 `MIMO_TTS_VOICE` 取代 |
 
 #### 渲染与数据库配置
 
@@ -558,6 +562,18 @@ runner 上成套构建三个平台的安装包并发布到 GitHub Releases（当
 应用内"系统设置 → 模型与 API 配置"提供可视化界面修改 LLM / 图像 / 视频 / 配音四类模型配置，保存后覆盖 `.env` / 默认值，持久化到 `server/data/model_api_config.json`，新任务立即读取最新配置。
 
 > ⚠️ `server/data/model_api_config.json` 会明文保存 API Key，属于本地运行时配置，**不应提交到版本库**。若该文件已进入 Git 历史，请立即轮换相关密钥并从历史记录中清除。
+
+### 模型价格与预算
+
+"系统设置 → 模型价格"按能力配置单价（LLM 每 100 万 tokens、图像每张、视频每秒、TTS 每 1000 字符、FFmpeg 每分钟编码），支持次级单价（LLM 输出 token）与分辨率倍率；"项目 → 预算面板"配置软/硬预算（金额与时长）并实时显示已用成本、已预留额度、剩余工作量的预计成本与预计耗时。
+
+记账口径（全项目统一）：
+
+- 金额一律是**货币最小单位的整数倍**（本项目管理到 10^-6 个货币单位，1 CNY = 1_000_000 micro），任何一步都用整数运算并向上取整，**不存在浮点金额**；
+- 没有可用价目的调用记为 `cost_known=false` 且金额为 NULL，界面显示"成本未知"，绝不按 0 元或猜测价格入账（本地占位图与本地 FFmpeg 是已知的零外部费用，单独标记为 `local`）；
+- **估算与实际分开存储**：启动前的估算写 `cost_estimates`，每次真实调用写 `usage_records`，两者互不覆盖；
+- 任务完成、失败、取消、被服务重启中断都会保留已发生的调用成本，任务中心可按任务查看明细；
+- 软预算超出只提示，硬预算超出会以 `error_code=budget_exceeded`（HTTP 409）阻止新任务启动；并发任务按"已用 + 已预留 + 本次估算"比对，预留随任务结束释放，不会重复计费。
 
 ---
 
@@ -614,6 +630,20 @@ runner 上成套构建三个平台的安装包并发布到 GitHub Releases（当
 | `GET` | `/api/graph/structure` | 获取自动模式流程图结构（节点+边，含中文标签和描述） |
 | `POST` | `/api/chat` | 自然语言交互（返回操作建议和项目/镜头上下文） |
 
+### 成本、用量与预算
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` `PUT` | `/api/budget/pricing` | 模型价格配置读取 / 保存（金额为整数 micro，浮点被拒绝） |
+| `GET` `PUT` | `/api/budget/config` | 项目 / 全局预算配置读取 / 保存（软预算、硬预算、时长预算） |
+| `GET` | `/api/budget/status` | 项目预算状态（已用 / 已预留 / 限额 / 状态等级） |
+| `POST` | `/api/budget/estimate` | 提交前估算：任务成本、预计耗时（含来源）、逐项拆解、是否会被硬预算拦下 |
+| `GET` | `/api/budget/summary` | 项目 / 剧集页所需的已用成本、剩余预计成本与耗时、各剧集成本表 |
+| `GET` | `/api/budget/usage` | 实际用量明细与多维度统计（项目 / 剧集 / 镜头 / 任务类型 / 能力 / provider / 模型） |
+| `GET` | `/api/budget/jobs/{job_id}` | 单次任务的成本明细：实际调用记录 + 启动前估算（失败 / 取消的任务同样可查） |
+
+> 提交类接口（`/api/script/parse`、`/api/script/upload`、`/api/shot/{pid}/generate-storyboard`、`/api/shot/{sid}/generate-video`、`/api/render`）在软预算超支时会在响应里附带 `budget_warning`；硬预算超限时返回 HTTP 409，`detail.error_code = budget_exceeded`。
+
 ### WebSocket 事件
 
 **连接**：`ws://127.0.0.1:8011/ws/{project_id}`
@@ -641,10 +671,15 @@ runner 上成套构建三个平台的安装包并发布到 GitHub Releases（当
 Project (项目/剧集)
 ├── 1:N → Shot (分镜镜头)
 ├── 1:N → Character (角色资产)
-└── 1:N → SceneAsset (场景资产)
+├── 1:N → SceneAsset (场景资产)
+└── 1:N → UsageRecord (实际用量) / CostEstimate (启动前估算)
 
 Project (series) ──parent_project_id──▶ Project (episode)
    剧集复用父项目的角色卡片和场景基准图
+
+BudgetConfig (预算：全局 / 项目 / 剧集)
+BudgetReservation (任务启动时按估算预留的额度)
+PricingConfig (各能力单价，按 capability + provider + model 匹配)
 ```
 
 ### 关键字段说明
@@ -656,6 +691,14 @@ Project (series) ──parent_project_id──▶ Project (episode)
 **Character** — 角色资产，包含 `visual_prompt`（英文绘画 Prompt）、`emotion_variants`（6 种情绪→Prompt 映射）、`key_features`（关键视觉特征 JSON）、`wardrobe_lock`（服装锁定）、`reference_images`（已确认参考图列表）。
 
 **SceneAsset** — 场景资产，通过 `scene_group_key`（地点+时段）分组实现场景组隔离，`consistency_profile` 锁定光照/色温/透视，`prop_lock` 锁定道具。
+
+**PricingConfig** — 单价表：`capability`（llm/image/video/tts/ffmpeg）+ `provider`（协议名）+ `model`（空串 = 该 provider 通用价）；`unit_price_micro` / `unit_price_secondary_micro`（LLM 输出 token）、`resolution_multipliers`（整数倍率，1_000_000 = 1.0）、`configured`。匹配优先级：model 精确 > provider 通用 > 能力兜底，只有 `configured=true` 且单价非空的行才参与计费。
+
+**UsageRecord** — 一次真实供应商调用的用量与费用：`usage_key`（唯一，重复写入不会重复计费）、归属（`project_id` / `series_id` / `shot_id` / `job_id` / `job_type` / `job_status`）、`capability` + `provider` + `model`、`quantity` / `secondary_quantity`（token / 张 / 秒 / 字符）、`units`（明细）、`status`（succeeded/failed/cancelled）、`cost_micro` + `cost_known` + `cost_source` + `price_snapshot`、`duration_ms`（供应商调用耗时）。
+
+**CostEstimate** — 任务启动前的估算（与 UsageRecord 分表）：`estimated_cost_micro` / `cost_known` / `estimated_seconds` / `duration_source`（history/heuristic/unknown）、`components`（逐能力拆解）与 `unknown_components`（哪些环节没有单价）。
+
+**BudgetConfig / BudgetReservation** — 预算（`soft_cost_micro` / `hard_cost_micro` / `soft_seconds` / `hard_seconds`，按 `scope_type` + `scope_id` 唯一）与任务启动时按估算预留的额度（`reservation_key` 唯一，任务终结即释放，保证并发下硬预算依然拦得住）。
 
 ---
 

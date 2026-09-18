@@ -1,17 +1,60 @@
 import asyncio
 import hashlib
+import json
+import logging
 import os
+import re
 import shutil
+import time
 import uuid
 from pathlib import Path
 
 from config import settings
+from services import usage_service
+from services.audio_mix_planner import SAMPLE_RATE, AudioMixPlan, MixTrackInput, manifest_digest, plan_audio_mix
+from services.providers.usage import CAPABILITY_FFMPEG
 from services.security import existing_file, safe_path, validate_identifier
 from services.storage_service import StorageQuotaExceeded, StorageService
+from services.subtitle_service import SubtitleCueData, SubtitleStyle, build_ass_document, serialize_srt
+
+logger = logging.getLogger(__name__)
+
+
+class MixBundle:
+    """一次混音的完整输入：预构建的主音轨链 + 规划器产出的轨道拓扑。"""
+
+    def __init__(self, plan: AudioMixPlan, main_inputs: list[str], main_statements: list[str]):
+        self.plan = plan
+        self.main_inputs = main_inputs
+        self.main_statements = main_statements
+        self.warnings: list[str] = list(plan.warnings)
+
+    @property
+    def inputs(self) -> list[str]:
+        return [*self.main_inputs, *self.plan.inputs]
+
+    @property
+    def filter_complex(self) -> str:
+        return ";".join([*self.main_statements, self.plan.filter_complex])
+
+    def manifest(self) -> dict:
+        return {
+            "tracks": self.plan.track_manifest,
+            "ducked_track_ids": self.plan.ducked_track_ids,
+            "filter_sha1": manifest_digest(self.plan.track_manifest),
+        }
+
+
+def _loud(value: float) -> str:
+    """响度参数定点化，避免 -0.0 / 科学计数法进入滤镜串。"""
+
+    return f"{float(value):.2f}"
 
 
 class FFmpegService:
     """Render shot images and optional audio into a short MP4."""
+
+    _subtitles_filter_available: bool | None = None
 
     def __init__(self):
         self.output_dir = settings.OUTPUT_DIR / "projects"
@@ -25,6 +68,7 @@ class FFmpegService:
         resolution: str = "1080p",
         project_id: str = "",
         publish: bool = True,
+        av_config: dict | None = None,
     ) -> str:
         try:
             safe_project_id = validate_identifier(project_id, "项目 ID")
@@ -38,6 +82,16 @@ class FFmpegService:
         work_dir = video_dir / f".render-{uuid.uuid4().hex}"
         work_dir.mkdir(parents=True, exist_ok=False)
         width, height = self._get_resolution(resolution, output_format)
+        av_tracks = list((av_config or {}).get("audio_tracks") or [])
+        subtitle_tracks = list((av_config or {}).get("subtitle_tracks") or [])
+        total_duration_s = float((av_config or {}).get("total_duration_s") or 0) or sum(
+            max(0.0, float(shot.get("duration") or 0)) for shot in shots
+        )
+        # FFmpeg 用量：编码时长（成片秒数）+ 输出分辨率 + 真实处理耗时。
+        # 本地能力默认零外部费用；若在系统设置里为 ffmpeg 配了单价，则按价目计费。
+        started = time.monotonic()
+        encoded_seconds = int(round(sum(max(0.0, float(shot.get("duration") or 0)) for shot in shots))) or len(shots)
+        output_resolution = f"{width}x{height}"
 
         try:
             clip_paths: list[Path] = []
@@ -58,12 +112,59 @@ class FFmpegService:
                 raise ValueError("没有可渲染的镜头图片")
 
             rendered = await self._concat_clips(clip_paths, work_dir)
-            rendered = await self._add_continuous_ambient_bed(rendered, work_dir)
+            # 字幕/音频工作台：有任一有效音轨时，混音接管音频（环境床在混音
+            # filter 内重建），否则保持旧管线（concat 音轨 + 独立环境床步骤）。
+            mix_bundle = await self._prepare_mix(shots, av_tracks, total_duration_s)
+            if mix_bundle is not None:
+                rendered = await self._apply_audio_mix(rendered, mix_bundle, work_dir, total_duration_s)
+            else:
+                rendered = await self._add_continuous_ambient_bed(rendered, work_dir)
+            # 烧录字幕在混音之后（避免字幕被后续步骤重编码抹掉画质前就叠上）。
+            for subtitle_track in subtitle_tracks:
+                if not subtitle_track.get("enabled") or not subtitle_track.get("burn_in"):
+                    continue
+                cues = subtitle_track.get("cues") or []
+                if not cues:
+                    continue
+                rendered = await self._burn_subtitles(rendered, subtitle_track, width, height, work_dir)
+            soft_tracks = [
+                track
+                for track in subtitle_tracks
+                if track.get("enabled") and not track.get("burn_in") and (track.get("cues") or [])
+            ]
+            if soft_tracks:
+                rendered = await self._mux_soft_subtitles(rendered, soft_tracks, work_dir)
             final_path = video_dir / ("final.mp4" if publish else f".final-{uuid.uuid4().hex}.candidate")
             os.replace(rendered, final_path)
             if not final_path.exists() or final_path.stat().st_size <= 1024:
                 raise RuntimeError("FFmpeg 未生成有效的成片文件")
+            usage_service.record_usage(
+                CAPABILITY_FFMPEG,
+                provider="local",
+                model="ffmpeg",
+                quantity=encoded_seconds,
+                resolution=output_resolution,
+                units={"encoding_seconds": encoded_seconds, "shots": len(clip_paths)},
+                duration_ms=int((time.monotonic() - started) * 1000),
+                scope=usage_service.current_scope(),
+            )
             return str(final_path)
+        except BaseException as exc:
+            # 失败/取消同样留痕：编码耗时是真实发生的资源消耗。
+            cancelled = isinstance(exc, asyncio.CancelledError)
+            usage_service.record_usage(
+                CAPABILITY_FFMPEG,
+                provider="local",
+                model="ffmpeg",
+                quantity=encoded_seconds,
+                resolution=output_resolution,
+                units={"encoding_seconds": encoded_seconds, "shots": len(shots)},
+                status=usage_service.CALL_CANCELLED if cancelled else usage_service.CALL_FAILED,
+                error_code="ffmpeg_cancelled" if cancelled else "ffmpeg_failed",
+                duration_ms=int((time.monotonic() - started) * 1000),
+                scope=usage_service.current_scope(),
+            )
+            raise
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -237,6 +338,422 @@ class FFmpegService:
         mixed_path.replace(video_path)
         return video_path
 
+    # --- 字幕与音频混音工作台 ---------------------------------------------
+
+    async def probe_duration_ms(self, path: str | Path) -> int:
+        """探测媒体时长（毫秒）。优先 ffprobe，缺失时退回 ffmpeg 解码解析。"""
+
+        target = str(path)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1", target,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            )
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+            except asyncio.CancelledError:
+                if proc.returncode is None:
+                    proc.kill()
+                await proc.communicate()
+                raise
+            if proc.returncode == 0:
+                for line in stdout.decode("utf-8", errors="ignore").splitlines():
+                    line = line.strip()
+                    if line:
+                        try:
+                            return int(float(line) * 1000)
+                        except ValueError:
+                            continue
+        except FileNotFoundError:
+            pass
+        except asyncio.TimeoutError:
+            return 0
+        # 退路：完整解码并取进度行的最后一个 time=。
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-hide_banner", "-i", target, "-f", "null", "-",
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=max(30, int(settings.FFMPEG_TIMEOUT_SECONDS)))
+            except asyncio.CancelledError:
+                if proc.returncode is None:
+                    proc.kill()
+                await proc.communicate()
+                raise
+            matches = re.findall(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)", stderr.decode("utf-8", errors="ignore"))
+            if matches:
+                hours, minutes, seconds = matches[-1]
+                return int((int(hours) * 3600 + int(minutes) * 60 + float(seconds)) * 1000)
+        except FileNotFoundError:
+            logger.warning("ffprobe 与 ffmpeg 均不可用，无法探测 %s 的时长", target)
+        return 0
+
+    async def _prepare_mix(
+        self,
+        shots: list[dict],
+        av_tracks: list[dict],
+        total_duration_s: float,
+        *,
+        allow_empty: bool = False,
+    ) -> MixBundle | None:
+        """校验素材、探测时长并规划混音。无有效轨道时按需返回 None。"""
+
+        tracks: list[MixTrackInput] = []
+        for item in av_tracks:
+            if item.get("muted"):
+                continue
+            media = self._media_path(str(item.get("resolved_source_path") or ""), minimum_size=1)
+            if media is None:
+                logger.warning("音轨 %s 的素材缺失或越出允许目录，已从混音中剔除", item.get("id"))
+                continue
+            duration_ms = int(item.get("source_duration_ms") or 0)
+            if duration_ms <= 0:
+                duration_ms = await self.probe_duration_ms(media)
+            tracks.append(
+                MixTrackInput(
+                    id=str(item.get("id") or ""),
+                    kind=str(item.get("kind") or "music"),
+                    media_path=str(media),
+                    media_duration_ms=duration_ms,
+                    shot_id=str(item.get("shot_id") or ""),
+                    start_ms=int(item.get("start_ms") or 0),
+                    volume=float(item.get("volume") or 1.0),
+                    pan=float(item.get("pan") or 0.0),
+                    fade_in_ms=int(item.get("fade_in_ms") or 0),
+                    fade_out_ms=int(item.get("fade_out_ms") or 0),
+                    delay_ms=int(item.get("delay_ms") or 0),
+                    trim_start_ms=int(item.get("trim_start_ms") or 0),
+                    trim_end_ms=int(item.get("trim_end_ms") or 0),
+                    loop=bool(item.get("loop")),
+                    duck_amount_db=float(item.get("duck_amount_db") or 0.0),
+                    duck_attack_ms=int(item.get("duck_attack_ms") or 120),
+                    duck_release_ms=int(item.get("duck_release_ms") or 480),
+                    clip_limit_ms=int(item.get("clip_limit_ms") or 0),
+                )
+            )
+        # 对白轨绑定的镜头：其 TTS 配音从主音轨拆出（主音轨对应区间置静音）。
+        bound_dialogue_shots = {track.shot_id for track in tracks if track.kind == "dialogue" and track.media_path}
+        main_inputs, main_statements = self._build_main_audio_chain(shots, bound_dialogue_shots)
+        plan = plan_audio_mix(
+            tracks,
+            total_duration_s,
+            main_label="[main0]",
+            first_track_input_index=len(main_inputs),
+            allow_empty=allow_empty,
+        )
+        if plan is None:
+            return None
+        return MixBundle(plan, main_inputs, main_statements)
+
+    def _build_main_audio_chain(
+        self, shots: list[dict], bound_dialogue_shots: set[str]
+    ) -> tuple[list[str], list[str]]:
+        """按镜头顺序重建主音轨（等价于 concat 视频内嵌的音轨）。
+
+        渲染与预览共用这一重建逻辑：对白拆出区间为静音、TTS 镜头用配音文件
+        并 pad 到镜头时长、native 镜头用生成视频自带音轨，其余为静音。因此
+        预览听到的主音轨与成片内嵌音轨来自同一段 filter 定义。
+        """
+
+        input_files: list[str] = []
+        input_index_of: dict[str, int] = {}
+
+        def allocate(path_obj: Path) -> int:
+            key = str(path_obj)
+            if key not in input_index_of:
+                input_files.append(key)
+                input_index_of[key] = len(input_files) - 1
+            return input_index_of[key]
+
+        format_chain = [f"aresample={SAMPLE_RATE}", "aformat=sample_fmts=fltp:channel_layouts=stereo"]
+        statements: list[str] = []
+        segment_labels: list[str] = []
+        for index, shot in enumerate(shots):
+            duration = max(0.5, float(shot.get("duration") or 3.0))
+            sec = f"{duration:.3f}"
+            label = f"m{index}"
+            audio = None
+            if str(shot.get("shot_id") or "") not in bound_dialogue_shots:
+                audio = self._media_path(shot.get("audio_path"), minimum_size=1)
+            # 输入标签后不能跟逗号（否则 ffmpeg 解析出空滤镜名）。
+            if str(shot.get("shot_id") or "") in bound_dialogue_shots:
+                head, chain = "", [f"aevalsrc=exprs=0|0:d={sec}:s={SAMPLE_RATE}", *format_chain]
+            elif audio is not None:
+                head, chain = f"[{allocate(audio)}:a:0]", [*format_chain, f"apad=pad_dur={sec}", f"atrim=duration={sec}", "asetpts=PTS-STARTPTS"]
+            elif self._shot_has_native_audio(shot):
+                video = self._media_path(shot.get("video_path"), minimum_size=4096)
+                if video is not None:
+                    head, chain = f"[{allocate(video)}:a:0]", [*format_chain, f"atrim=duration={sec}", "asetpts=PTS-STARTPTS"]
+                else:
+                    head, chain = "", [f"aevalsrc=exprs=0|0:d={sec}:s={SAMPLE_RATE}", *format_chain]
+            else:
+                head, chain = "", [f"aevalsrc=exprs=0|0:d={sec}:s={SAMPLE_RATE}", *format_chain]
+            statements.append(head + ",".join(part for part in chain if part) + f"[{label}]")
+            segment_labels.append(label)
+        if not segment_labels:
+            statements.append(f"aevalsrc=exprs=0|0:d=0.5:s={SAMPLE_RATE}[main0]")
+        else:
+            statements.append(
+                "".join(f"[{label}]" for label in segment_labels) + f"concat=n={len(segment_labels)}:v=0:a=1[main0]"
+            )
+        return input_files, statements
+
+    async def _apply_audio_mix(self, video_path: Path, bundle: MixBundle, work_dir: Path, total_duration_s: float) -> Path:
+        normalized = await self._produce_normalized_mix(bundle, work_dir)
+        (work_dir / "mix_manifest.json").write_text(
+            json.dumps(bundle.manifest(), ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        if bundle.warnings:
+            logger.warning("混音警告: %s", "; ".join(bundle.warnings))
+        output = work_dir / "final_mixed.mp4"
+        await self._run(
+            [
+                "ffmpeg", "-y",
+                "-i", str(video_path),
+                "-i", str(normalized),
+                "-map", "0:v:0", "-map", "1:a:0",
+                "-c:v", "copy", "-c:a", "aac",
+                "-movflags", "+faststart",
+                "-shortest",
+                str(output),
+            ]
+        )
+        return output
+
+    async def _produce_normalized_mix(self, bundle: MixBundle, work_dir: Path) -> Path:
+        """执行规划好的 filter_complex，并完成响度归一化与削波防护。
+
+        渲染与预览共用：同一份轨道配置 → 同一条 filter → 同一段归一化链，
+        这是「预览与最终输出一致」的保证点。
+        """
+
+        raw = work_dir / "mix_raw.wav"
+        inputs: list[str] = []
+        for path in bundle.inputs:
+            inputs.extend(["-i", path])
+        await self._run(
+            [
+                "ffmpeg", "-y", *inputs,
+                "-filter_complex", bundle.filter_complex,
+                "-map", bundle.plan.output_label,
+                "-c:a", "pcm_s16le", "-ar", str(SAMPLE_RATE),
+                str(raw),
+            ]
+        )
+        measured = await self._measure_loudness(raw)
+        normalized = work_dir / "mix_norm.wav"
+        # 两遍响度归一化（EBU R128）：先测量再线性套用，结果可复现；测量失败
+        # 时退回单遍动态模式，宁可降级也不放弃归一化。
+        if measured:
+            audio_filter = (
+                f"loudnorm=I={_loud(settings.LOUDNESS_TARGET_I)}:TP={_loud(settings.LOUDNESS_TARGET_TP)}"
+                f":LRA={_loud(settings.LOUDNESS_TARGET_LRA)}:linear=true"
+                f":measured_I={measured['input_i']}:measured_TP={measured['input_tp']}"
+                f":measured_LRA={measured['input_lra']}:measured_thresh={measured['input_thresh']}"
+                f":offset={measured['target_offset']}"
+            )
+        else:
+            audio_filter = (
+                f"loudnorm=I={_loud(settings.LOUDNESS_TARGET_I)}:TP={_loud(settings.LOUDNESS_TARGET_TP)}"
+                f":LRA={_loud(settings.LOUDNESS_TARGET_LRA)}"
+            )
+        limit = 10 ** (max(float(settings.LOUDNESS_TARGET_TP), -6.0) / 20.0)
+        audio_filter += f",alimiter=limit={limit:.4f}:level=false"
+        await self._run(
+            ["ffmpeg", "-y", "-i", str(raw), "-af", audio_filter, "-c:a", "pcm_s16le", "-ar", str(SAMPLE_RATE), str(normalized)]
+        )
+        stats = await self.detect_volume(normalized)
+        max_db = stats.get("max_volume_db")
+        if max_db is None or max_db <= -60.0:
+            raise RuntimeError("混音输出完全静音：请检查轨道音量、静音与素材配置后重试")
+        if max_db > float(settings.CLIPPING_HEADROOM_DB):
+            raise RuntimeError(f"混音输出检测到削波（峰值 {max_db:.2f} dB），已中止本次渲染")
+        return normalized
+
+    async def _measure_loudness(self, media: Path) -> dict | None:
+        """loudnorm 第一遍测量；静音或解析失败返回 None。"""
+
+        _, stderr = await self._run_capture(
+            [
+                "ffmpeg", "-hide_banner", "-i", str(media),
+                "-af",
+                f"loudnorm=I={_loud(settings.LOUDNESS_TARGET_I)}:TP={_loud(settings.LOUDNESS_TARGET_TP)}"
+                f":LRA={_loud(settings.LOUDNESS_TARGET_LRA)}:print_format=json",
+                "-f", "null", "-",
+            ]
+        )
+        match = re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", stderr.decode("utf-8", errors="ignore"), re.S)
+        if not match:
+            return None
+        try:
+            measured = json.loads(match.group(0))
+        except ValueError:
+            return None
+        required = ("input_i", "input_tp", "input_lra", "input_thresh", "target_offset")
+        if any(str(measured.get(key, "")).strip().lower() in {"-inf", "inf", "nan", ""} for key in required):
+            return None
+        return measured
+
+    async def detect_volume(self, media: Path) -> dict:
+        """volumedetect 峰值/均值（dB）。完全静音时值为 -inf，以 None 表示。"""
+
+        _, stderr = await self._run_capture(
+            ["ffmpeg", "-hide_banner", "-i", str(media), "-map", "0:a:0", "-af", "volumedetect", "-f", "null", "-"]
+        )
+        text = stderr.decode("utf-8", errors="ignore")
+
+        def parse(key: str) -> float | None:
+            found = re.search(rf"{key}:\s*(-?[\d.]+|-inf)\s*dB", text)
+            if not found:
+                return None
+            if found.group(1) == "-inf":
+                return float("-inf")
+            try:
+                return float(found.group(1))
+            except ValueError:
+                return None
+
+        return {"max_volume_db": parse("max_volume"), "mean_volume_db": parse("mean_volume")}
+
+    async def _supports_subtitles_filter(self) -> bool:
+        """探测当前 ffmpeg 是否带 subtitles 滤镜（依赖 libass；结果进程内缓存）。
+
+        部分 Homebrew / 最小化构建不含 libass，直接调用会以「No such filter」
+        失败。提前探测可以把这类环境问题转成可操作的中文提示，而不是让整次
+        渲染在半途才报一段 ffmpeg 原始输出。无法判定时按可用处理，交还 ffmpeg
+        自身的错误兜底。
+        """
+
+        if FFmpegService._subtitles_filter_available is None:
+            available = True
+            try:
+                _, stdout = await self._run_capture(["ffmpeg", "-hide_banner", "-filters"])
+                lines = stdout.decode("utf-8", errors="ignore").splitlines()
+                available = any(
+                    line.split() and line.split()[-1] == "subtitles" for line in lines
+                )
+            except (RuntimeError, TimeoutError, OSError):
+                available = True
+            FFmpegService._subtitles_filter_available = available
+        return FFmpegService._subtitles_filter_available
+
+    async def _burn_subtitles(self, video_path: Path, track: dict, width: int, height: int, work_dir: Path) -> Path:
+        if not await self._supports_subtitles_filter():
+            raise RuntimeError(
+                "当前 FFmpeg 缺少 subtitles 滤镜（libass），无法烧录字幕；"
+                "可在字幕与音频工作台把该字幕轨改为「独立字幕轨」后重试"
+            )
+        cues = [
+            SubtitleCueData(
+                start_ms=int(cue.get("start_ms") or 0),
+                end_ms=int(cue.get("end_ms") or 0),
+                text=str(cue.get("text") or ""),
+                character_name=str(cue.get("character_name") or ""),
+            )
+            for cue in track.get("cues") or []
+        ]
+        style = SubtitleStyle(
+            font_family=str(track.get("font_family") or "sans-serif"),
+            font_size=int(track.get("font_size") or 54),
+            primary_color=str(track.get("primary_color") or "#FFFFFF"),
+            outline_color=str(track.get("outline_color") or "#000000"),
+            outline_width=int(track.get("outline_width") or 0),
+            bold=bool(track.get("bold")),
+            position=str(track.get("position") or "bottom"),
+            safe_margin=int(track.get("safe_margin") or 0),
+        )
+        ass_path = work_dir / "burn_subtitles.ass"
+        ass_path.write_text(build_ass_document(style, cues, width, height), encoding="utf-8")
+        output = work_dir / "final_subtitled.mp4"
+        await self._run(
+            [
+                "ffmpeg", "-y", "-i", str(video_path),
+                "-vf", f"subtitles=filename='{self._escape_filter_path(ass_path)}'",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-c:a", "copy",
+                "-movflags", "+faststart",
+                str(output),
+            ]
+        )
+        return output
+
+    async def _mux_soft_subtitles(self, video_path: Path, tracks: list[dict], work_dir: Path) -> Path:
+        """把未烧录的字幕轨以 mov_text 内封进 MP4（画面与音轨直通）。"""
+
+        inputs: list[str] = []
+        maps: list[str] = ["-map", "0:v:0", "-map", "0:a:0"]
+        metadata: list[str] = []
+        for index, track in enumerate(tracks):
+            cues = [
+                SubtitleCueData(
+                    start_ms=int(cue.get("start_ms") or 0),
+                    end_ms=int(cue.get("end_ms") or 0),
+                    text=str(cue.get("text") or ""),
+                    character_name=str(cue.get("character_name") or ""),
+                )
+                for cue in track.get("cues") or []
+            ]
+            srt_path = work_dir / f"soft_subtitles_{index}.srt"
+            srt_path.write_text(serialize_srt(cues), encoding="utf-8")
+            inputs.extend(["-i", str(srt_path)])
+            maps.extend(["-map", f"{index + 1}:s:0"])
+            language = re.sub(r"[^A-Za-z0-9_-]", "", str(track.get("language") or "zh")) or "zh"
+            metadata.extend([f"-metadata:s:s:{index}", f"language={language}"])
+            name = str(track.get("name") or "").replace("\n", " ")[:60]
+            if name:
+                metadata.extend([f"-metadata:s:s:{index}", f"title={name}"])
+        output = work_dir / "final_soft_subtitles.mp4"
+        await self._run(
+            [
+                "ffmpeg", "-y", "-i", str(video_path), *inputs, *maps,
+                "-c:v", "copy", "-c:a", "copy", "-c:s", "mov_text",
+                *metadata,
+                "-movflags", "+faststart",
+                str(output),
+            ]
+        )
+        return output
+
+    async def render_mix_preview(
+        self,
+        shots: list[dict],
+        av_tracks: list[dict],
+        total_duration_s: float,
+        output_path: Path,
+        window_s: tuple[float, float] | None = None,
+    ) -> dict:
+        """生成音频预览（渲染同源的 filter + 归一化链）。"""
+
+        bundle = await self._prepare_mix(shots, av_tracks, total_duration_s, allow_empty=True)
+        if bundle is None:  # allow_empty=True 时规划器恒返回结果，防御式兜底
+            raise RuntimeError("无法规划音频预览")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        work_dir = output_path.parent / f".preview-{uuid.uuid4().hex}"
+        work_dir.mkdir(parents=True, exist_ok=False)
+        try:
+            normalized = await self._produce_normalized_mix(bundle, work_dir)
+            args = ["ffmpeg", "-y", "-i", str(normalized)]
+            if window_s is not None:
+                start, end = float(window_s[0]), float(window_s[1])
+                if start > 0:
+                    args.extend(["-ss", f"{start:.3f}"])
+                if end > start:
+                    args.extend(["-to", f"{end:.3f}"])
+            args.extend(["-c:a", "aac", str(output_path)])
+            await self._run(args)
+            return {"path": str(output_path), "warnings": bundle.warnings, "manifest": bundle.manifest()}
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+    @staticmethod
+    def _escape_filter_path(path: Path | str) -> str:
+        """subtitles 滤镜的文件名转义（引号内转义 ' 与 :）。"""
+
+        text = str(path).replace("\\", "/")
+        return text.replace(":", "\\:").replace("'", "\\'")
+
     @staticmethod
     def _shot_has_native_audio(shot: dict) -> bool:
         if shot.get("native_audio") is True:
@@ -305,13 +822,16 @@ class FFmpegService:
         return width - width % 2, height - height % 2
 
     async def _run(self, args: list[str]) -> None:
+        await self._run_capture(args)
+
+    async def _run_capture(self, args: list[str]) -> tuple[bytes, bytes]:
         proc = await asyncio.create_subprocess_exec(
             *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            _, stderr = await asyncio.wait_for(
+            stdout, stderr = await asyncio.wait_for(
                 proc.communicate(),
                 timeout=max(30, int(settings.FFMPEG_TIMEOUT_SECONDS)),
             )
@@ -327,13 +847,10 @@ class FFmpegService:
             proc.kill()
             await proc.communicate()
             raise TimeoutError("FFmpeg 执行超时") from exc
-        except asyncio.CancelledError:
-            proc.kill()
-            await proc.communicate()
-            raise
         if proc.returncode != 0:
             message = stderr.decode("utf-8", errors="ignore")[-2000:]
             raise RuntimeError(f"FFmpeg 执行失败: {message}")
+        return stdout or b"", stderr or b""
 
     def _media_path(self, value: str | None, minimum_size: int = 1) -> Path | None:
         if not value:

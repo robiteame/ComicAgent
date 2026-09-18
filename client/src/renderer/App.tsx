@@ -4,10 +4,12 @@ import GlobalPlayfulMotion from './components/GlobalPlayfulMotion'
 import LeftSidebar from './components/LeftSidebar'
 import MainWorkspace from './components/MainWorkspace'
 import RightSidebar from './components/RightSidebar'
+import TaskCenter, { OPEN_TASK_CENTER_EVENT } from './components/TaskCenter'
 import TopBar from './components/TopBar'
 import { OPEN_SETTINGS_EVENT } from './components/TopBar'
 import { beginProjectNavigationIntent, requestProjectNavigation } from './services/projectNavigationGuard'
 import { useProjectStore } from './stores/projectStore'
+import { useTaskStore } from './stores/taskStore'
 
 const OPEN_CREATE_PROJECT_EVENT = 'workspace:open-create-project'
 const WORKSPACE_NAVIGATE_EVENT = 'workspace:navigate'
@@ -22,6 +24,7 @@ const App: React.FC = () => {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [rightSidebarCollapsed, setRightSidebarCollapsed] = useState(true)
   const [settingsPageOpen, setSettingsPageOpen] = useState(false)
+  const [taskCenterOpen, setTaskCenterOpen] = useState(false)
   const settingsPageOpenRef = useRef(settingsPageOpen)
   const pendingWorkspaceNavigationRef = useRef<WorkspaceNavigateDetail | null>(null)
   const settingsNavigationRequestRef = useRef(0)
@@ -34,6 +37,21 @@ const App: React.FC = () => {
     const openShotConfig = () => setRightSidebarCollapsed(false)
     window.addEventListener('workspace:open-shot-config', openShotConfig)
     return () => window.removeEventListener('workspace:open-shot-config', openShotConfig)
+  }, [])
+
+  // 任务中心连接在应用生命周期内保持：关闭面板不停止 WebSocket，任务自然继续
+  // 在后台运行；卸载时统一清理 socket、定时器与事件缓冲。
+  useEffect(() => {
+    useTaskStore.getState().start()
+    return () => {
+      useTaskStore.getState().stop()
+    }
+  }, [])
+
+  useEffect(() => {
+    const openTaskCenter = () => setTaskCenterOpen(true)
+    window.addEventListener(OPEN_TASK_CENTER_EVENT, openTaskCenter)
+    return () => window.removeEventListener(OPEN_TASK_CENTER_EVENT, openTaskCenter)
   }, [])
 
   useEffect(() => {
@@ -112,6 +130,7 @@ const App: React.FC = () => {
         )}
       </div>
       <BottomBar />
+      <TaskCenter open={taskCenterOpen} onClose={() => setTaskCenterOpen(false)} />
     </div>
   )
 }

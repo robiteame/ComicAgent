@@ -4,10 +4,19 @@
 端点配置来自 ``get_endpoint("voice")``，保存配置后新任务即生效。
 """
 
+import asyncio
+import time
+
 from config import settings
+from services import usage_service
 from services.providers.base import TTSRequest
 from services.providers.endpoint import get_endpoint
 from services.providers.registry import get_adapter
+from services.providers.usage import (
+    CAPABILITY_TTS,
+    ERROR_CODE_PROVIDER_CALL_FAILED,
+    adapter_usage_for_request,
+)
 from services.providers.tts_mimo import VOICE_ALIASES, MIMO_TTS_VOICES
 from services.providers.tts_mimo import normalize_mimo_voice as _normalize_mimo_voice
 from services.security import atomic_write_bytes, safe_path, validate_identifier
@@ -51,7 +60,33 @@ class TTSService:
             raise RuntimeError("未配置语音端点 API Key，无法调用 TTS")
 
         adapter = get_adapter("voice", endpoint.protocol)(endpoint)
-        audio_data = await adapter.synthesize(TTSRequest(text=text, voice_id=voice_id, emotion=emotion))
+        request = TTSRequest(text=text, voice_id=voice_id, emotion=emotion)
+        # 用量按字符数记账（TTS 的通用计价口径）；成功/失败都留痕。
+        metadata = adapter_usage_for_request(adapter, CAPABILITY_TTS, request)
+        scope = usage_service.current_scope().merged(project_id=safe_project_id, shot_id=safe_shot_id)
+        started = time.monotonic()
+        try:
+            audio_data = await adapter.synthesize(request)
+        except asyncio.CancelledError:
+            usage_service.record_cancelled(
+                metadata,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                scope=scope,
+            )
+            raise
+        except Exception:
+            usage_service.record_failure(
+                metadata,
+                error_code=ERROR_CODE_PROVIDER_CALL_FAILED,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                scope=scope,
+            )
+            raise
+        usage_service.record_metadata(
+            metadata,
+            duration_ms=int((time.monotonic() - started) * 1000),
+            scope=scope,
+        )
 
         audio_dir = safe_path(self.output_dir, safe_project_id, "audio", create_parent=True)
         suffix = str(endpoint.param("format") or "wav").lstrip(".")

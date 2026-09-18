@@ -1,21 +1,25 @@
 import sys
 import asyncio
+import logging
 import shutil
 import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from api.routes import asset, character, chat, graph, project, render, script, settings as settings_routes, shot  # noqa: E402
-from api.websocket import ws_manager  # noqa: E402
+from api.routes import asset, audio_track, budget, character, chat, graph, jobs, project, regeneration_queue, render, script, settings as settings_routes, shot, subtitle  # noqa: E402
+from api.websocket import jobs_manager, ws_manager  # noqa: E402
 from config import settings as app_settings  # noqa: E402
-from db import engine, init_db  # noqa: E402
+from db import SessionLocal, engine, init_db  # noqa: E402
+from services import job_center  # noqa: E402
+from services.error_reporter import install_log_redaction  # noqa: E402
 from services.task_registry import recover_interrupted  # noqa: E402
 from services.local_auth import (  # noqa: E402
     configured_token,
@@ -28,6 +32,8 @@ from services.local_auth import (  # noqa: E402
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # uvicorn 会在启动时注册自己的 handler，这里再装一次脱敏过滤器。
+    _configure_logging()
     init_db()
     recovered_deletions = project.recover_staged_project_deletions()
     if recovered_deletions:
@@ -71,6 +77,26 @@ app.add_middleware(
 )
 
 
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """输入校验失败时返回稳定的 422，且不回显原始输入。
+
+    FastAPI 默认会把出错字段的原始值放进响应体；当该值是 JSON 扩展字面量
+    NaN/Infinity（Python 的 json 模块可解析）时，响应序列化会失败并把本该是
+    422 的请求变成 500。这里只保留字段路径、错误类型与可读原因。
+    """
+
+    errors = [
+        {
+            "loc": [str(part) for part in error.get("loc", ())],
+            "type": str(error.get("type", "")),
+            "msg": str(error.get("msg", ""))[:200],
+        }
+        for error in exc.errors()
+    ]
+    return JSONResponse(status_code=422, content={"detail": errors})
+
+
 @app.middleware("http")
 async def local_auth_middleware(request: Request, call_next):
     expected = configured_token()
@@ -92,21 +118,84 @@ app.include_router(render.router)
 app.include_router(chat.router)
 app.include_router(graph.router)
 app.include_router(character.router)
+app.include_router(jobs.router)
+app.include_router(regeneration_queue.router, prefix="/api")
+app.include_router(regeneration_queue.router, prefix="/api/shot")
+app.include_router(budget.router)
+app.include_router(subtitle.router)
+app.include_router(audio_track.router)
 
 output_dir = app_settings.OUTPUT_DIR
 output_dir.mkdir(parents=True, exist_ok=True)
 app.mount("/output", StaticFiles(directory=str(output_dir)), name="output")
 
 
-@app.websocket("/ws/{project_id}")
-async def websocket_endpoint(websocket: WebSocket, project_id: str):
+async def _authorize_websocket(websocket: WebSocket) -> bool:
+    """本地 API token 与 Origin 白名单校验；两个 WebSocket 入口共用。"""
+
     expected = configured_token()
     provided = request_token(dict(websocket.headers), websocket.query_params.get("token"))
     if not is_allowed_websocket_origin(websocket.headers.get("origin")):
         await websocket.close(code=1008, reason="websocket origin not allowed")
-        return
+        return False
     if not is_token_valid(expected, provided):
         await websocket.close(code=1008, reason="invalid local auth token")
+        return False
+    return True
+
+
+def jobs_snapshot() -> dict:
+    """任务中心初始快照：连接建立后先发一次，避免错过历史事件。
+
+    只包含最近的一批任务与统计，且与 REST 使用同一个 DTO —— 不含 run token。
+    """
+
+    db = SessionLocal()
+    try:
+        listing = job_center.list_jobs(
+            db,
+            job_center.JobQuery(page=1, page_size=app_settings.JOB_EVENT_SNAPSHOT_LIMIT),
+        )
+    finally:
+        db.close()
+    return {
+        "type": "job_snapshot",
+        "jobs": listing["items"],
+        "total": listing["total"],
+        "active_count": listing["active_count"],
+        "status_counts": listing["status_counts"],
+        "page": listing["page"],
+        "page_size": listing["page_size"],
+        "generated_at": listing["generated_at"],
+    }
+
+
+# 必须注册在 /ws/{project_id} 之前：否则 "jobs" 会被当成项目 ID 匹配掉。
+@app.websocket("/ws/jobs")
+async def jobs_websocket_endpoint(websocket: WebSocket):
+    """全局任务中心事件通道：先发当前快照，再推送增量事件。"""
+
+    if not await _authorize_websocket(websocket):
+        return
+    await jobs_manager.connect(websocket)
+    try:
+        await websocket.send_json(jobs_snapshot())
+        while True:
+            data = await websocket.receive_text()
+            if data == "ping":
+                await websocket.send_json({"type": "pong"})
+            elif data == "sync":
+                # 断线重连后前端会再要一次快照：只依赖增量事件无法保证一致性。
+                await websocket.send_json(jobs_snapshot())
+    except WebSocketDisconnect:
+        jobs_manager.disconnect(websocket)
+    except Exception:  # noqa: BLE001 - 单个连接异常不能影响其它连接
+        jobs_manager.disconnect(websocket)
+
+
+@app.websocket("/ws/{project_id}")
+async def websocket_endpoint(websocket: WebSocket, project_id: str):
+    if not await _authorize_websocket(websocket):
         return
     await ws_manager.connect(websocket, project_id)
     try:
@@ -165,6 +254,16 @@ def _check_ffmpeg() -> None:
         subprocess.run([executable, "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=5)
     except (OSError, subprocess.SubprocessError) as exc:
         raise RuntimeError("ffmpeg unavailable") from exc
+
+
+def _configure_logging() -> None:
+    """全局日志配置：后台任务失败的堆栈需要落到 stderr，同时脱敏密钥。"""
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    install_log_redaction()
 
 
 def _start_parent_watchdog() -> None:

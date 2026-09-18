@@ -1,15 +1,28 @@
 import json
 from datetime import datetime
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from api.schemas import (
+    CharacterAssetIdList,
+    CharacterName,
+    Identifier,
+    JsonFieldInput,
+    KeyFeatureInput,
+    OptionalIdentifier,
+    ShortKey,
+    ShotText,
+    VisualNotes,
+)
 from db import get_db
 from models import Character, Project, SceneAsset, Shot
 from services.image_service import ImageService
 from services.invalidation_service import invalidate_asset_consumers
 from services.security import validate_identifier
+from services.shot_version_service import create_version
 from services.task_registry import cancel_scopes
 
 router = APIRouter(prefix="/api/asset", tags=["asset"])
@@ -17,43 +30,44 @@ image_service = ImageService()
 
 
 class ShotAssetUpdate(BaseModel):
-    project_id: str
-    scene_asset_id: str = ""
-    character_asset_ids: list[str] = Field(default_factory=list)
+    project_id: Identifier
+    scene_asset_id: OptionalIdentifier = ""
+    character_asset_ids: CharacterAssetIdList = Field(default_factory=list)
 
 
 class CharacterAssetUpdate(BaseModel):
     # Required for direct asset updates so an ID from another project cannot be
     # edited accidentally (or by a guessed identifier).
-    project_id: str | None = None
-    name: str | None = None
-    appearance: dict | str | None = None
-    personality: str | None = None
-    visual_prompt: str | None = None
-    negative_prompt: str | None = None
-    voice_id: str | None = None
-    emotion_variants: dict | str | None = None
-    key_features: list[str] | str | None = None
-    default_outfit: str | None = None
-    lora_profile: str | None = None
-    ip_adapter_profile: str | None = None
-    wardrobe_lock: str | None = None
-    seed: str | None = None
+    project_id: OptionalIdentifier | None = None
+    name: CharacterName | None = None
+    appearance: JsonFieldInput | None = None
+    personality: ShotText | None = None
+    visual_prompt: VisualNotes | None = None
+    negative_prompt: VisualNotes | None = None
+    voice_id: ShortKey | None = None
+    emotion_variants: JsonFieldInput | None = None
+    key_features: KeyFeatureInput | None = None
+    default_outfit: ShotText | None = None
+    lora_profile: ShortKey | None = None
+    ip_adapter_profile: ShortKey | None = None
+    wardrobe_lock: ShotText | None = None
+    seed: ShortKey | None = None
     regenerate: bool = False
 
 
 class SceneAssetUpdate(BaseModel):
-    project_id: str | None = None
-    name: str | None = None
-    description: str | None = None
-    visual_prompt: str | None = None
-    negative_prompt: str | None = None
-    key_features: list[str] | str | None = None
-    scene_group_key: str | None = None
-    time_of_day: str | None = None
-    consistency_profile: dict | str | None = None
-    prop_lock: str | None = None
-    seed: int | None = None
+    project_id: OptionalIdentifier | None = None
+    name: CharacterName | None = None
+    description: ShotText | None = None
+    visual_prompt: VisualNotes | None = None
+    negative_prompt: VisualNotes | None = None
+    key_features: KeyFeatureInput | None = None
+    # 场景分组键与时段允许中文（例如「教室-morning」「清晨」），不做 identifier 校验。
+    scene_group_key: ShortKey | None = None
+    time_of_day: ShortKey | None = None
+    consistency_profile: JsonFieldInput | None = None
+    prop_lock: ShotText | None = None
+    seed: Annotated[int, Field(ge=0, le=2_147_483_647)] | None = None
     regenerate: bool = False
 
 
@@ -110,6 +124,9 @@ async def update_shot_assets(shot_id: str, data: ShotAssetUpdate, db: Session = 
     changed = shot.scene_asset_id != scene_asset_id or _json_list(shot.character_asset_ids) != character_ids
     shot_project_id = shot.project_id
     result_id = shot.id
+    if changed:
+        # 资产换绑会清空全部下游产物：被替换的当前状态先进入版本历史。
+        create_version(db, shot, "manual_edit")
     shot.scene_asset_id = scene_asset_id
     shot.character_asset_ids = json.dumps(character_ids, ensure_ascii=False)
     if changed:

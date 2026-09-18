@@ -69,12 +69,56 @@ class Settings(BaseSettings):
     MAX_IMAGE_GENERATION_BYTES: int = 32 * 1024 * 1024
     MAX_INLINE_REFERENCE_BYTES: int = 12 * 1024 * 1024
     MAX_TTS_AUDIO_BYTES: int = 64 * 1024 * 1024
+    # 字幕与音频混音工作台的上限（同样属于服务端安全边界）。
+    MAX_AUDIO_UPLOAD_BYTES: int = 128 * 1024 * 1024
+    MAX_AUDIO_TRACKS: int = 32
+    MAX_SUBTITLE_TRACKS: int = 8
+    MAX_SUBTITLE_CUES: int = 2000
+    MAX_SUBTITLE_CUE_CHARS: int = 500
+    MAX_SUBTITLE_IMPORT_CHARS: int = 2 * 1024 * 1024
+    MAX_SUBTITLE_CHARACTER_CHARS: int = 60
+    # 混音输出与预览共用的响度/削波目标（EBU R128 短视频常见档位）。
+    LOUDNESS_TARGET_I: float = -16.0
+    LOUDNESS_TARGET_TP: float = -1.5
+    LOUDNESS_TARGET_LRA: float = 11.0
+    CLIPPING_HEADROOM_DB: float = 0.1
     PROJECT_STORAGE_QUOTA_BYTES: int = 5 * 1024 * 1024 * 1024
     PROJECT_TEMP_FILE_TTL_SECONDS: int = 24 * 60 * 60
     PROJECT_VERSION_RETENTION_COUNT: int = 3
     FFMPEG_WORKSPACE_RESERVE_BYTES: int = 1024 * 1024 * 1024
     FFMPEG_TIMEOUT_SECONDS: int = 900
     BACKGROUND_TASK_CANCEL_TIMEOUT_SECONDS: int = 30
+
+    # 任务中心：分页、事件快照与历史清理的上限。列表读取永远分页，
+    # 避免任务很多时把整张表读进内存；事件快照只带最近的一批任务。
+    JOB_LIST_DEFAULT_PAGE_SIZE: int = 20
+    JOB_LIST_MAX_PAGE_SIZE: int = 100
+    JOB_EVENT_SNAPSHOT_LIMIT: int = 100
+    JOB_CLEANUP_MAX_ROWS: int = 500
+    # 只有同类型任务攒够这么多次真实耗时样本，才给出预计剩余时间。
+    JOB_ETA_MIN_SAMPLES: int = 3
+
+    # 请求 DTO 与 LLM 输出的字段级上限。前端 min/max 只是交互提示，
+    # 真正的边界统一读这里，保证服务端校验与生成流程使用同一套配额。
+    MAX_PROJECT_TITLE_CHARS: int = 120
+    MAX_PROJECT_GENRE_CHARS: int = 40
+    MAX_PROJECT_STYLE_CHARS: int = 48
+    MAX_GENERATION_PROMPT_CHARS: int = 4000
+    MAX_SHOT_TEXT_CHARS: int = 2000
+    MAX_VISUAL_NOTES_CHARS: int = 2000
+    MAX_BATCH_SHOT_IDS: int = 200
+    MAX_CHARACTER_ASSET_IDS: int = 50
+    MIN_TARGET_DURATION_SECONDS: int = 5
+    MAX_TARGET_DURATION_SECONDS: int = 600
+    MIN_SHOT_DURATION_SECONDS: float = 0.5
+    MAX_SHOT_DURATION_SECONDS: float = 60.0
+    MAX_EPISODE_NUMBER: int = 9999
+    LLM_MAX_CHARACTERS: int = 6
+    LLM_MAX_SCENES: int = 8
+    LLM_MAX_SHOTS: int = 12
+    LLM_MAX_DIALOGUE_LINES: int = 20
+    LLM_MAX_TEXT_CHARS: int = 2000
+    LLM_MAX_PROMPT_CHARS: int = 2000
 
     class Config:
         env_file = (

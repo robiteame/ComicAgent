@@ -234,6 +234,13 @@ class AgentState(TypedDict):
 | PUT | `/api/character/{character_id}` | 更新角色资产 |
 | GET | `/api/graph/structure` | 自动模式流程图结构（由 build_graph 派生） |
 | POST | `/api/chat` | 自然语言交互 |
+| GET/PUT | `/api/budget/pricing` | 模型价格配置读取 / 保存 |
+| GET/PUT | `/api/budget/config` | 预算配置（项目 / 全局，软 + 硬 + 时长） |
+| GET | `/api/budget/status` | 项目预算状态（已用 / 已预留 / 限额 / 等级） |
+| POST | `/api/budget/estimate` | 提交前估算（成本 + 预计耗时 + 是否被硬预算拦下） |
+| GET | `/api/budget/summary` | 项目 / 剧集统计（已用、剩余预计、各剧集成本） |
+| GET | `/api/budget/usage` | 实际用量明细 + 多维分组统计 |
+| GET | `/api/budget/jobs/{job_id}` | 单次任务成本明细（含失败 / 取消任务） |
 
 ### WebSocket
 
@@ -249,8 +256,10 @@ ws://localhost:8011/ws/{project_id}
 {"type": "shot_update", "shot_id": "...", "status": "video_done", "image_path": "...", "storyboard_path": "...", "video_path": "..."}
 {"type": "storyboard_ready", "project_id": "..."}
 {"type": "render_complete", "video_url": "...", "duration": 30}
-{"type": "error", "message": "..."}
+{"type": "error", "error_type": "pipeline_error|storyboard_error|shot_video_error|render_error", "message": "简短中文提示", "error_id": "8位十六进制"}
 ```
+
+> 错误事件不携带堆栈、本地路径或供应商原始响应：服务端用 `services/error_reporter.py` 记录完整异常（含脱敏后的堆栈）并生成短错误编号，前端只需展示 `message` 与 `error_id`。
 
 进度 `step` 取值与流程对应：`parse_script` / `generate_storyboard` / `wait_asset_confirm` / `generate_storyboard_images` / `wait_storyboard_approval` / `generate_voice` / `generate_seedance_video` / `rendering`。
 
@@ -262,6 +271,73 @@ ws://localhost:8011/ws/{project_id}
 
 ---
 
+## 成本与时长预算
+
+### 记账口径（硬约束）
+
+1. **金额只允许整数**：统一用「货币最小单位的整数倍」表示，本项目管理到 10^-6 个货币单位
+   （`MICRO_PER_UNIT = 1_000_000`，即 1 CNY = 1_000_000 micro）。所有换算走
+   `services/pricing_service.py` 的整数运算（`ceil_div`，向上取整到 1 micro），
+   **任何一步都不得引入浮点金额**；API 收到浮点金额一律 400。
+2. **未知就是未知**：没有可用价目（未配置 `configured=true` 的价目行、或 provider 未注册）
+   时 `cost_known=false` 且 `cost_micro=NULL`，前端显示「成本未知」；绝不按 0 元或猜测
+   价格入账。本地零成本能力（占位图 `placeholder`、本地 `ffmpeg`）单独标为
+   `cost_source=local`，是「确定不花钱」而不是「不知道」。
+3. **估算与实际分表**：启动前估算写 `cost_estimates`（`services/budget_service.estimate_job`），
+   每次真实调用写 `usage_records`（`services/usage_service`），互不覆盖。
+4. **一次调用只入账一次**：`usage_records.usage_key` 唯一 + 事务内先查后插，
+   并发/重复回调不会重复计费。
+5. **失败与取消同样留痕**：调用失败记 `status=failed`；只有供应商真的回报过用量
+   （`source=provider`）或本地实测（`source=local`）才保留数量，按请求推导的数量
+   一律丢弃（未知），保证「任务失败后仍能查询已发生的调用成本」且不虚增金额。
+6. **不落敏感信息**：用量与估算表不保存 API Key、供应商原始响应或本地绝对路径。
+
+### 用量归属（contextvar）
+
+`task_registry.start()` 会把任务的用量上下文（`project_id` / `series_id` / `shot_id` /
+`job_key` / `job_id` / `job_type`）绑定到协程上下文，服务层（LLM / 图像 / 视频 / TTS /
+FFmpeg）通过 `usage_service.current_scope()` 读取，无需层层透传参数。任务进入终态时
+`task_registry.finish()`（含取消、服务重启中断路径）会调用 `usage_service.finalize_job`
+标记 `job_status` 并释放预算预留。
+
+### 预算执行
+
+- 预算作用域：项目 > 父系列 > 全局（`budget_service.effective_limits`）；
+- **软预算**：超出只返回提示（`budget_soft_exceeded` + 响应里的 `budget_warning`），任务照常执行；
+- **硬预算**：`task_registry.claim_job` 在抢占前比对「已用 + 已预留 + 本次估算」，
+  超限直接拒绝并返回 `error_code=budget_exceeded`（HTTP 409），任务不会被创建；
+- **并发安全**：抢占前按估算金额写一条 `budget_reservations`（`reservation_key` 唯一），
+  任务终结时释放，避免两个并发任务各自以为额度充足；
+- **估算未知不拦**：没有单价时金额未知，只跳过金额校验并在状态里标注，已用金额本身
+  超过硬预算时仍然拦截；
+- 时长为第二维度，口径是「任务执行时长」（`background_jobs` 真实起止时间之和），
+  与供应商计费秒数（`usage_records.quantity`）分开统计。
+
+### 关键文件
+
+| 文件 | 职责 |
+|------|------|
+| `models/pricing.py` / `models/usage.py` / `models/budget.py` | 价目、用量、估算、预算与预留表 |
+| `services/providers/usage.py` | 统一 `UsageMetadata` 与适配器用量钩子（未实现钩子的适配器安全回退为「未知」） |
+| `services/pricing_service.py` | 整数金额运算、价目匹配与读写、出厂模板（全部未配置金额） |
+| `services/usage_service.py` | 用量上下文、记账、统计、任务终结标记 |
+| `services/budget_service.py` | 预算配置、任务估算、预算检查与预留、项目/剧集汇总 |
+| `api/routes/budget.py` | 成本 / 预算 / 统计 API |
+| `api/claim_guard.py` | 路由层抢占守卫：预算拦截转 409、软预算提示透传 |
+
+### 测试
+
+```bash
+cd server
+python -m pytest tests/test_usage_accounting.py tests/test_budget_enforcement.py tests/test_budget_api.py tests/test_usage_integration.py -q
+```
+
+覆盖：适配器统一用量元数据、未知 provider 不伪造金额、整数金额运算、估算与实际分表、
+失败/取消留痕、重复与并发不重复计费、硬预算阻止任务启动（真实路由 409）、预留释放、
+项目/剧集/镜头/任务级统计、以及不泄漏密钥与供应商原始响应。
+
+---
+
 ## 环境变量
 
 复制 `.env.example` 为 `.env` 并填写：
@@ -269,15 +345,15 @@ ws://localhost:8011/ws/{project_id}
 ```bash
 # LLM —— 默认 Mimo (小米 MiMo, OpenAI 兼容)
 LLM_PROVIDER=mimo            # mimo / openai / deepseek
-MIMO_API_KEY=sk-xxx
-# OPENAI_API_KEY=sk-xxx      # 作为兜底/可选
+MIMO_API_KEY=                # 留空 = 未配置（不要填占位值, 否则会被当成已配置）
+# OPENAI_API_KEY=           # 作为兜底/可选（留空 = 未配置）
 # OPENAI_BASE_URL=
 
 # 图像生成 —— 默认 local 占位 stub (无需 key 即可跑通)
 IMAGE_PROVIDER=local         # local(占位图) / stability / doubao-seedream-5.0-lite
 # 火山方舟 (Seedream 图像 + SeedDance 视频, 任一 ARK/SEEDDANCE/SEEDREAM key 均可)
-ARK_API_KEY=xxx
-# STABILITY_API_KEY=sk-xxx   # 若用 Stability
+ARK_API_KEY=                 # 留空 = 未配置
+# STABILITY_API_KEY=         # 若用 Stability
 
 # TTS —— 固定使用 Mimo 内置 TTS (TTS_PROVIDER 为历史字段, 不再切换)
 ```
@@ -332,6 +408,8 @@ uvicorn main:app --host 0.0.0.0 --port 8011 --reload
 | platform | str | douyin / kuaishou / bilibili / custom |
 | consistency_config | JSON | 项目级一致性配置 |
 | project_type / parent_project_id / episode_number | str/int | 系列剧集支持（剧集挂在父项目下，资产复用父项目） |
+
+> 项目树不变量：系列（`series`）是根节点（无父级），剧集（`episode`）必须挂在真实存在的系列下，禁止自引用与负数集号。约束由 CHECK（新库）+ SQLite 触发器（存量库，见 `db/database.py`）+ API 层校验（`api/routes/project.py::_resolve_project_tree`）三层保证；启动时 `init_db()` 会先修复历史脏数据再补约束。
 
 ### Shot
 

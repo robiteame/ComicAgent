@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from services.providers.base import BaseAdapter, VideoCapabilities, VideoRequest, VideoResult
+from services.providers.usage import CAPABILITY_VIDEO, UsageMetadata
 
 EMOTION_LABELS = {
     "happy": "轻快",
@@ -30,6 +31,27 @@ class NativeAudioVideoAdapter(BaseAdapter):
         voice_consistent=False,
     )
     production_ready = False
+
+    def usage_for_request(
+        self,
+        capability: str,
+        request: VideoRequest | None = None,
+        *,
+        model: str = "",
+    ) -> UsageMetadata:
+        """原生音视频协议的用量由请求推导：秒数 + 分辨率（未接入厂商实现前不报价）。"""
+
+        return UsageMetadata(
+            capability=CAPABILITY_VIDEO,
+            provider=self.endpoint.protocol,
+            model=model or self.endpoint.model,
+            seconds=float(getattr(request, "duration", 0) or 0),
+            resolution=str(getattr(request, "resolution", "") or ""),
+            known=True,
+            billable=True,
+            source="request",
+            extra={"ratio": str(getattr(request, "ratio", "") or ""), "native_audio": True},
+        )
 
     async def generate(self, request: VideoRequest) -> VideoResult:
         raise NotImplementedError(

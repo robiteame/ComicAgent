@@ -12,7 +12,7 @@
     "dev": "vite --host 127.0.0.1 --port 5173",
     "backend:dev": "cd ../server && python main.py",
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --test 'src/**/*.test.mts'",
+    "test": "node --experimental-strip-types --test 'src/**/*.test.mts' 'scripts/**/*.test.mts'",
     "test:server": "python3 -m unittest discover -s ../server/tests -p 'test_*.py'",
     "test:server:pytest": "python3 -m pytest -q",
     "test:all": "pnpm run test && pnpm run test:server",

@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import json
-
 from config import settings
+from services.atomic_json import atomic_write_json, path_lock, read_json_file
 
 
 STYLE_TEMPLATES: dict[str, dict[str, str]] = {
@@ -114,11 +113,11 @@ def create_custom_style_template(
         "negative_prompt": negative_prompt or "low quality, watermark, text artifacts, inconsistent style",
         "created_at": created_at,
     }
-    custom = _custom_templates()
-    custom[key] = template
     path = _custom_template_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(custom, ensure_ascii=False, indent=2), encoding="utf-8")
+    with path_lock(path):
+        custom = _custom_templates()
+        custom[key] = template
+        atomic_write_json(path, custom)
     return {"value": key, "label": label, "keywords": keywords, "custom": True}
 
 
@@ -127,14 +126,8 @@ def _all_templates() -> dict[str, dict[str, str]]:
 
 
 def _custom_templates() -> dict[str, dict[str, str]]:
-    path = _custom_template_path()
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8") or "{}")
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+    data = read_json_file(_custom_template_path(), default=None)
+    return data if isinstance(data, dict) else {}
 
 
 def _custom_template_path():

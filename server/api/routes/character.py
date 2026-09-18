@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from api.schemas import CharacterName, JsonText, OptionalIdentifier, ShortKey, ShotText, VisualNotes
 from db import get_db
 from models import Character, Project
 from services.invalidation_service import invalidate_asset_consumers
@@ -14,20 +15,20 @@ router = APIRouter(prefix="/api/character", tags=["character"])
 
 
 class CharacterUpdate(BaseModel):
-    project_id: str | None = None
-    name: str | None = None
-    appearance: str | None = None
-    personality: str | None = None
-    visual_prompt: str | None = None
-    negative_prompt: str | None = None
-    voice_id: str | None = None
-    emotion_variants: str | None = None
-    key_features: str | None = None
-    default_outfit: str | None = None
-    lora_profile: str | None = None
-    ip_adapter_profile: str | None = None
-    wardrobe_lock: str | None = None
-    seed: str | None = None
+    project_id: OptionalIdentifier | None = None
+    name: CharacterName | None = None
+    appearance: JsonText | None = None
+    personality: ShotText | None = None
+    visual_prompt: VisualNotes | None = None
+    negative_prompt: VisualNotes | None = None
+    voice_id: ShortKey | None = None
+    emotion_variants: JsonText | None = None
+    key_features: JsonText | None = None
+    default_outfit: ShotText | None = None
+    lora_profile: ShortKey | None = None
+    ip_adapter_profile: ShortKey | None = None
+    wardrobe_lock: ShotText | None = None
+    seed: ShortKey | None = None
 
 
 @router.get("/{project_id}/characters")

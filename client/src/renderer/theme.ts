@@ -29,6 +29,7 @@ body,
 .asset-page,
 .script-panel,
 .preview-panel,
+.av-panel,
 .workspace-tab-body,
 .right-sidebar {
   background: #131820 !important;
@@ -68,7 +69,10 @@ body,
 .bound-asset-thumb,
 .consistency-baseline-thumb,
 .final-video,
-.thumb-item {
+.thumb-item,
+.av-timeline-card,
+.av-inspector-section,
+.av-cue-editor {
   background: #0f141b !important;
   color: #b4c0cf !important;
 }

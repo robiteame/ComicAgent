@@ -1,28 +1,31 @@
 import asyncio
 import json
 import os
-import traceback
 import uuid
 from pathlib import Path
-from typing import Literal
 
 import aiofiles
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from agent.nodes import script_parser, storyboard_gen
+from api import schemas
 from api.websocket import ws_manager
 from config import settings
 from db import SessionLocal
 from models import Character as CharacterModel
 from models import Project, SceneAsset, Shot as ShotModel
+from models import ShotVersion
 from services.consistency_service import ConsistencyService
+from services.error_reporter import ERROR_PIPELINE, report_failure
 from services.image_service import ImageService
 from services.llm_service import LLMService
+from services.shot_version_service import create_version
 from services.skill_config_service import agent_prompt_append, agent_style_id, resolve_skill_config
 from services.style_templates import style_prompt_params, style_template
 from services.tts_service import normalize_mimo_voice
 from services.security import UploadLimitExceeded, safe_filename, save_upload_stream, validate_identifier, validate_script_upload
+from api.claim_guard import budget_notice, claim_or_block
 from services.task_registry import claim as claim_task, start as start_task, update_progress as update_job_progress
 
 router = APIRouter(prefix="/api/script", tags=["script"])
@@ -34,24 +37,24 @@ consistency_service = ConsistencyService()
 
 
 class ScriptGenerateRequest(BaseModel):
-    project_id: str | None = None
-    prompt: str = "校园成长短剧"
-    style: str = "anime"
-    genre: str = "原创短剧"
-    target_duration: int = 45
-    characters_hint: str = ""
+    project_id: schemas.OptionalIdentifier | None = None
+    prompt: schemas.GenerationPrompt = "校园成长短剧"
+    style: schemas.StyleId = "anime"
+    genre: schemas.Genre = "原创短剧"
+    target_duration: schemas.TargetDuration = 45
+    characters_hint: schemas.CharactersHint = ""
 
 
 class ScriptParseRequest(BaseModel):
-    project_id: str
-    user_input: str
-    input_type: str = "text"
-    style: str = "anime"
-    output_format: str = "9:16"
-    resolution: str = "1080p"
-    platform: str = "douyin"
-    target_duration: int = 45
-    mode: Literal["manual", "auto"] = "manual"
+    project_id: schemas.Identifier
+    user_input: schemas.ScriptText
+    input_type: schemas.InputType = "text"
+    style: schemas.StyleId = "anime"
+    output_format: schemas.OutputFormat = "9:16"
+    resolution: schemas.Resolution = "1080p"
+    platform: schemas.Platform = "douyin"
+    target_duration: schemas.TargetDuration = 45
+    mode: schemas.PipelineMode = "manual"
 
 
 @router.post("/generate")
@@ -84,18 +87,23 @@ async def parse_script(data: ScriptParseRequest):
     )
     if task is None:
         return {"status": "already_running", "project_id": data.project_id, "mode": data.mode, "deduplicated": True}
-    return {"status": "started", "project_id": data.project_id, "mode": data.mode}
+    return {
+        "status": "started",
+        "project_id": data.project_id,
+        "mode": data.mode,
+        **getattr(task, "budget_notice", {}),
+    }
 
 
 @router.post("/upload")
 async def upload_script(
     project_id: str = Form(...),
     file: UploadFile = File(...),
-    style: str = Form("anime"),
-    output_format: str = Form("9:16"),
-    resolution: str = Form("1080p"),
-    platform: str = Form("douyin"),
-    mode: Literal["manual", "auto"] = Form("manual"),
+    style: schemas.StyleId = Form("anime"),
+    output_format: schemas.OutputFormat = Form("9:16"),
+    resolution: schemas.Resolution = Form("1080p"),
+    platform: schemas.Platform = Form("douyin"),
+    mode: schemas.PipelineMode = Form("manual"),
 ):
     try:
         safe_project_id = validate_identifier(project_id, "项目 ID")
@@ -150,7 +158,14 @@ async def upload_script(
     task = _spawn_pipeline(safe_project_id, _initial_state(payload, _resolved_skill_config(safe_project_id)), mode, output_format, resolution)
     if task is None:
         return {"status": "already_running", "project_id": safe_project_id, "mode": mode, "deduplicated": True}
-    return {"status": "started", "project_id": safe_project_id, "mode": mode, "file": file.filename, "script": user_input}
+    return {
+        "status": "started",
+        "project_id": safe_project_id,
+        "mode": mode,
+        "file": file.filename,
+        "script": user_input,
+        **getattr(task, "budget_notice", {}),
+    }
 
 
 async def _generate_script_text(data: ScriptGenerateRequest, skill_config: dict | None = None) -> str:
@@ -246,8 +261,16 @@ def _require_project(project_id: str) -> Project:
 def _spawn_pipeline(project_id: str, initial_state: dict, mode: str, output_format: str, resolution: str) -> asyncio.Task | None:
     """根据 mode 启动手动(逐步)或自动(LangGraph 端到端)流水线,均后台异步执行。"""
     task_key = f"project:{project_id}:pipeline:{mode}"
-    if not claim_task(task_key, f"project:{project_id}"):
+    # 抢占即预算闸门：硬预算不足时这里会抛 409（error_code=budget_exceeded）。
+    claim = claim_or_block(
+        task_key,
+        f"project:{project_id}",
+        current_step="parse_script",
+        message="已排队，正在解析剧本",
+    )
+    if not claim.claimed:
         return None
+    _pending_budget_notice = budget_notice(claim)
     if mode == "auto":
         coro = _run_auto_pipeline(project_id, initial_state, output_format, resolution)
     else:
@@ -255,6 +278,8 @@ def _spawn_pipeline(project_id: str, initial_state: dict, mode: str, output_form
     task = start_task(task_key, coro)
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
+    # 软预算提示跟随本次任务对象返回给路由层（未触发时为空 dict）。
+    task.budget_notice = _pending_budget_notice  # type: ignore[attr-defined]
     return task
 
 
@@ -289,7 +314,12 @@ async def _run_auto_pipeline(project_id: str, initial_state: dict, output_format
             db.close()
         await ws_manager.send_to_project(
             project_id,
-            {"type": "error", "message": f"自动流程失败: {exc}\n{traceback.format_exc()}"},
+            report_failure(
+                exc,
+                error_type=ERROR_PIPELINE,
+                message="自动流程中断，本次生成已停止。请检查运行日志后重试，或改用「手动审核」逐步生成。",
+                context={"project_id": project_id, "mode": "auto"},
+            ),
         )
         raise
 
@@ -344,7 +374,12 @@ async def _run_storyboard_phase(project_id: str, state: dict):
             db.close()
         await ws_manager.send_to_project(
             project_id,
-            {"type": "error", "message": f"剧本与分镜生成失败: {exc}\n{traceback.format_exc()}"},
+            report_failure(
+                exc,
+                error_type=ERROR_PIPELINE,
+                message="剧本与分镜生成失败，本次生成已停止。请确认剧本内容与模型配置后重试。",
+                context={"project_id": project_id, "mode": "manual"},
+            ),
         )
         raise
 
@@ -372,10 +407,14 @@ def _persist_phase1(db, project_id: str, state: dict, status: str = "assets_read
     existing_shots = db.query(ShotModel).filter(ShotModel.project_id == project_id).all()
     if any(shot.confirmed or shot.video_path for shot in existing_shots):
         raise RuntimeError("项目已存在已确认/已出片的镜头，重新解析会丢失这些成果，请先清空项目后再解析")
+    db.query(ShotVersion).filter(ShotVersion.project_id == project_id).delete()
     db.query(ShotModel).filter(ShotModel.project_id == project_id).delete()
     shots = state.get("shots", [])
     for index, shot in enumerate(shots):
-        db.add(_shot_model(project_id, shot, index + 1, character_ids, scene_ids, state.get("script_scenes", []), state.get("characters", [])))
+        model = _shot_model(project_id, shot, index + 1, character_ids, scene_ids, state.get("script_scenes", []), state.get("characters", []))
+        db.add(model)
+        # 剧本解析生成的镜头以 import 来源进入版本历史，作为时间线的 v1。
+        create_version(db, model, "import")
 
     db.commit()
 
@@ -628,8 +667,10 @@ async def _persist_shot_update(project_id: str, shot: dict) -> None:
 
 
 async def _progress(project_id: str, step: str, progress: int, message: str) -> None:
-    update_job_progress(f"project:{project_id}:pipeline:auto", progress)
-    update_job_progress(f"project:{project_id}:pipeline:manual", progress)
+    # 两个键都写一次：只有真正持有当前 run token 的那个会成功，另一个会被静默忽略，
+    # 因此不需要在这里判断本次是 manual 还是 auto。
+    for key in (f"project:{project_id}:pipeline:auto", f"project:{project_id}:pipeline:manual"):
+        update_job_progress(key, progress, current_step=step, message=message)
     await ws_manager.send_to_project(project_id, {"type": "progress", "step": step, "progress": progress, "message": message})
 
 

@@ -1,15 +1,19 @@
+from typing import Annotated
+
 from fastapi import APIRouter
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from services.llm_service import LLMService
+
+from api.schemas import GenerationPrompt, Identifier
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 llm_service = LLMService()
 
 
 class ChatRequest(BaseModel):
-    project_id: str
-    message: str
-    current_shots: list[dict] = []
+    project_id: Identifier
+    message: GenerationPrompt
+    current_shots: Annotated[list[dict], Field(max_length=100)] = []
 
 
 @router.post("")

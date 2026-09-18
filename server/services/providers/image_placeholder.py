@@ -9,10 +9,28 @@ from io import BytesIO
 from PIL import Image, ImageDraw, ImageFont
 
 from services.providers.base import BaseAdapter, ImageCapabilities, ImageRequest
+from services.providers.usage import CAPABILITY_IMAGE, UsageMetadata, local_usage
 
 
 class PlaceholderImageAdapter(BaseAdapter):
     capabilities = ImageCapabilities(reference_images=False, requires_credentials=False)
+
+    def usage_for_request(
+        self,
+        capability: str,
+        request: ImageRequest | None = None,
+        *,
+        model: str = "",
+    ) -> UsageMetadata:
+        """本地占位图：张数与分辨率可信，但不产生外部费用（billable=False）。"""
+
+        return local_usage(
+            CAPABILITY_IMAGE,
+            provider=self.endpoint.protocol or "placeholder",
+            model=model or self.endpoint.model,
+            images=1,
+            resolution=str(getattr(request, "size", "") or ""),
+        )
 
     async def generate(self, request: ImageRequest) -> bytes:
         data = self._render(request.label, request.prompt, self._parse_size(request.size))

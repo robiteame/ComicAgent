@@ -1,11 +1,13 @@
-import json
 import re
 from datetime import datetime
+from typing import Annotated
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, StringConstraints
 
+from api.schemas import StyleKeywords, StyleLabel
 from config import settings
+from services.atomic_json import read_json_file
 from services.model_config_service import get_model_config, save_model_config
 from services.skill_config_service import list_skill_templates, save_skill_template, set_skill_bindings
 from services.style_templates import create_custom_style_template, style_options
@@ -14,9 +16,9 @@ router = APIRouter(prefix="/api/settings", tags=["settings"])
 
 
 class StyleTemplateCreate(BaseModel):
-    label: str
-    keywords: str
-    negative_prompt: str = ""
+    label: StyleLabel
+    keywords: StyleKeywords
+    negative_prompt: Annotated[str, StringConstraints(strip_whitespace=True, max_length=1000)] = ""
 
 
 class SkillTemplateSave(BaseModel):
@@ -99,9 +101,8 @@ def _template_key(label: str) -> str:
     if not slug:
         slug = "custom"
     path = settings.DATA_DIR / "custom_style_templates.json"
-    existing = {}
-    if path.exists():
-        existing = json.loads(path.read_text(encoding="utf-8") or "{}")
+    data = read_json_file(path, default=None)
+    existing = data if isinstance(data, dict) else {}
     key = f"custom_{slug}"
     if key not in existing:
         return key

@@ -6,13 +6,22 @@
 与 markdown 围栏 JSON 容错。
 """
 
+import asyncio
 import json
 import re
+import time
 
 from config import settings
 from services.providers.base import BaseAdapter
 from services.providers.endpoint import EndpointConfig, endpoint_identity, get_endpoint
 from services.providers.registry import get_adapter
+from services.providers.usage import (
+    CAPABILITY_LLM,
+    ERROR_CODE_PROVIDER_CALL_FAILED,
+    adapter_usage_for_request,
+    adapter_usage_from_response,
+)
+from services import usage_service
 
 
 class LLMService:
@@ -21,6 +30,42 @@ class LLMService:
     def __init__(self):
         self._adapters: dict[tuple, BaseAdapter] = {}
         self._sync_config()
+
+    # --- 用量记账 --------------------------------------------------------
+
+    def _record(self, adapter: BaseAdapter, response, model: str, started: float) -> None:
+        """把一次成功调用的 token 用量入账（供应商未回报 usage 时记为「成本未知」）。"""
+
+        duration_ms = int((time.monotonic() - started) * 1000)
+        metadata = adapter_usage_from_response(
+            adapter, CAPABILITY_LLM, response, model=model, duration_ms=duration_ms
+        )
+        usage_service.record_metadata(
+            metadata,
+            duration_ms=duration_ms,
+            scope=usage_service.current_scope(),
+        )
+
+    def _record_failure(self, adapter: BaseAdapter, model: str, started: float) -> None:
+        duration_ms = int((time.monotonic() - started) * 1000)
+        metadata = adapter_usage_for_request(adapter, CAPABILITY_LLM, None, model=model)
+        usage_service.record_failure(
+            metadata,
+            error_code=ERROR_CODE_PROVIDER_CALL_FAILED,
+            duration_ms=duration_ms,
+            scope=usage_service.current_scope(),
+        )
+
+    def _record_cancelled(self, adapter: BaseAdapter, model: str, started: float) -> None:
+        """任务在 LLM 调用途中被取消：留痕但不虚增金额。"""
+
+        duration_ms = int((time.monotonic() - started) * 1000)
+        metadata = adapter_usage_for_request(adapter, CAPABILITY_LLM, None, model=model)
+        usage_service.record_cancelled(
+            metadata,
+            duration_ms=duration_ms,
+            scope=usage_service.current_scope(),
+        )
 
     @staticmethod
     def _connection_key(endpoint: EndpointConfig | None) -> tuple | None:
@@ -148,22 +193,35 @@ class LLMService:
 
     async def _completion_with_fallback(self, create_completion, allow_fallback: bool = True):
         self._sync_config()
+        primary_adapter = self._adapter_for(self._endpoint)
+        started = time.monotonic()
         try:
-            response = await create_completion(self._adapter_for(self._endpoint), self.model)
+            response = await create_completion(primary_adapter, self.model)
             self.last_provider_used = self._endpoint_label(self._endpoint)
+            self._record(primary_adapter, response, self.model, started)
             return response
+        except asyncio.CancelledError:
+            self._record_cancelled(primary_adapter, self.model, started)
+            raise
         except Exception as primary_error:
+            self._record_failure(primary_adapter, self.model, started)
             fallback = self._fallback_endpoint
             if not allow_fallback or fallback is None:
                 raise
+            fallback_adapter = self._adapter_for(fallback)
+            fallback_model = fallback.model or self.model
+            fallback_started = time.monotonic()
             try:
-                response = await create_completion(
-                    self._adapter_for(fallback), fallback.model or self.model
-                )
+                response = await create_completion(fallback_adapter, fallback_model)
+            except asyncio.CancelledError:
+                self._record_cancelled(fallback_adapter, fallback_model, fallback_started)
+                raise
             except Exception as fallback_error:
+                self._record_failure(fallback_adapter, fallback_model, fallback_started)
                 # 备端点也失败时优先暴露主端点错误（更具诊断价值）。
                 raise primary_error from fallback_error
             self.last_provider_used = self._endpoint_label(fallback)
+            self._record(fallback_adapter, response, fallback_model, fallback_started)
             return response
 
     def _loads_json(self, content: str) -> dict:
@@ -193,21 +251,31 @@ class LLMService:
             image_data = base64.b64encode(f.read()).decode()
         mime_type = mimetypes.guess_type(image_path)[0] or "image/png"
 
-        response = await self.client.chat.completions.create(
-            model=self.vision_model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:{mime_type};base64,{image_data}"},
-                        },
-                    ],
-                }
-            ],
-            temperature=0.3,
-            max_tokens=self.max_tokens,
-        )
+        adapter = self._adapter_for(self._endpoint)
+        started = time.monotonic()
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.vision_model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:{mime_type};base64,{image_data}"},
+                            },
+                        ],
+                    }
+                ],
+                temperature=0.3,
+                max_tokens=self.max_tokens,
+            )
+        except asyncio.CancelledError:
+            self._record_cancelled(adapter, self.vision_model, started)
+            raise
+        except Exception:
+            self._record_failure(adapter, self.vision_model, started)
+            raise
+        self._record(adapter, response, self.vision_model, started)
         return self._message_text(response.choices[0].message)

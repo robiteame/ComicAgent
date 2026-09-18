@@ -11,6 +11,7 @@ import {
   PlaySquareOutlined,
   ProjectOutlined,
   RightOutlined,
+  UnorderedListOutlined,
 } from '@ant-design/icons'
 import message from 'antd/es/message'
 import Modal from 'antd/es/modal'
@@ -19,10 +20,14 @@ import { characterApi, projectApi, shotApi } from '../services/api'
 import { beginProjectNavigationIntent, requestProjectNavigation } from '../services/projectNavigationGuard'
 import { useProjectStore } from '../stores/projectStore'
 import { useShotStore } from '../stores/shotStore'
+import { useTaskStore } from '../stores/taskStore'
+import { formatRelativeTime } from './taskCenterModel'
+import { OPEN_TASK_CENTER_EVENT } from './TaskCenter'
 import { OPEN_SETTINGS_EVENT } from './TopBar'
 
 const OPEN_CREATE_PROJECT_EVENT = 'workspace:open-create-project'
 const WORKSPACE_NAVIGATE_EVENT = 'workspace:navigate'
+const OPEN_PROJECT_EVENT = 'workspace:open-project'
 
 interface ProjectItem {
   id: string
@@ -71,6 +76,7 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
     appendLog,
     clearLogs,
   } = useShotStore()
+  const taskSummary = useTaskStore((state) => state.summary)
 
   const [projects, setProjects] = useState<ProjectItem[]>([])
   const [expandedSeriesIds, setExpandedSeriesIds] = useState<Set<string>>(new Set())
@@ -107,6 +113,21 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
     refreshProjects()
     projectContextEpochRef.current += 1
   }, [projectId])
+
+  // 任务中心的「跳转到对应项目」：复用项目切换的全部守卫（导航意图 + 请求竞态）。
+  useEffect(() => {
+    const openProject = (event: Event) => {
+      const detail = (event as CustomEvent<{ projectId?: string; shotId?: string }>).detail || {}
+      if (!detail.projectId) return
+      void handleSelectProject(detail.projectId).then(() => {
+        if (detail.shotId) {
+          window.dispatchEvent(new CustomEvent('workspace:open-shot', { detail: { projectId: detail.projectId, shotId: detail.shotId } }))
+        }
+      })
+    }
+    window.addEventListener(OPEN_PROJECT_EVENT, openProject)
+    return () => window.removeEventListener(OPEN_PROJECT_EVENT, openProject)
+  })
 
   const visibleProjects = useMemo(() => {
     return [...projects].sort((a, b) => {
@@ -448,6 +469,16 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
   ]
 
   const openSettings = () => window.dispatchEvent(new CustomEvent(OPEN_SETTINGS_EVENT))
+  const openTaskCenter = () => window.dispatchEvent(new CustomEvent(OPEN_TASK_CENTER_EVENT))
+  const taskBadgeCount = taskSummary.activeCount + taskSummary.failedCount + taskSummary.interruptedCount
+  const taskBadgeLabel =
+    taskSummary.activeCount > 0
+      ? `${taskSummary.activeCount} 个任务进行中`
+      : taskSummary.failedCount > 0
+        ? `${taskSummary.failedCount} 个任务失败`
+        : taskSummary.latest
+          ? `最近任务：${taskSummary.latest.status_label}`
+          : '暂无任务'
 
   return (
     <aside className={`left-sidebar${collapsed ? ' collapsed' : ''}`} aria-label="左侧导航">
@@ -530,16 +561,46 @@ const LeftSidebar: React.FC<LeftSidebarProps> = ({ collapsed, onToggleCollapsed 
 
       <div className="sidebar-footer">
         {collapsed ? (
-          <Tooltip title="系统设置" placement="right">
-            <button type="button" className="collapsed-project-btn sidebar-settings-btn" onClick={openSettings} aria-label="系统设置">
-              <ControlOutlined />
-            </button>
-          </Tooltip>
+          <>
+            <Tooltip title={'任务中心 · ' + taskBadgeLabel} placement="right">
+              <button
+                type="button"
+                className="collapsed-project-btn sidebar-task-center-btn"
+                onClick={openTaskCenter}
+                aria-label={'任务中心，' + taskBadgeLabel}
+                aria-haspopup="dialog"
+              >
+                <UnorderedListOutlined />
+                {taskBadgeCount > 0 && <span className="sidebar-task-badge" aria-hidden="true">{taskBadgeCount}</span>}
+              </button>
+            </Tooltip>
+            <Tooltip title="系统设置" placement="right">
+              <button type="button" className="collapsed-project-btn sidebar-settings-btn" onClick={openSettings} aria-label="系统设置">
+                <ControlOutlined />
+              </button>
+            </Tooltip>
+          </>
         ) : (
-          <button type="button" className="linear-action sidebar-settings-btn" onClick={openSettings}>
-            <span className="linear-action-icon"><ControlOutlined /></span>
-            <span>系统设置</span>
-          </button>
+          <>
+            <button
+              type="button"
+              className="linear-action sidebar-task-center-btn"
+              onClick={openTaskCenter}
+              aria-haspopup="dialog"
+              aria-label={'任务中心，' + taskBadgeLabel}
+            >
+              <span className="linear-action-icon"><UnorderedListOutlined /></span>
+              <span className="sidebar-task-copy">
+                <span>任务中心</span>
+                <em>{taskBadgeLabel}</em>
+              </span>
+              {taskBadgeCount > 0 && <span className="sidebar-task-badge">{taskBadgeCount}</span>}
+            </button>
+            <button type="button" className="linear-action sidebar-settings-btn" onClick={openSettings}>
+              <span className="linear-action-icon"><ControlOutlined /></span>
+              <span>系统设置</span>
+            </button>
+          </>
         )}
       </div>
 

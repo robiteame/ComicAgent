@@ -4,6 +4,7 @@ import {
   ArrowLeftOutlined,
   BgColorsOutlined,
   CopyOutlined,
+  DollarOutlined,
   ExperimentOutlined,
   ReloadOutlined,
   SaveOutlined,
@@ -18,6 +19,7 @@ import Select from 'antd/es/select'
 import Slider from 'antd/es/slider'
 import Switch from 'antd/es/switch'
 import { projectApi, settingsApi } from '../services/api'
+import PricingConfigPanel from './PricingConfigPanel'
 import { STYLE_TEMPLATES_UPDATED_EVENT } from '../constants/events'
 import { STYLE_DESCRIPTIONS, STYLE_OPTIONS } from '../constants/styleTemplates'
 import { useProjectStore } from '../stores/projectStore'
@@ -129,7 +131,7 @@ interface SystemSettingsPageProps {
   onBack: () => void
 }
 
-type SettingsTab = 'appearance' | 'models' | 'skill'
+type SettingsTab = 'appearance' | 'models' | 'pricing' | 'skill'
 
 const DEFAULT_AGENT_CONFIG: AgentSkillConfig = {
   style_template_id: 'anime',
@@ -161,6 +163,7 @@ const EMPTY_MODEL_CONFIG: ModelConfigState = {
 const TAB_ITEMS: { key: SettingsTab; label: string; desc: string; icon: React.ReactNode }[] = [
   { key: 'appearance', label: '外观与画风', desc: '画风模板与全局生成规格', icon: <BgColorsOutlined /> },
   { key: 'models', label: '模型与 API 配置', desc: '剧本 / 图像 / 视频 / 配音接口', icon: <ApiOutlined /> },
+  { key: 'pricing', label: '模型价格', desc: '单价、计价单位与分辨率倍率', icon: <DollarOutlined /> },
   { key: 'skill', label: 'Skill 配置', desc: '子 Agent 生成策略与绑定', icon: <ExperimentOutlined /> },
 ]
 
@@ -579,6 +582,8 @@ const SystemSettingsPage: React.FC<SystemSettingsPageProps> = ({ onBack }) => {
                 </div>
               </div>
             )}
+
+            {activeTab === 'pricing' && <PricingConfigPanel />}
 
             {activeTab === 'skill' && (
               <section className="settings-section skill-settings-section">

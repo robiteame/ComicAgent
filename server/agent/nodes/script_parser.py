@@ -1,7 +1,9 @@
 import json
 import re
 
+from agent.output_schemas import CharacterOutput, LLMOutputError, SceneOutput, parse_script_output
 from agent.state import AgentState
+from config import settings
 from memory.project_memory import ProjectMemory
 from rag.rag_service import RAGService
 from services.llm_service import LLMService
@@ -10,6 +12,15 @@ from services.tts_service import normalize_mimo_voice
 llm_service = LLMService()
 rag_service = RAGService()
 project_memory = ProjectMemory()
+
+DEFAULT_EMOTION_VARIANTS = {
+    "neutral": "calm expression",
+    "happy": "gentle smile",
+    "shy": "slight blush",
+    "sad": "downcast eyes",
+    "angry": "determined eyes",
+    "surprised": "wide eyes",
+}
 
 
 async def run(state: AgentState) -> dict:
@@ -51,176 +62,97 @@ async def run(state: AgentState) -> dict:
     except Exception as exc:
         raise RuntimeError(f"Mimo 剧本解析失败: {exc}") from exc
 
-    if not isinstance(result, dict):
-        raise RuntimeError("Mimo 剧本解析没有返回 JSON 对象")
+    # 模型输出是不可信输入：统一走强 schema 校验，字段级问题在这里被归一化或丢弃，
+    # 不会以 KeyError/TypeError/ValueError 的形式冒泡到流水线。
+    try:
+        parsed = parse_script_output(result, fallback_style=state.get("style", "anime"))
+    except LLMOutputError as exc:
+        raise RuntimeError(f"Mimo 剧本解析结果无法使用: {exc}") from exc
 
-    raw_characters = result.get("characters", [])
-    raw_scenes = result.get("script_scenes") or result.get("scenes") or []
-    if not raw_characters or not raw_scenes:
-        raise RuntimeError("Mimo 剧本解析结果缺少角色或场景")
-
-    characters = _normalize_characters(raw_characters, user_input)
+    characters = _build_characters(parsed.characters)
     if not characters:
         raise RuntimeError("Mimo 剧本解析结果缺少可用角色")
-    script_scenes = _normalize_scenes(raw_scenes, user_input, characters)
+    script_scenes = _build_scenes(parsed.script_scenes, characters)
     if not script_scenes:
-        raise RuntimeError("Mimo 剧本解析结果缺少角色或场景")
+        raise RuntimeError("Mimo 剧本解析结果缺少可用场景")
 
     project_memory.save_characters(project_id, characters)
     project_memory.save_narrative_context(
         project_id,
         {
             "script_scenes": script_scenes,
-            "genre": result.get("genre", "原创短剧"),
-            "style_suggestion": result.get("style_suggestion", state.get("style", "anime")),
+            "genre": parsed.genre or "原创短剧",
+            "style_suggestion": parsed.style_suggestion,
         },
     )
 
     return {
-        "script_title": result.get("title") or _guess_title(user_input),
-        "genre": result.get("genre", "原创短剧"),
-        "style_suggestion": result.get("style_suggestion", state.get("style", "anime")),
+        "script_title": parsed.title or _guess_title(user_input),
+        "genre": parsed.genre or "原创短剧",
+        "style_suggestion": parsed.style_suggestion,
         "characters": characters,
         "raw_script": json.dumps(script_scenes, ensure_ascii=False),
         "script_scenes": script_scenes,
-        "logic_issues": result.get("logic_issues", []),
+        "logic_issues": parsed.logic_issues,
         "rag_context": rag_context,
         "current_step": "parse_script",
     }
 
 
-def _normalize_characters(raw: list, user_input: str) -> list[dict]:
+def _build_characters(items: list[CharacterOutput]) -> list[dict]:
+    """把已校验的角色输出补全为角色卡片（音色、情绪变体、固定 seed）。"""
+
     characters: list[dict] = []
-    for index, item in enumerate(raw[:6]):
-        name = str(item.get("name") or f"角色{index + 1}").strip()
+    for index, item in enumerate(items[: settings.LLM_MAX_CHARACTERS]):
+        name = item.name.strip()
         if not name:
             continue
-        appearance = item.get("appearance") if isinstance(item.get("appearance"), dict) else {}
-        features = appearance.get("features", [])
-        if isinstance(features, str):
-            features = [part.strip() for part in re.split(r"[,，、]", features) if part.strip()]
         characters.append(
             {
                 "name": name,
-                "appearance": appearance,
-                "personality": item.get("personality", "性格鲜明，行动目标清晰"),
-                "visual_prompt": item.get("visual_prompt") or f"{name}, expressive finished color comic character design",
-                "negative_prompt": item.get("negative_prompt", "low quality, blurry, watermark"),
-                "voice_id": normalize_mimo_voice(item.get("voice_type") or item.get("voice_id") or "少女"),
-                "key_features": features,
-                "emotion_variants": {
-                    "neutral": "calm expression",
-                    "happy": "gentle smile",
-                    "shy": "slight blush",
-                    "sad": "downcast eyes",
-                    "angry": "determined eyes",
-                    "surprised": "wide eyes",
-                },
-                "seed": 42 + index,
+                "appearance": dict(item.appearance),
+                "personality": item.personality or "性格鲜明，行动目标清晰",
+                "visual_prompt": item.visual_prompt or f"{name}, expressive finished color comic character design",
+                "negative_prompt": item.negative_prompt or "low quality, blurry, watermark",
+                "voice_id": normalize_mimo_voice(item.voice_type or "少女"),
+                "key_features": item.key_features or _split_features(item.appearance.get("features", "")),
+                "emotion_variants": dict(DEFAULT_EMOTION_VARIANTS),
+                "seed": item.seed if item.seed is not None else 42 + index,
             }
         )
-
-    if characters or raw:
-        return characters
-
-    names = re.findall(r"(?:人物|角色)[:：]\s*([^\n，。]+)", user_input)
-    name = names[0].strip() if names else "主角"
-    return [
-        {
-            "name": name,
-            "appearance": {"features": ["清爽造型", "表情细腻"], "default_outfit": "日常服装"},
-            "personality": "敏感而有行动力",
-            "visual_prompt": f"{name}, modern Chinese comic character, clean office-light illustration",
-            "negative_prompt": "low quality, blurry, watermark, extra fingers",
-            "voice_id": normalize_mimo_voice("少女"),
-            "key_features": ["清爽造型", "表情细腻"],
-            "emotion_variants": {
-                "neutral": "calm expression",
-                "happy": "gentle smile",
-                "shy": "slight blush",
-                "sad": "downcast eyes",
-                "angry": "determined eyes",
-                "surprised": "wide eyes",
-            },
-            "seed": 42,
-        }
-    ]
+    return characters
 
 
-def _normalize_scenes(raw: list, user_input: str, characters: list[dict]) -> list[dict]:
+def _split_features(raw: str) -> list[str]:
+    """模型常把标志特征写成顿号/逗号分隔的字符串，这里拆成列表。"""
+
+    return [part.strip() for part in re.split(r"[,，、]", raw or "") if part.strip()]
+
+
+def _build_scenes(items: list[SceneOutput], characters: list[dict]) -> list[dict]:
+    """把已校验的场景输出补全为剧本场景（对白、情绪、机位建议）。"""
+
+    default_character = characters[0]["name"] if characters else "主角"
     scenes: list[dict] = []
-    for index, item in enumerate(raw[:8]):
-        dialogue = item.get("dialogue", [])
-        if isinstance(dialogue, str):
-            dialogue = [{"character": characters[0]["name"], "line": dialogue, "emotion": "neutral", "action": ""}]
+    for index, item in enumerate(items[: settings.LLM_MAX_SCENES]):
+        dialogue = [line.model_dump() for line in item.dialogue if line.line.strip()]
         scenes.append(
             {
-                "scene_number": int(item.get("scene_number") or index + 1),
-                "location": item.get("location") or "室内创作空间",
-                "characters_in_scene": item.get("characters_in_scene") or [characters[0]["name"]],
-                "actions": item.get("actions") or item.get("description") or "角色推进剧情",
+                "scene_number": item.scene_number or index + 1,
+                "location": item.location or "室内创作空间",
+                "characters_in_scene": item.characters_in_scene or [default_character],
+                "actions": item.actions or item.description or "角色推进剧情",
                 "dialogue": dialogue,
-                "emotion": item.get("emotion") or "neutral",
-                "camera_suggestion": item.get("camera_suggestion") or "medium",
+                "emotion": item.emotion,
+                "camera_suggestion": item.camera_suggestion,
             }
         )
-
-    if scenes:
-        return scenes
-
-    chunks = [part.strip() for part in re.split(r"\n\s*\n|[。！？]\s*", user_input) if part.strip()]
-    if not chunks:
-        chunks = ["主角进入场景，故事开始推进"]
-    return [
-        {
-            "scene_number": i + 1,
-            "location": _guess_location(chunk),
-            "characters_in_scene": [characters[0]["name"]],
-            "actions": chunk[:120],
-            "dialogue": _extract_dialogue(chunk, characters[0]["name"]),
-            "emotion": _guess_emotion(chunk),
-            "camera_suggestion": "medium",
-        }
-        for i, chunk in enumerate(chunks[:5])
-    ]
-
-
-def _fallback_parse(user_input: str) -> dict:
-    return {
-        "title": _guess_title(user_input),
-        "genre": "原创短剧",
-        "style_suggestion": "anime",
-        "characters": [],
-        "script_scenes": [],
-        "logic_issues": [],
-    }
+    return scenes
 
 
 def _guess_title(text: str) -> str:
     first = re.sub(r"\s+", "", text or "")[:14]
     return first or "未命名项目"
-
-
-def _guess_location(text: str) -> str:
-    match = re.search(r"(?:场景|地点)[:：]\s*([^\n，。]+)", text)
-    return match.group(1).strip() if match else "故事场景"
-
-
-def _extract_dialogue(text: str, character: str) -> list[dict]:
-    lines = re.findall(r"[“\"']([^”\"']{2,80})[”\"']", text)
-    return [{"character": character, "line": line, "emotion": _guess_emotion(line), "action": ""} for line in lines[:2]]
-
-
-def _guess_emotion(text: str) -> str:
-    if re.search(r"笑|开心|惊喜|甜", text):
-        return "happy"
-    if re.search(r"哭|难过|失落|雨|深夜", text):
-        return "sad"
-    if re.search(r"怒|冲突|争吵", text):
-        return "angry"
-    if re.search(r"突然|震惊|发现", text):
-        return "surprised"
-    return "neutral"
 
 
 def _load_system_prompt() -> str:

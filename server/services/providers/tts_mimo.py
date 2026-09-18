@@ -11,6 +11,7 @@ import httpx
 
 from config import settings
 from services.providers.base import BaseAdapter, TTSRequest
+from services.providers.usage import CAPABILITY_TTS, UsageMetadata
 
 MIMO_TTS_VOICES = {"mimo_default", "冰糖", "茉莉", "苏打", "白桦", "Mia", "Chloe", "Milo", "Dean"}
 
@@ -54,6 +55,30 @@ def normalize_mimo_voice(voice_id: str = "", default_voice: str = "") -> str:
 
 
 class MimoTTSAdapter(BaseAdapter):
+    def usage_for_request(
+        self,
+        capability: str,
+        request: TTSRequest | None = None,
+        *,
+        model: str = "",
+    ) -> UsageMetadata:
+        """Mimo TTS 按字符计费；音色与音频格式记进明细便于核对。"""
+
+        text = str(getattr(request, "text", "") or "")
+        return UsageMetadata(
+            capability=CAPABILITY_TTS,
+            provider=self.endpoint.protocol,
+            model=model or self.endpoint.model,
+            characters=len(text.strip()),
+            known=True,
+            billable=True,
+            source="request",
+            extra={
+                "voice": str(getattr(request, "voice_id", "") or self.endpoint.param("voice") or ""),
+                "format": str(self.endpoint.param("format") or ""),
+            },
+        )
+
     async def synthesize(self, request: TTSRequest) -> bytes:
         endpoint = self.endpoint
         if not endpoint.api_key:

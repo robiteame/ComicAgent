@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any
 
 from config import settings
+from services.atomic_json import atomic_write_json, path_lock, read_json_file
 
 
 DEFAULT_AGENT_CONFIG: dict[str, Any] = {
@@ -44,47 +45,50 @@ def list_skill_templates() -> dict[str, Any]:
 
 
 def save_skill_template(template: dict[str, Any]) -> dict[str, Any]:
-    store = _load_store()
-    template_id = _template_id(template.get("id") or template.get("name") or "skill")
-    existing = store["templates"].get(template_id, {})
-    now = datetime.utcnow().isoformat()
-    normalized = _normalize_template(
-        {
-            **existing,
-            **template,
-            "id": template_id,
-            "created_at": existing.get("created_at") or now,
-            "updated_at": now,
-        }
-    )
-    store["templates"][template_id] = normalized
-    if not store.get("global_default_template_id"):
-        store["global_default_template_id"] = template_id
-    _save_store(store)
+    # 同一路径的锁覆盖「读 -> 改 -> 写」整段，避免并发保存互相覆盖。
+    with path_lock(_store_path()):
+        store = _load_store()
+        template_id = _template_id(template.get("id") or template.get("name") or "skill")
+        existing = store["templates"].get(template_id, {})
+        now = datetime.utcnow().isoformat()
+        normalized = _normalize_template(
+            {
+                **existing,
+                **template,
+                "id": template_id,
+                "created_at": existing.get("created_at") or now,
+                "updated_at": now,
+            }
+        )
+        store["templates"][template_id] = normalized
+        if not store.get("global_default_template_id"):
+            store["global_default_template_id"] = template_id
+        _save_store(store)
     return normalized
 
 
 def set_skill_bindings(data: dict[str, Any]) -> dict[str, Any]:
-    store = _load_store()
-    templates = store["templates"]
+    with path_lock(_store_path()):
+        store = _load_store()
+        templates = store["templates"]
 
-    global_default = data.get("global_default_template_id")
-    if global_default:
-        _ensure_template(templates, global_default)
-        store["global_default_template_id"] = global_default
+        global_default = data.get("global_default_template_id")
+        if global_default:
+            _ensure_template(templates, global_default)
+            store["global_default_template_id"] = global_default
 
-    for key, target in (("project_bindings", "project_bindings"), ("episode_bindings", "episode_bindings")):
-        if key not in data:
-            continue
-        next_bindings = {}
-        for project_id, template_id in (data.get(key) or {}).items():
-            if not project_id or not template_id:
+        for key, target in (("project_bindings", "project_bindings"), ("episode_bindings", "episode_bindings")):
+            if key not in data:
                 continue
-            _ensure_template(templates, template_id)
-            next_bindings[str(project_id)] = str(template_id)
-        store[target] = next_bindings
+            next_bindings = {}
+            for project_id, template_id in (data.get(key) or {}).items():
+                if not project_id or not template_id:
+                    continue
+                _ensure_template(templates, template_id)
+                next_bindings[str(project_id)] = str(template_id)
+            store[target] = next_bindings
 
-    _save_store(store)
+        _save_store(store)
     return list_skill_templates()
 
 
@@ -179,23 +183,21 @@ def _agent_config(skill_config: dict[str, Any] | None, agent: str) -> dict[str, 
 
 def _load_store() -> dict[str, Any]:
     path = _store_path()
-    if path.exists():
-        try:
-            data = json.loads(path.read_text(encoding="utf-8") or "{}")
-        except Exception:
+    with path_lock(path):
+        data = read_json_file(path, default=None)
+        if not isinstance(data, dict):
             data = {}
-    else:
-        data = {}
-    store = _normalize_store(data)
-    if not path.exists():
-        _save_store(store)
-    return store
+        store = _normalize_store(data)
+        # 文件不存在或刚被判定损坏（已备份为 .corrupt）时落一份默认配置。
+        if not path.exists():
+            _save_store(store)
+        return store
 
 
 def _save_store(store: dict[str, Any]) -> None:
     path = _store_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(_normalize_store(store), ensure_ascii=False, indent=2), encoding="utf-8")
+    with path_lock(path):
+        atomic_write_json(path, _normalize_store(store))
 
 
 def _normalize_store(data: dict[str, Any]) -> dict[str, Any]:

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from services.providers.endpoint import EndpointConfig
+from services.providers.usage import UsageMetadata, unknown_usage
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,10 @@ class BaseAdapter:
 
     协议骨架（厂商实现未落地）应把 ``production_ready`` 置为 False：路由层会把
     该协议对应的高级能力（如原生音频）视为暂不可用并安全回退。
+
+    用量回报：每个适配器都用 ``usage_for_request`` / ``usage_from_response`` 宣告
+    本次调用消耗了多少（token / 张 / 秒 / 字符）。没有声明用量的适配器一律返回
+    「未知」，记账层据此显示「成本未知」，绝不按 0 或猜测值入账。
     """
 
     capabilities: object = None
@@ -89,3 +94,29 @@ class BaseAdapter:
 
     def __init__(self, endpoint: EndpointConfig):
         self.endpoint = endpoint
+
+    # --- 统一 usage metadata ------------------------------------------------
+
+    def usage_for_request(
+        self,
+        capability: str,
+        request: object | None = None,
+        *,
+        model: str = "",
+    ) -> UsageMetadata:
+        """按请求 / 端点推导用量；未声明协议的适配器返回「未知」。"""
+
+        return unknown_usage(capability, self.endpoint.protocol, model or self.endpoint.model)
+
+    def usage_from_response(
+        self,
+        capability: str,
+        response: object | None = None,
+        *,
+        request: object | None = None,
+        model: str = "",
+        duration_ms: int = 0,
+    ) -> UsageMetadata:
+        """用供应商返回值细化用量（默认沿用请求侧推导）。"""
+
+        return self.usage_for_request(capability, request, model=model)

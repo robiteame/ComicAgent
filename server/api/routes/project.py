@@ -10,9 +10,10 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from api import schemas
 from config import settings
 from db import get_db
-from models import Character, Project, SceneAsset, Shot
+from models import Character, Project, SceneAsset, Shot, ShotVersion
 from services.security import UploadLimitExceeded, safe_path, save_upload_stream, validate_identifier, validate_video_upload
 from services.storage_service import StorageQuotaExceeded, StorageService
 from services.task_registry import ScopeCancellation, cancel_scopes, release_scope_block
@@ -28,49 +29,45 @@ class _StagedProjectPath:
 
 
 class ProjectCreate(BaseModel):
-    title: str = "未命名项目"
-    first_episode_title: str = ""
-    parent_project_id: str = ""
-    project_type: str = "series"
-    episode_number: int = 0
-    genre: str = ""
-    style: str = "anime"
-    input_text: str = ""
-    input_type: str = "text"
-    output_format: str = "9:16"
-    resolution: str = "1080p"
-    platform: str = "douyin"
+    title: schemas.ProjectTitle = "未命名项目"
+    first_episode_title: schemas.EpisodeTitle = ""
+    parent_project_id: schemas.OptionalIdentifier = ""
+    project_type: schemas.ProjectType = "series"
+    episode_number: schemas.EpisodeNumber = 0
+    genre: schemas.Genre = ""
+    style: schemas.StyleId = "anime"
+    input_text: schemas.ScriptText = ""
+    input_type: schemas.InputType = "text"
+    output_format: schemas.OutputFormat = "9:16"
+    resolution: schemas.Resolution = "1080p"
+    platform: schemas.Platform = "douyin"
 
 
 class ProjectUpdate(BaseModel):
-    title: str | None = None
-    parent_project_id: str | None = None
-    project_type: str | None = None
-    episode_number: int | None = None
-    genre: str | None = None
-    style: str | None = None
-    output_format: str | None = None
-    resolution: str | None = None
-    platform: str | None = None
+    title: schemas.OptionalTitle | None = None
+    parent_project_id: schemas.OptionalIdentifier | None = None
+    project_type: schemas.ProjectType | None = None
+    episode_number: schemas.EpisodeNumber | None = None
+    genre: schemas.Genre | None = None
+    style: schemas.StyleId | None = None
+    output_format: schemas.OutputFormat | None = None
+    resolution: schemas.Resolution | None = None
+    platform: schemas.Platform | None = None
 
 
 @router.post("")
 async def create_project(data: ProjectCreate, db: Session = Depends(get_db)):
     payload = data.model_dump()
     first_episode_title = payload.pop("first_episode_title", "")
-    parent_id = payload.get("parent_project_id") or ""
-    if parent_id:
-        try:
-            validate_identifier(parent_id, "父项目 ID")
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        parent = db.query(Project).filter(Project.id == parent_id).first()
-        if not parent:
-            raise HTTPException(status_code=404, detail="父项目不存在")
-        if parent.status == "deleting":
-            raise HTTPException(status_code=409, detail="父项目正在删除")
-    if payload.get("project_type") == "episode" and not payload.get("episode_number"):
-        payload["episode_number"] = _next_episode_number(db, payload.get("parent_project_id", ""))
+    project_type, parent_id, episode_number = _resolve_project_tree(
+        db,
+        project_type=payload.get("project_type", "series"),
+        parent_project_id=payload.get("parent_project_id", ""),
+        episode_number=payload.get("episode_number", 0),
+    )
+    payload["project_type"] = project_type
+    payload["parent_project_id"] = parent_id
+    payload["episode_number"] = episode_number
     project = Project(id=str(uuid.uuid4()), **payload)
     db.add(project)
     first_episode = None
@@ -124,21 +121,29 @@ async def update_project(project_id: str, data: ProjectUpdate, db: Session = Dep
         key in generation_fields and getattr(project, key) != value
         for key, value in changed.items()
     )
-    if "parent_project_id" in changed and changed["parent_project_id"]:
-        parent_id = str(changed["parent_project_id"])
-        try:
-            validate_identifier(parent_id, "父项目 ID")
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        if parent_id == project.id:
-            raise HTTPException(status_code=400, detail="项目不能成为自己的父项目")
-        parent = db.query(Project).filter(Project.id == parent_id).first()
-        if not parent:
-            raise HTTPException(status_code=404, detail="父项目不存在")
-        if parent.status == "deleting":
-            raise HTTPException(status_code=409, detail="父项目正在删除")
-        if _is_descendant(db, project.id, parent_id):
+    tree_fields = {"project_type", "parent_project_id", "episode_number"}
+    if tree_fields & changed.keys():
+        next_type, next_parent, next_number = _resolve_project_tree(
+            db,
+            project_type=changed.get("project_type", project.project_type or "series"),
+            parent_project_id=changed.get("parent_project_id", project.parent_project_id or ""),
+            episode_number=changed.get("episode_number", project.episode_number or 0),
+            project_id=project.id,
+        )
+        child_episodes = _episode_count(db, project.id)
+        if next_type != "series" and child_episodes:
+            raise HTTPException(
+                status_code=409,
+                detail=f"该项目下已有 {child_episodes} 集剧集，不能改为剧集类型",
+            )
+        if next_parent and _is_descendant(db, project.id, next_parent):
             raise HTTPException(status_code=400, detail="不能将项目移动到自己的子项目下")
+        if next_parent != (project.parent_project_id or ""):
+            changed["parent_project_id"] = next_parent
+        if next_type != project.project_type or "project_type" in changed:
+            changed["project_type"] = next_type
+        if next_number != (project.episode_number or 0) or "episode_number" in changed:
+            changed["episode_number"] = next_number
     for key, value in changed.items():
         setattr(project, key, value)
     if generation_changed:
@@ -193,6 +198,8 @@ async def delete_project(project_id: str, db: Session = Depends(get_db)):
         staged_paths = _stage_project_paths(delete_ids, trash_token, previous_statuses)
 
         for target_id in delete_ids:
+            # 版本快照随镜头一并清理（append-only 只限制改写，不限制项目级清理）。
+            db.query(ShotVersion).filter(ShotVersion.project_id == target_id).delete()
             db.query(Shot).filter(Shot.project_id == target_id).delete()
             db.query(Character).filter(Character.project_id == target_id).delete()
             db.query(SceneAsset).filter(SceneAsset.project_id == target_id).delete()
@@ -371,6 +378,66 @@ def _serialize_project(project: Project, parent_titles: dict[str, str] | None = 
         "created_at": project.created_at.isoformat(),
         "updated_at": project.updated_at.isoformat(),
     }
+
+
+PROJECT_TYPES = ("series", "episode")
+
+
+def _resolve_project_tree(
+    db: Session,
+    *,
+    project_type: str,
+    parent_project_id: str,
+    episode_number: int,
+    project_id: str | None = None,
+) -> tuple[str, str, int]:
+    """校验并归一化项目树字段，返回 (project_type, parent_project_id, episode_number)。
+
+    不变量：series 是根节点（无父级），episode 必须挂在真实存在的 series 下，
+    禁止自引用与未知类型，集号不能为负；集号为 0 时自动取下一个可用集号。
+    """
+
+    normalized_type = str(project_type or "").strip()
+    if normalized_type not in PROJECT_TYPES:
+        raise HTTPException(status_code=400, detail=f"未知的项目类型: {normalized_type or '(空)'}")
+    parent_id = str(parent_project_id or "").strip()
+    if project_id and parent_id and parent_id == project_id:
+        raise HTTPException(status_code=400, detail="项目不能成为自己的父项目")
+    if normalized_type == "series":
+        if parent_id:
+            raise HTTPException(status_code=400, detail="大项目不能挂在其他项目下")
+        return "series", "", 0
+
+    if not parent_id:
+        raise HTTPException(status_code=400, detail="剧集必须指定所属大项目")
+    try:
+        validate_identifier(parent_id, "父项目 ID")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    parent = db.query(Project).filter(Project.id == parent_id).first()
+    if not parent:
+        raise HTTPException(status_code=404, detail="父项目不存在")
+    if parent.status == "deleting":
+        raise HTTPException(status_code=409, detail="父项目正在删除")
+    if (parent.project_type or "series") != "series":
+        raise HTTPException(status_code=400, detail="剧集只能挂在系列项目下")
+
+    number = int(episode_number or 0)
+    if number < 0:
+        raise HTTPException(status_code=400, detail="集号不能为负数")
+    if number == 0:
+        number = _next_episode_number(db, parent_id)
+    return "episode", parent_id, number
+
+
+def _episode_count(db: Session, project_id: str) -> int:
+    """该项目直属的剧集数量，用于阻止会把剧集变成孤儿的类型变更。"""
+
+    return (
+        db.query(Project)
+        .filter(Project.parent_project_id == project_id, Project.project_type == "episode")
+        .count()
+    )
 
 
 def _next_episode_number(db: Session, parent_project_id: str) -> int:

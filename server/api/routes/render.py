@@ -1,7 +1,6 @@
 import asyncio
 import json
 import os
-import traceback
 import uuid
 from pathlib import Path
 
@@ -9,12 +8,16 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import text
 
+from api import schemas
 from api.websocket import ws_manager
 from config import settings
 from db import SessionLocal, get_db
 from models import Project, Shot as ShotModel
+from services.av_config_service import build_av_manifest, collect_render_config
+from services.error_reporter import ERROR_RENDER, error_payload, log_failure
 from services.ffmpeg_service import FFmpegService
 from services.security import existing_file, validate_identifier
+from api.claim_guard import budget_notice, claim_or_block
 from services.task_registry import claim as claim_task, snapshot as task_snapshot, start as start_task, update_progress as update_job_progress
 
 router = APIRouter(prefix="/api/render", tags=["render"])
@@ -26,9 +29,11 @@ _render_locks: dict[str, asyncio.Lock] = {}
 
 
 class RenderRequest(BaseModel):
+    # project_id 沿用 400 的既有约定（下面显式 validate_identifier），
+    # 比例与分辨率在这里收敛到项目真实支持的档位。
     project_id: str
-    output_format: str = "9:16"
-    resolution: str = "1080p"
+    output_format: schemas.OutputFormat = "9:16"
+    resolution: schemas.Resolution = "1080p"
 
 
 @router.post("")
@@ -40,13 +45,19 @@ async def render_video(data: RenderRequest, db=Depends(get_db)):
     if not db.query(Project).filter(Project.id == data.project_id).first():
         raise HTTPException(status_code=404, detail="项目不存在")
     task_key = f"project:{data.project_id}:render"
-    if not claim_task(task_key, f"project:{data.project_id}"):
+    claim = claim_or_block(
+        task_key,
+        f"project:{data.project_id}",
+        current_step="rendering",
+        message="已排队，准备导出成片",
+    )
+    if not claim.claimed:
         return {"status": "rendering", "project_id": data.project_id, "deduplicated": True}
     task = start_task(task_key, _render_task(data.project_id, data.output_format, data.resolution))
     _render_tasks.add(task)
     task.add_done_callback(_render_tasks.discard)
     _render_status[data.project_id] = {"status": "rendering", "progress": 0}
-    return {"status": "rendering", "project_id": data.project_id}
+    return {"status": "rendering", "project_id": data.project_id, **budget_notice(claim)}
 
 
 @router.get("/{project_id}/status")
@@ -157,7 +168,16 @@ async def _render_task(project_id: str, output_format: str, resolution: str):
                 s.id: (s.version or 1, bool(s.confirmed), s.video_path or "", s.audio_path or "")
                 for s in db_shots
             }
-            project_manifest = (project.style, project.output_format, project.resolution) if project else None
+            # 字幕/音频工作台：渲染采用当时的全部轨道与字幕配置；发布前重读比对，
+            # 期间任何修改（av_config_version 亦会推进）都使本批成片作废。
+            av_render_config = collect_render_config(db, project_id)
+            av_manifest = build_av_manifest(av_render_config)
+            av_config_payload = {
+                "audio_tracks": av_render_config.audio_tracks,
+                "subtitle_tracks": av_render_config.subtitle_tracks,
+                "total_duration_s": av_render_config.total_duration_ms / 1000,
+            }
+            project_manifest = _project_manifest_tuple(project)
         finally:
             db.close()
         _apply_post_profiles(shots)
@@ -169,13 +189,14 @@ async def _render_task(project_id: str, output_format: str, resolution: str):
             resolution=resolution,
             project_id=project_id,
             publish=False,
+            av_config=av_config_payload,
             )
         )
         final_file = existing_file(staged_video, minimum_size=1024, allowed_roots=media_roots)
         if final_file is None:
             raise RuntimeError("FFmpeg 未生成有效的成片文件")
 
-        video_path = _publish_render(project_id, staged_video, manifest, project_manifest)
+        video_path = _publish_render(project_id, staged_video, manifest, project_manifest, av_manifest)
         staged_video = None
         _render_status[project_id] = {"status": "completed", "progress": 100, "video_path": video_path}
         await ws_manager.send_to_project(
@@ -198,7 +219,14 @@ async def _render_task(project_id: str, output_format: str, resolution: str):
             db.close()
         raise
     except Exception as exc:
-        _render_status[project_id] = {"status": "error", "progress": 0, "message": str(exc)}
+        error_id = log_failure(exc, error_type=ERROR_RENDER, context={"project_id": project_id})
+        public_message = "成片导出失败，本次渲染已停止。请检查镜头素材、配音与输出设置后重试。"
+        # 渲染状态会经 GET /api/render/{id}/status 回显，只保留可读提示与错误编号。
+        _render_status[project_id] = {
+            "status": "error",
+            "progress": 0,
+            "message": f"{public_message}（错误编号 {error_id}）",
+        }
         db = SessionLocal()
         try:
             project = db.query(Project).filter(Project.id == project_id).first()
@@ -207,7 +235,10 @@ async def _render_task(project_id: str, output_format: str, resolution: str):
                 db.commit()
         finally:
             db.close()
-        await ws_manager.send_to_project(project_id, {"type": "error", "message": f"导出失败: {exc}\n{traceback.format_exc()}"})
+        await ws_manager.send_to_project(
+            project_id,
+            error_payload(error_type=ERROR_RENDER, message=public_message, error_id=error_id),
+        )
         # Do not swallow the error: automatic LangGraph callers must be able to
         # short-circuit instead of reaching END with a false success.
         raise
@@ -219,7 +250,7 @@ async def _render_task(project_id: str, output_format: str, resolution: str):
 
 async def _progress(project_id: str, step: str, progress: int, message: str):
     _render_status[project_id] = {"status": "rendering", "progress": progress, "message": message}
-    update_job_progress(f"project:{project_id}:render", progress)
+    update_job_progress(f"project:{project_id}:render", progress, current_step=step, message=message)
     await ws_manager.send_to_project(project_id, {"type": "progress", "step": step, "progress": progress, "message": message})
 
 
@@ -233,11 +264,30 @@ def _json_dict(raw: str | None) -> dict:
         return {}
 
 
+def _project_manifest_tuple(project) -> tuple | None:
+    if project is None:
+        return None
+    return (project.style, project.output_format, project.resolution, int(project.av_config_version or 0))
+
+
+def _manifest_matches(recorded: tuple | None, current: tuple | None) -> bool:
+    """比对项目配置 manifest；三段历史格式（无 av 版本）缺省按 0 处理。"""
+
+    if recorded is None or current is None:
+        return recorded is None and current is None
+    if len(recorded) == 3:
+        recorded = (*recorded, 0)
+    if len(current) == 3:
+        current = (*current, 0)
+    return recorded == current
+
+
 def _publish_render(
     project_id: str,
     staged_video: Path,
     manifest: dict[str, tuple],
     project_manifest: tuple | None,
+    av_manifest: list | None = None,
 ) -> str:
     """Atomically validate the render inputs and promote its staged output."""
 
@@ -250,10 +300,16 @@ def _publish_render(
             shot.id: (shot.version or 1, bool(shot.confirmed), shot.video_path or "", shot.audio_path or "")
             for shot in current
         }
-        current_project_manifest = (project.style, project.output_format, project.resolution) if project else None
-        if not project or current_manifest != manifest or current_project_manifest != project_manifest:
+        current_project_manifest = _project_manifest_tuple(project)
+        current_av_manifest = build_av_manifest(collect_render_config(db, project_id)) if av_manifest is not None else None
+        if (
+            not project
+            or current_manifest != manifest
+            or not _manifest_matches(project_manifest, current_project_manifest)
+            or (av_manifest is not None and current_av_manifest != av_manifest)
+        ):
             db.rollback()
-            raise asyncio.CancelledError("渲染期间镜头已发生变化")
+            raise asyncio.CancelledError("渲染期间镜头或字幕/音频配置已发生变化")
         final_path = settings.OUTPUT_DIR / "projects" / project_id / "output" / "final.mp4"
         final_path.parent.mkdir(parents=True, exist_ok=True)
         backup_path = final_path.with_name(f".final-{uuid.uuid4().hex}.previous")

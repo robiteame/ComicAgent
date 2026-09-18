@@ -10,10 +10,31 @@ import httpx
 
 from services.providers.base import BaseAdapter, ImageCapabilities, ImageRequest
 from services.providers.image_common import extract_image_bytes, read_bounded_response
+from services.providers.usage import CAPABILITY_IMAGE, UsageMetadata
 
 
 class ArkSeedreamImageAdapter(BaseAdapter):
     capabilities = ImageCapabilities(reference_images=True, requires_credentials=True)
+
+    def usage_for_request(
+        self,
+        capability: str,
+        request: ImageRequest | None = None,
+        *,
+        model: str = "",
+    ) -> UsageMetadata:
+        """方舟 Seedream 按张计费：一次请求出一张，分辨率取请求尺寸。"""
+
+        return UsageMetadata(
+            capability=CAPABILITY_IMAGE,
+            provider=self.endpoint.protocol,
+            model=model or self.endpoint.model,
+            images=1,
+            resolution=str(getattr(request, "size", "") or ""),
+            known=True,
+            billable=True,
+            source="request",
+        )
 
     async def generate(self, request: ImageRequest) -> bytes:
         errors: list[str] = []

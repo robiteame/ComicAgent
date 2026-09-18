@@ -9,8 +9,9 @@ from urllib.parse import unquote, urlparse
 
 from config import settings
 from db import SessionLocal
-from models import Character, SceneAsset, Shot
+from models import AudioTrack, Character, SceneAsset, Shot, ShotVersion
 from services.security import atomic_write_bytes, safe_path, validate_identifier
+from services.shot_version_service import iter_snapshot_media_paths
 
 
 class StorageQuotaExceeded(ValueError):
@@ -187,6 +188,15 @@ class StorageService:
             for row in session.query(*scene_json_columns).all():
                 for value in row:
                     self._add_json_references(protected, project_dir, value)
+
+            # 混音工作台上传的素材受保护：轨道行还在引用就不能被清理误删。
+            for (track_source,) in session.query(AudioTrack.source_path).all():
+                self._add_protected_path(protected, project_dir, track_source)
+
+            # 版本历史快照引用的媒体同样受保护：它们是「恢复历史版本」的唯一依据。
+            for (raw_snapshot,) in session.query(ShotVersion.snapshot).all():
+                for path in iter_snapshot_media_paths(raw_snapshot):
+                    self._add_protected_path(protected, project_dir, path)
             return protected
         except Exception:
             return None

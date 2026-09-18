@@ -1,5 +1,8 @@
-﻿import React from 'react'
+import React from 'react'
+import { UnorderedListOutlined } from '@ant-design/icons'
 import { useShotStore } from '../stores/shotStore'
+import { useTaskStore } from '../stores/taskStore'
+import { OPEN_TASK_CENTER_EVENT } from './TaskCenter'
 
 const stepLabels: Record<string, string> = {
   generate_script: '剧本生成',
@@ -17,6 +20,9 @@ const stepLabels: Record<string, string> = {
 
 const BottomBar: React.FC = () => {
   const { isGenerating, progress, shots, currentStep } = useShotStore()
+  const taskSummary = useTaskStore((state) => state.summary)
+  const connectionState = useTaskStore((state) => state.connectionState)
+  const openTaskCenter = () => window.dispatchEvent(new CustomEvent(OPEN_TASK_CENTER_EVENT))
 
   const totalDuration = shots.reduce((sum, item) => sum + item.duration, 0)
   const remaining = isGenerating ? Math.max(0, Math.round((100 - progress) * 1.2)) : 0
@@ -44,6 +50,23 @@ const BottomBar: React.FC = () => {
             ? `总时长 ${totalDuration.toFixed(1)} 秒`
             : '等待输入剧本'}
       </span>
+
+      <button
+        type="button"
+        className="bottom-task-trigger"
+        onClick={openTaskCenter}
+        aria-haspopup="dialog"
+        aria-label="打开后台任务中心"
+      >
+        <UnorderedListOutlined aria-hidden="true" />
+        <span>
+          后台任务 {taskSummary.activeCount} 进行中
+          {taskSummary.failedCount > 0 ? ' · ' + taskSummary.failedCount + ' 失败' : ''}
+        </span>
+        <em className={'bottom-task-link bottom-task-link-' + connectionState} aria-hidden="true">
+          {connectionState === 'open' ? '实时' : '兜底轮询'}
+        </em>
+      </button>
 
       <span>系统占用 {isGenerating ? '41%' : '0%'}</span>
     </footer>

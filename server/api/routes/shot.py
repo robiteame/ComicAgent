@@ -1,22 +1,41 @@
 import asyncio
 import hashlib
 import json
-import traceback
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from api import schemas
 from api.websocket import ws_manager
 from config import settings
 from db import SessionLocal, get_db
-from models import Character, Project, SceneAsset, Shot
+from models import Character, Project, SceneAsset, Shot, ShotVersion
 from services.audio_routing import resolve_audio_mode
 from services.consistency_service import ConsistencyService
+from services.error_reporter import (
+    ERROR_SHOT_VIDEO,
+    ERROR_STORYBOARD,
+    error_payload,
+    log_failure,
+    report_failure,
+)
 from services.image_service import ImageService
 from services.providers.base import Dialogue
 from services.reference_asset_service import ReferenceAssetService
+from services.shot_version_service import (
+    apply_snapshot_to_shot,
+    capture_current_snapshot,
+    content_hash,
+    create_version,
+    diff_snapshots,
+    list_versions,
+    missing_asset_bindings,
+    missing_media,
+    parse_snapshot,
+    version_detail,
+)
 from services.skill_config_service import (
     agent_style_id,
     apply_agent_config_to_shot,
@@ -28,7 +47,15 @@ from services.style_templates import style_prompt_params
 from services.tts_service import TTSService
 from services.video_service import SeedanceVideoService
 from services.security import existing_file, validate_identifier
-from services.task_registry import cancel as cancel_task, cancel_scopes, claim as claim_task, finish as finish_task, start as start_task
+from api.claim_guard import budget_notice, claim_or_block
+from services.task_registry import (
+    cancel as cancel_task,
+    cancel_scopes,
+    claim as claim_task,
+    finish as finish_task,
+    start as start_task,
+    update_progress as update_job_progress,
+)
 
 router = APIRouter(prefix="/api/shot", tags=["shot"])
 
@@ -44,36 +71,37 @@ _shot_generation_locks: dict[str, asyncio.Lock] = {}
 
 
 class ShotUpdate(BaseModel):
-    shot_type: str | None = None
-    scene_description: str | None = None
-    character_action: str | None = None
-    dialogue: str | None = None
-    camera_angle: str | None = None
-    camera_movement: str | None = None
-    duration: float | None = None
-    emotion: str | None = None
-    transition: str | None = None
-    visual_notes: str | None = None
-    scene_asset_id: str | None = None
-    character_asset_ids: list[str] | None = None
-    audio_mode: str | None = None  # 镜头级音频路径覆盖："tts" | "native" | "auto"，空串清除
+    shot_type: schemas.ShotType | None = None
+    scene_description: schemas.ShotText | None = None
+    character_action: schemas.ShotText | None = None
+    dialogue: schemas.ShotText | None = None
+    camera_angle: schemas.CameraAngle | None = None
+    camera_movement: schemas.CameraMovement | None = None
+    duration: schemas.ShotDuration | None = None
+    emotion: schemas.Emotion | None = None
+    transition: schemas.Transition | None = None
+    visual_notes: schemas.VisualNotes | None = None
+    scene_asset_id: schemas.OptionalIdentifier | None = None
+    character_asset_ids: schemas.CharacterAssetIdList | None = None
+    audio_mode: schemas.AudioModeOverride | None = None  # 镜头级音频路径覆盖："tts" | "native" | "auto"，空串清除
 
 
 class RegenerateRequest(BaseModel):
-    reason: str = ""
-    prompt: str | None = None
-    visual_notes: str | None = None
-    new_emotion: str | None = None
-    new_scene: str | None = None
-    new_camera_angle: str | None = None
-    shot_type: str | None = None
-    character_action: str | None = None
-    dialogue: str | None = None
-    duration: float | None = None
+    reason: schemas.ReasonText = ""
+    prompt: schemas.VisualNotes | None = None
+    visual_notes: schemas.VisualNotes | None = None
+    new_emotion: schemas.Emotion | None = None
+    new_scene: schemas.ShotText | None = None
+    new_camera_angle: schemas.CameraAngle | None = None
+    shot_type: schemas.ShotType | None = None
+    character_action: schemas.ShotText | None = None
+    dialogue: schemas.ShotText | None = None
+    duration: schemas.ShotDuration | None = None
+    force_confirmed: bool = False
 
 
 class StoryboardGenerateRequest(BaseModel):
-    shot_ids: list[str] = Field(default_factory=list)
+    shot_ids: schemas.ShotIdList = Field(default_factory=list)
 
 
 class StoryboardApprovalRequest(BaseModel):
@@ -82,6 +110,17 @@ class StoryboardApprovalRequest(BaseModel):
 
 class ShotVideoGenerateRequest(BaseModel):
     force: bool = False
+    # 重试 / 续跑时复用仍然有效的配音，避免重复执行已经成功完成的阶段。
+    # 前端不发送该字段，默认 False 保持既有行为不变。
+    reuse_audio: bool = False
+    # 仅供显式选择性队列使用：故事板 + 视频批次可以在同一批次内衔接，
+    # 不把“未人工审核”误认为普通视频入口的授权。
+    allow_unconfirmed: bool = False
+
+
+class ShotAudioGenerateRequest(BaseModel):
+    force: bool = False
+    reuse_existing: bool = False
 
 
 @router.get("/{shot_id}/generation-prompt")
@@ -149,6 +188,9 @@ async def update_shot(shot_id: str, data: ShotUpdate, db: Session = Depends(get_
             changed["scene_asset_id"] = scene_value
         if "character_asset_ids" in changed:
             changed["character_asset_ids"] = character_value
+    if changed:
+        # 被编辑替换的当前状态先进入版本历史（内容与最新记录一致时自动去重）。
+        create_version(db, shot, "manual_edit")
     for key, value in changed.items():
         if key == "character_asset_ids":
             setattr(shot, key, json.dumps(value or [], ensure_ascii=False))
@@ -165,7 +207,7 @@ async def update_shot(shot_id: str, data: ShotUpdate, db: Session = Depends(get_
 
     if changed:
         _invalidate_storyboard_outputs(shot)
-        _invalidate_downstream_media(db, shot, {previous_scene_key, _shot_scene_key(shot)})
+        _invalidate_downstream_media(db, shot, {previous_scene_key, _shot_scene_key(shot)}, source="manual_edit")
         shot.version = (shot.version or 1) + 1
         _mark_project_output_stale(db, project_id)
 
@@ -187,16 +229,24 @@ async def regenerate_shot(shot_id: str, data: RegenerateRequest, db: Session = D
     if not shot:
         raise HTTPException(status_code=404, detail="Shot not found")
 
-    _ensure_shot_unlocked(shot)
+    _ensure_shot_unlocked(shot, force=data.force_confirmed)
     task_key = _shot_task_key(shot_id, "storyboard")
     expected_version = (shot.version or 1) + 1
-    if not claim_task(task_key, f"shot:{shot_id}", version=expected_version):
+    claim = claim_or_block(
+        task_key,
+        f"shot:{shot_id}",
+        version=expected_version,
+        current_step="regenerate_storyboard",
+        message=f"正在重新生成镜头 {shot.sequence} 的故事板",
+    )
+    if not claim.claimed:
         return {"id": shot.id, "status": "regenerating", "version": shot.version, "deduplicated": True}
 
     try:
+        create_version(db, shot, "regenerate", task_id=task_key)
         previous_scene_key = _shot_scene_key(shot)
         _invalidate_storyboard_outputs(shot)
-        _invalidate_downstream_media(db, shot, {previous_scene_key, _shot_scene_key(shot)})
+        _invalidate_downstream_media(db, shot, {previous_scene_key, _shot_scene_key(shot)}, source="regenerate")
         shot.status = "pending"
         shot.storyboard_status = "queued"
         shot.version = (shot.version or 1) + 1
@@ -232,7 +282,7 @@ async def regenerate_shot(shot_id: str, data: RegenerateRequest, db: Session = D
 
 
 @router.post("/batch-regenerate")
-async def batch_regenerate(shot_ids: list[str], reason: str = "", db: Session = Depends(get_db)):
+async def batch_regenerate(shot_ids: schemas.ShotIdList, reason: schemas.ReasonText = "", db: Session = Depends(get_db)):
     shots = db.query(Shot).filter(Shot.id.in_(shot_ids)).all()
     missing = sorted(set(shot_ids) - {shot.id for shot in shots})
     if missing:
@@ -243,7 +293,9 @@ async def batch_regenerate(shot_ids: list[str], reason: str = "", db: Session = 
     claimed_keys: list[str] = []
     for shot in shots:
         task_key = _shot_task_key(shot.id, "storyboard")
-        if not claim_task(task_key, f"shot:{shot.id}", version=(shot.version or 1) + 1):
+        # 预算不足时 claim_or_block 直接抛 409（budget_exceeded），不需要回滚已占用的镜头。
+        claim = claim_or_block(task_key, f"shot:{shot.id}", version=(shot.version or 1) + 1)
+        if not claim.claimed:
             for claimed_key in claimed_keys:
                 finish_task(claimed_key, "cancelled", "batch claim rolled back")
             raise HTTPException(status_code=409, detail=f"镜头已有生成任务: {shot.id}")
@@ -251,9 +303,10 @@ async def batch_regenerate(shot_ids: list[str], reason: str = "", db: Session = 
     expected_versions: dict[str, int] = {}
     try:
         for shot in shots:
+            create_version(db, shot, "regenerate", task_id=_shot_task_key(shot.id, "storyboard"))
             previous_scene_key = _shot_scene_key(shot)
             _invalidate_storyboard_outputs(shot)
-            _invalidate_downstream_media(db, shot, {previous_scene_key, _shot_scene_key(shot)})
+            _invalidate_downstream_media(db, shot, {previous_scene_key, _shot_scene_key(shot)}, source="regenerate")
             shot.status = "pending"
             shot.storyboard_status = "queued"
             shot.version = (shot.version or 1) + 1
@@ -302,15 +355,22 @@ async def generate_storyboard_images(project_id: str, data: StoryboardGenerateRe
         raise HTTPException(status_code=404, detail="No shots available for storyboard generation")
 
     task_key = _project_task_key(project_id, "storyboard")
-    if not claim_task(task_key, f"project:{project_id}"):
+    claim = claim_or_block(
+        task_key,
+        f"project:{project_id}",
+        current_step="generate_storyboard_images",
+        message=f"已排队，准备生成 {len(shots)} 个镜头的定稿故事板",
+    )
+    if not claim.claimed:
         return {"status": "storyboard_generating", "project_id": project_id, "deduplicated": True}
 
     try:
         expected_versions: dict[str, int] = {}
         for shot in shots:
+            create_version(db, shot, "regenerate", task_id=task_key)
             previous_scene_key = _shot_scene_key(shot)
             _invalidate_storyboard_outputs(shot)
-            _invalidate_downstream_media(db, shot, {previous_scene_key, _shot_scene_key(shot)})
+            _invalidate_downstream_media(db, shot, {previous_scene_key, _shot_scene_key(shot)}, source="regenerate")
             shot.storyboard_status = "queued"
             shot.status = "pending"
             shot.version = (shot.version or 1) + 1
@@ -362,9 +422,11 @@ async def approve_storyboard(shot_id: str, data: StoryboardApprovalRequest, db: 
     shot.status = "storyboard_approved" if data.approved else "needs_review"
     revoked = was_approved and not data.approved
     if revoked:
+        # 撤销审核会清空视频产物：被替换的状态先进版本历史。
+        create_version(db, shot, "manual_edit")
         shot.version = (shot.version or 1) + 1
         _invalidate_video_outputs(shot)
-        _invalidate_downstream_media(db, shot)
+        _invalidate_downstream_media(db, shot, source="manual_edit")
         shot.status = "needs_review"
         _mark_project_output_stale(db, project_id, status="storyboard_ready")
     db.commit()
@@ -386,7 +448,7 @@ async def generate_shot_video(shot_id: str, data: ShotVideoGenerateRequest, db: 
     if not shot:
         raise HTTPException(status_code=404, detail="Shot not found")
     task_key = _shot_task_key(shot_id, "video")
-    if not shot.confirmed:
+    if not shot.confirmed and not data.allow_unconfirmed:
         raise HTTPException(status_code=400, detail="请先审核通过该镜头故事板")
     if not (shot.storyboard_path or shot.image_path):
         raise HTTPException(status_code=400, detail="该镜头尚未生成定稿故事板")
@@ -394,13 +456,22 @@ async def generate_shot_video(shot_id: str, data: ShotVideoGenerateRequest, db: 
         return {"id": shot.id, "status": shot.status, "video_path": shot.video_path, "audio_path": shot.audio_path}
 
     expected_version = shot.version or 1
-    if not claim_task(task_key, f"shot:{shot_id}", version=expected_version):
+    claim = claim_or_block(
+        task_key,
+        f"shot:{shot_id}",
+        version=expected_version,
+        current_step="generate_voice",
+        message=f"已排队，准备生成镜头 {shot.sequence} 的配音与视频",
+    )
+    if not claim.claimed:
         return {"id": shot.id, "status": "video_generating", "deduplicated": True}
     try:
+        # 视频重新生成前保存当前状态（含旧视频/配音路径），供 A/B 对比与回滚。
+        create_version(db, shot, "regenerate", task_id=task_key)
         shot.status = "video_generating"
         _mark_project_output_stale(db, shot.project_id, status="storyboard_approved")
         db.commit()
-        task = start_task(task_key, _run_single_shot_video(shot_id, data.force, expected_version))
+        task = start_task(task_key, _run_single_shot_video(shot_id, data.force, expected_version, data.reuse_audio))
     except BaseException as exc:
         db.rollback()
         finish_task(task_key, "failed", f"video scheduling failed: {exc}")
@@ -408,6 +479,161 @@ async def generate_shot_video(shot_id: str, data: ShotVideoGenerateRequest, db: 
     _shot_video_tasks.add(task)
     task.add_done_callback(_shot_video_tasks.discard)
     return {"id": shot.id, "status": "video_generating"}
+
+
+@router.post("/{shot_id}/generate-audio")
+async def generate_shot_audio(shot_id: str, data: ShotAudioGenerateRequest, db: Session = Depends(get_db)):
+    """只生成镜头配音；独立于视频阶段，供选择性重生成队列使用。"""
+    shot = db.query(Shot).filter(Shot.id == shot_id).first()
+    if not shot:
+        raise HTTPException(status_code=404, detail="Shot not found")
+    if shot.confirmed and not data.force:
+        raise HTTPException(status_code=423, detail="已审核锁定的镜头禁止重新生成配音")
+    if not (shot.dialogue or "").strip():
+        return {"id": shot.id, "status": shot.status, "audio_path": shot.audio_path, "skipped": True}
+    task_key = _shot_task_key(shot_id, "audio")
+    expected_version = shot.version or 1
+    if data.reuse_existing and _reusable_audio_path(shot_id, expected_version, shot.audio_path):
+        return {"id": shot.id, "status": shot.status, "audio_path": shot.audio_path, "skipped": True}
+    claim = claim_or_block(
+        task_key,
+        f"shot:{shot_id}",
+        version=expected_version,
+        current_step="generate_voice",
+        message=f"已排队，准备生成镜头 {shot.sequence} 的配音",
+    )
+    if not claim.claimed:
+        return {"id": shot.id, "status": "audio_generating", "deduplicated": True}
+    create_version(db, shot, "regenerate", task_id=task_key)
+    shot.status = "audio_generating"
+    _mark_project_output_stale(db, shot.project_id, status="storyboard_approved" if shot.confirmed else "storyboard_ready")
+    db.commit()
+    task = start_task(task_key, _run_single_shot_audio(shot_id, expected_version))
+    _regeneration_tasks.add(task)
+    task.add_done_callback(_regeneration_tasks.discard)
+    return {"id": shot.id, "status": "audio_generating"}
+
+
+@router.get("/{shot_id}/versions")
+async def list_shot_versions(shot_id: str, db: Session = Depends(get_db)):
+    """镜头版本时间线（新版本在前）。``current_version_id`` 标记与当前状态一致的记录。"""
+
+    _validate_id_or_400(shot_id, "镜头 ID")
+    shot = db.query(Shot).filter(Shot.id == shot_id).first()
+    if not shot:
+        raise HTTPException(status_code=404, detail="Shot not found")
+    versions = list_versions(db, shot_id)
+    current_hash = content_hash(capture_current_snapshot(db, shot))
+    return {
+        "shot_id": shot_id,
+        "versions": versions,
+        "current_version_id": next((item["id"] for item in versions if item["content_hash"] == current_hash), None),
+    }
+
+
+@router.get("/{shot_id}/versions/compare")
+async def compare_shot_versions(
+    shot_id: str,
+    a: str = Query(...),
+    b: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    """A/B 对比两个版本：返回双方完整快照与逐字段差异，只读、不改变当前状态。"""
+
+    _validate_id_or_400(shot_id, "镜头 ID")
+    _validate_id_or_400(a, "版本 ID")
+    _validate_id_or_400(b, "版本 ID")
+    if not db.query(Shot).filter(Shot.id == shot_id).first():
+        raise HTTPException(status_code=404, detail="Shot not found")
+    if a == b:
+        raise HTTPException(status_code=400, detail="对比的两个版本不能相同")
+    row_a = db.query(ShotVersion).filter(ShotVersion.id == a, ShotVersion.shot_id == shot_id).first()
+    row_b = db.query(ShotVersion).filter(ShotVersion.id == b, ShotVersion.shot_id == shot_id).first()
+    if not row_a or not row_b:
+        raise HTTPException(status_code=404, detail="Version not found")
+    diff = diff_snapshots(parse_snapshot(row_a), parse_snapshot(row_b))
+    return {
+        "shot_id": shot_id,
+        "a": version_detail(row_a),
+        "b": version_detail(row_b),
+        "diff": diff,
+        "changed_fields": [item["field"] for item in diff if item["changed"]],
+    }
+
+
+@router.get("/{shot_id}/versions/{version_id}")
+async def get_shot_version(shot_id: str, version_id: str, db: Session = Depends(get_db)):
+    """版本详情：元数据 + 完整字段快照。"""
+
+    _validate_id_or_400(shot_id, "镜头 ID")
+    _validate_id_or_400(version_id, "版本 ID")
+    if not db.query(Shot).filter(Shot.id == shot_id).first():
+        raise HTTPException(status_code=404, detail="Shot not found")
+    row = db.query(ShotVersion).filter(ShotVersion.id == version_id, ShotVersion.shot_id == shot_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Version not found")
+    return version_detail(row)
+
+
+@router.post("/{shot_id}/versions/{version_id}/restore")
+async def restore_shot_version(shot_id: str, version_id: str, db: Session = Depends(get_db)):
+    """把历史版本恢复为当前版本。
+
+    恢复只追加：先保存被替换的当前状态，再按快照写回镜头并追加「恢复后」的
+    新版本记录；历史记录不改写。恢复前校验快照引用的媒体与资产仍然有效，
+    缺失时返回 409 与明确原因。已审核锁定的镜头禁止恢复。
+    """
+
+    _validate_id_or_400(shot_id, "镜头 ID")
+    _validate_id_or_400(version_id, "版本 ID")
+    shot = db.query(Shot).filter(Shot.id == shot_id).first()
+    if not shot:
+        raise HTTPException(status_code=404, detail="Shot not found")
+    _ensure_shot_unlocked(shot)
+    row = db.query(ShotVersion).filter(ShotVersion.id == version_id, ShotVersion.shot_id == shot_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Version not found")
+    snapshot = parse_snapshot(row)
+
+    missing_files = missing_media(snapshot)
+    if missing_files:
+        raise HTTPException(
+            status_code=409,
+            detail="版本引用的媒体文件已缺失，无法恢复: " + ", ".join(missing_files),
+        )
+    missing_assets = missing_asset_bindings(db, shot, snapshot)
+    if missing_assets:
+        raise HTTPException(
+            status_code=409,
+            detail="版本绑定的资产已不存在，无法恢复: " + ", ".join(missing_assets),
+        )
+
+    project_id = shot.project_id
+    create_version(db, shot, "restore")
+    apply_snapshot_to_shot(shot, snapshot)
+    shot.version = (shot.version or 1) + 1
+    _mark_project_output_stale(db, project_id)
+    # 恢复必须留下新版本记录（内容与被恢复版本一致，来源标记为 restore）。
+    restored_row = create_version(db, shot, "restore", force=True)
+    db.commit()
+
+    # 版本号已递增 + 作用域取消双保险：在途任务既过不了版本校验，也被等待退出，
+    # 不会把恢复后的镜头再覆盖掉。
+    await cancel_scopes(
+        {f"shot:{shot_id}", f"project:{project_id}"},
+        "shot version was restored",
+    )
+    payload = _shot_update_payload(shot)
+    payload["restored_from_version_id"] = row.id
+    await ws_manager.send_to_project(project_id, payload)
+    return {
+        "id": shot.id,
+        "status": "updated",
+        "version": shot.version,
+        "restored_from_version_id": row.id,
+        "new_version_id": restored_row.id if restored_row is not None else None,
+        "shot": _serialize_shot(shot),
+    }
 
 
 async def _run_storyboard_generation(
@@ -487,7 +713,13 @@ async def _run_storyboard_generation_impl(
             finally:
                 db.close()
 
-            await _progress(project_id, "generate_storyboard_images", 48 + min(index * 4, 35), "正在生成定稿故事板参考图")
+            await _progress(
+                project_id,
+                "generate_storyboard_images",
+                48 + min(index * 4, 35),
+                f"正在生成镜头 {shot.sequence} 的定稿故事板参考图",
+                job_keys=(f"project:{project_id}:storyboard", f"shot:{shot_id}:storyboard"),
+            )
             _materialize_control_references(project_id, shot_data, skill_config)
             image_path = await image_service.generate_shot_image(
                 shot=shot_data,
@@ -513,6 +745,8 @@ async def _run_storyboard_generation_impl(
                 shot.storyboard_path = image_path
                 shot.storyboard_status = "done"
                 shot.status = "storyboard_done"
+                # 生成结果同样入版本历史（与版本校验同事务，过期任务写不进来）。
+                create_version(db, shot, "regenerate", task_id=f"project:{project_id}:storyboard")
                 db.commit()
                 update = _shot_update_payload(shot)
             finally:
@@ -549,7 +783,13 @@ async def _run_storyboard_generation_impl(
                 db.commit()
         finally:
             db.close()
-        await _progress(project_id, "wait_storyboard_approval", 72, "定稿故事板参考图已生成，等待人工审核")
+        await _progress(
+            project_id,
+            "wait_storyboard_approval",
+            72,
+            "定稿故事板参考图已生成，等待人工审核",
+            job_keys=(f"project:{project_id}:storyboard",),
+        )
         await ws_manager.send_to_project(project_id, {"type": "storyboard_ready", "project_id": project_id})
     except Exception as exc:
         db = SessionLocal()
@@ -565,7 +805,15 @@ async def _run_storyboard_generation_impl(
             db.commit()
         finally:
             db.close()
-        await ws_manager.send_to_project(project_id, {"type": "error", "message": f"故事板生成失败: {exc}\n{traceback.format_exc()}"})
+        await ws_manager.send_to_project(
+            project_id,
+            report_failure(
+                exc,
+                error_type=ERROR_STORYBOARD,
+                message="定稿故事板生成失败，本次任务已停止。请检查镜头参数与模型配置后重试。",
+                context={"project_id": project_id},
+            ),
+        )
         raise
 
 
@@ -618,6 +866,12 @@ async def _regenerate_single_shot(shot_id: str, reason: str = "", expected_versi
         finally:
             db.close()
 
+        update_job_progress(
+            f"shot:{shot_id}:storyboard",
+            55,
+            current_step="regenerate_storyboard",
+            message="正在重新生成镜头故事板参考图",
+        )
         _materialize_control_references(project_id, shot_data, skill_config)
         image_path = await image_service.generate_shot_image(
             shot=shot_data,
@@ -643,37 +897,96 @@ async def _regenerate_single_shot(shot_id: str, reason: str = "", expected_versi
             shot.storyboard_path = image_path
             shot.storyboard_status = "done"
             shot.status = "storyboard_done"
+            create_version(db, shot, "regenerate", task_id=f"shot:{shot_id}:storyboard")
             db.commit()
             update = _shot_update_payload(shot)
         finally:
             db.close()
         await ws_manager.send_to_project(project_id, update)
     except Exception as exc:
+        error_id = log_failure(exc, error_type=ERROR_STORYBOARD, context={"shot_id": shot_id})
         db = SessionLocal()
         try:
             shot = db.query(Shot).filter(Shot.id == shot_id).first()
             if shot and (expected_version is None or (shot.version or 1) == expected_version):
                 shot.status = "failed"
                 shot.storyboard_status = "failed"
-                shot.visual_notes = f"重新生成故事板失败: {exc}"
+                # 落库的失败备注会回显到界面，只保留简短提示与错误编号。
+                shot.visual_notes = f"重新生成故事板失败（错误编号 {error_id}）"
                 project_id = shot.project_id
-                error_message = shot.visual_notes
+                should_notify = True
                 db.commit()
             else:
-                error_message = ""
+                should_notify = False
         finally:
             db.close()
-        if error_message:
-            await ws_manager.send_to_project(project_id, {"type": "error", "message": error_message})
+        if should_notify:
+            await ws_manager.send_to_project(
+                project_id,
+                error_payload(
+                    error_type=ERROR_STORYBOARD,
+                    message="镜头故事板重新生成失败。请检查镜头参数、素材绑定与模型配置后重试。",
+                    error_id=error_id,
+                ),
+            )
         raise
     finally:
         lock.release()
+
+
+async def _run_single_shot_audio(shot_id: str, expected_version: int) -> None:
+    """配音阶段的最小独立 worker；写入前再次校验版本，避免取消后的迟到发布。"""
+    project_id = ""
+    try:
+        db = SessionLocal()
+        try:
+            shot = db.query(Shot).filter(Shot.id == shot_id).first()
+            if not shot or (shot.version or 1) != expected_version:
+                raise asyncio.CancelledError("镜头版本已变化")
+            project_id = shot.project_id
+            dialogue = clean_tts_text(shot.dialogue or "", resolve_skill_config(project_id, db))
+            speaker = (_json_list(shot.characters_in_scene) or [""])[0]
+            characters = _characters(db, project_id)
+            voice_id = next((item.get("voice_id", "") for item in characters if item.get("name") == speaker), "")
+            emotion = shot.emotion or "neutral"
+        finally:
+            db.close()
+        audio_path = await tts_service.generate_dialogue(
+            text=dialogue,
+            voice_id=voice_id,
+            emotion=emotion,
+            project_id=project_id,
+            shot_id=_versioned_media_id(shot_id, expected_version),
+        )
+        db = SessionLocal()
+        try:
+            shot = db.query(Shot).filter(Shot.id == shot_id).first()
+            if not shot or (shot.version or 1) != expected_version:
+                raise asyncio.CancelledError("镜头版本已变化")
+            shot.audio_path = audio_path
+            shot.status = "video_done" if shot.video_path else ("storyboard_approved" if shot.confirmed else "storyboard_done")
+            create_version(db, shot, "regenerate", task_id=f"shot:{shot_id}:audio")
+            db.commit()
+            await ws_manager.send_to_project(project_id, _shot_update_payload(shot))
+        finally:
+            db.close()
+    except Exception as exc:
+        db = SessionLocal()
+        try:
+            shot = db.query(Shot).filter(Shot.id == shot_id).first()
+            if shot and (shot.version or 1) == expected_version:
+                shot.status = "failed"
+                db.commit()
+        finally:
+            db.close()
+        raise exc
 
 
 async def _run_single_shot_video(
     shot_id: str,
     force: bool = False,
     expected_version: int | None = None,
+    reuse_audio: bool = False,
 ) -> None:
     lock = _shot_generation_locks.setdefault(shot_id, asyncio.Lock())
     if lock.locked():
@@ -741,7 +1054,13 @@ async def _run_single_shot_video(
             db.close()
         _materialize_control_references(project_id, shot_data, skill_config)
 
-        await _progress(project_id, "generate_voice", 82, f"正在准备镜头 {shot_sequence} 的音频（音频路由决策中）")
+        await _progress(
+            project_id,
+            "generate_voice",
+            82,
+            f"正在准备镜头 {shot_sequence} 的音频（音频路由决策中）",
+            job_keys=(f"shot:{shot_id}:video",),
+        )
         media_id = _versioned_media_id(shot_id, expected_version)
         audio_path = shot_data.get("audio_path", "")
         audio_mode = resolve_audio_mode(shot_data)
@@ -757,18 +1076,43 @@ async def _run_single_shot_video(
                     Dialogue(role=speaker, text=clean_tts_text(dialogue, skill_config), emotion=emotion)
                 ]
         elif dialogue:
-            await _progress(project_id, "generate_voice", 84, f"正在生成镜头 {shot_sequence} 的配音")
-            voice_id = next((item.get("voice_id", "") for item in characters if item.get("name") == speaker), "")
-            audio_path = await tts_service.generate_dialogue(
-                text=clean_tts_text(dialogue, skill_config),
-                voice_id=voice_id,
-                emotion=emotion,
-                project_id=project_id,
-                shot_id=media_id,
-            )
-            shot_data["audio_path"] = audio_path
+            reusable_audio = _reusable_audio_path(shot_id, expected_version, audio_path) if reuse_audio else ""
+            if reusable_audio:
+                # 续跑 / 重试：该版本已经有有效配音，不再重复调用 TTS。
+                audio_path = reusable_audio
+                shot_data["audio_path"] = audio_path
+                await _progress(
+                    project_id,
+                    "generate_voice",
+                    84,
+                    f"镜头 {shot_sequence} 已有有效配音，复用后继续生成视频",
+                    job_keys=(f"shot:{shot_id}:video",),
+                )
+            else:
+                await _progress(
+                    project_id,
+                    "generate_voice",
+                    84,
+                    f"正在生成镜头 {shot_sequence} 的配音",
+                    job_keys=(f"shot:{shot_id}:video",),
+                )
+                voice_id = next((item.get("voice_id", "") for item in characters if item.get("name") == speaker), "")
+                audio_path = await tts_service.generate_dialogue(
+                    text=clean_tts_text(dialogue, skill_config),
+                    voice_id=voice_id,
+                    emotion=emotion,
+                    project_id=project_id,
+                    shot_id=media_id,
+                )
+                shot_data["audio_path"] = audio_path
 
-        await _progress(project_id, "generate_seedance_video", 90, f"正在生成镜头 {shot_sequence} 的视频")
+        await _progress(
+            project_id,
+            "generate_seedance_video",
+            90,
+            f"正在生成镜头 {shot_sequence} 的视频",
+            job_keys=(f"shot:{shot_id}:video",),
+        )
         video_shot_data = {**shot_data, "shot_id": media_id, "dialogues": dialogues}
         result = await seedance_service.generate_shot_video(video_shot_data, characters, scenes, project_id)
         if native_routed and not result.get("native_audio"):
@@ -804,6 +1148,7 @@ async def _run_single_shot_video(
             if not shot.image_path:
                 shot.image_path = result.get("frame_path", "")
             shot.status = "video_done"
+            create_version(db, shot, "regenerate", task_id=f"shot:{shot_id}:video")
             db.commit()
             update = _shot_update_payload(shot)
         finally:
@@ -811,12 +1156,13 @@ async def _run_single_shot_video(
 
         await ws_manager.send_to_project(project_id, update)
     except Exception as exc:
+        error_id = log_failure(exc, error_type=ERROR_SHOT_VIDEO, context={"shot_id": shot_id})
         db = SessionLocal()
         try:
             shot = db.query(Shot).filter(Shot.id == shot_id).first()
             if shot and (expected_version is None or (shot.version or 1) == expected_version):
                 shot.status = "failed"
-                shot.visual_notes = f"单镜头视频生成失败: {exc}"
+                shot.visual_notes = f"单镜头视频生成失败（错误编号 {error_id}）"
                 project_id = shot.project_id
                 shot_sequence = shot.sequence
                 db.commit()
@@ -828,7 +1174,11 @@ async def _run_single_shot_video(
         if should_notify:
             await ws_manager.send_to_project(
                 project_id,
-                {"type": "error", "message": f"镜头 {shot_sequence} 视频生成失败: {exc}\n{traceback.format_exc()}"},
+                error_payload(
+                    error_type=ERROR_SHOT_VIDEO,
+                    message=f"镜头 {shot_sequence} 视频生成失败。请检查该镜头的故事板、配音与视频模型配置后重试。",
+                    error_id=error_id,
+                ),
             )
         raise
     finally:
@@ -1028,8 +1378,8 @@ def _json_dict(raw: str | None) -> dict:
         return {}
 
 
-def _ensure_shot_unlocked(shot: Shot) -> None:
-    if shot.confirmed:
+def _ensure_shot_unlocked(shot: Shot, *, force: bool = False) -> None:
+    if shot.confirmed and not force:
         raise HTTPException(status_code=423, detail="已审核锁定的镜头禁止修改或重新生成")
 
 
@@ -1043,6 +1393,24 @@ def _invalidate_storyboard_outputs(shot: Shot) -> None:
     shot.reference_weights = "{}"
     shot.consistency_context = ""
     _invalidate_video_outputs(shot, reset_status=False)
+
+
+def _reusable_audio_path(shot_id: str, version: int | None, audio_path: str | None) -> str:
+    """已经生成且仍然对应当前镜头版本的有效配音路径；否则返回空串。
+
+    只认文件名与 ``_versioned_media_id`` 完全一致的产物，避免复用旧版本配音。
+    """
+
+    if not audio_path:
+        return ""
+    if Path(audio_path).stem != _versioned_media_id(shot_id, version):
+        return ""
+    resolved = existing_file(
+        audio_path,
+        minimum_size=1024,
+        allowed_roots=(settings.OUTPUT_DIR, settings.ASSETS_DIR, settings.DATA_DIR),
+    )
+    return str(resolved) if resolved is not None else ""
 
 
 def _can_reuse_existing_video(shot: Shot, force: bool = False) -> bool:
@@ -1077,7 +1445,12 @@ def _invalidate_video_outputs(shot: Shot, reset_status: bool = True) -> None:
         shot.status = "pending"
 
 
-def _invalidate_downstream_media(db: Session, shot: Shot, scene_keys: set[str] | None = None) -> None:
+def _invalidate_downstream_media(
+    db: Session,
+    shot: Shot,
+    scene_keys: set[str] | None = None,
+    source: str = "manual_edit",
+) -> None:
     keys = {key for key in (scene_keys or {_shot_scene_key(shot)}) if key}
     if not keys:
         return
@@ -1089,6 +1462,18 @@ def _invalidate_downstream_media(db: Session, shot: Shot, scene_keys: set[str] |
     )
     for item in downstream:
         if _shot_scene_key(item) in keys:
+            # 下游镜头的视频/续帧产物会被清空：清理前先进版本历史。
+            if any(
+                (
+                    item.audio_path,
+                    item.video_path,
+                    item.last_frame_path,
+                    item.continuity_reference_path,
+                    item.pose_reference_path,
+                    item.depth_reference_path,
+                )
+            ):
+                create_version(db, item, source)
             _invalidate_video_outputs(item)
             # Fence an in-flight video worker for this downstream shot. The
             # project-scope cancellation performed by callers then waits for it
@@ -1253,5 +1638,13 @@ def _previous_reference_for_shot(db: Session, shot: Shot, prefer_last_frame: boo
     return ""
 
 
-async def _progress(project_id: str, step: str, progress: int, message: str):
+async def _progress(project_id: str, step: str, progress: int, message: str, *, job_keys: tuple[str, ...] = ()):
+    """推送项目进度，并把同一份进度写进任务中心的 durable 记录。
+
+    ``job_keys`` 传候选键即可：只有真正持有当前 run token 的那个会写入成功，其余
+    会被 task_registry 静默忽略，因此旧尝试的迟到回调不会覆盖新尝试。
+    """
+
+    for key in job_keys:
+        update_job_progress(key, progress, current_step=step, message=message)
     await ws_manager.send_to_project(project_id, {"type": "progress", "step": step, "progress": progress, "message": message})

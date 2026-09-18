@@ -1,6 +1,8 @@
 import json
 
+from agent.output_schemas import LLMOutputError, ShotOutput, parse_storyboard_output
 from agent.state import AgentState
+from config import settings
 from services.llm_service import LLMService
 
 llm_service = LLMService()
@@ -29,10 +31,18 @@ async def run(state: AgentState) -> dict:
     except Exception as exc:
         raise RuntimeError(f"Mimo 分镜生成失败: {exc}") from exc
 
-    raw_shots = result if isinstance(result, list) else (result or {}).get("shots", [])
-    if not raw_shots:
+    # 模型可能返回 {"shots": [...]} 或直接返回数组；两种情况都经过强 schema 校验，
+    # 非法枚举/负时长/超长数组在这里被归一化或丢弃，不会冒泡成未捕获异常。
+    try:
+        parsed = parse_storyboard_output(result)
+    except LLMOutputError as exc:
+        raise RuntimeError(f"Mimo 分镜生成结果无法使用: {exc}") from exc
+    if not parsed.shots:
         raise RuntimeError("Mimo 分镜生成结果缺少 shots")
-    shots = _normalize_shots(raw_shots, state)
+
+    shots = _build_shots(parsed.shots, state)
+    if not shots:
+        raise RuntimeError("Mimo 分镜生成结果缺少可用镜头")
 
     return {
         "shots": shots,
@@ -40,86 +50,41 @@ async def run(state: AgentState) -> dict:
     }
 
 
-def _normalize_shots(raw_shots: list, state: AgentState) -> list[dict]:
+def _build_shots(items: list[ShotOutput], state: AgentState) -> list[dict]:
+    """把已校验的镜头输出补全为可落库的分镜（shot_id、seed、默认角色）。"""
+
     project_id = state["project_id"]
     characters = state.get("characters", [])
     default_character = characters[0]["name"] if characters else "主角"
     scenes = state.get("script_scenes", [])
-    source = raw_shots if raw_shots else _fallback_shots(scenes, default_character)
 
     shots: list[dict] = []
-    for i, item in enumerate(source[:12]):
-        dialogue = item.get("dialogue", "")
-        if isinstance(dialogue, list):
-            dialogue = dialogue[0].get("line", "") if dialogue else ""
-        characters_in_scene = item.get("characters_in_scene") or [default_character]
+    for index, item in enumerate(items[: settings.LLM_MAX_SHOTS]):
+        scene_number = item.scene_number or item.source_scene_number or min(index + 1, max(len(scenes), 1))
         shots.append(
             {
-                "shot_id": item.get("shot_id") or f"{project_id}_shot_{i + 1:04d}",
-                "scene_number": int(item.get("scene_number") or item.get("source_scene_number") or min(i + 1, max(len(scenes), 1))),
-                "shot_type": item.get("shot_type") or item.get("camera_suggestion") or "medium",
-                "scene_description": item.get("scene_description") or item.get("actions") or "角色推进剧情",
-                "characters_in_scene": characters_in_scene,
-                "character_action": item.get("character_action") or item.get("actions") or "",
-                "dialogue": dialogue,
-                "camera_angle": _normalize_camera_angle(item.get("camera_angle", "正面")),
-                "camera_movement": item.get("camera_movement", "静止"),
-                "emotion": item.get("emotion", "neutral"),
-                "duration": float(item.get("duration") or 3.0),
-                "transition": item.get("transition", "cut"),
-                "image_path": item.get("image_path", ""),
-                "audio_path": item.get("audio_path", ""),
-                "status": item.get("status", "pending"),
-                "confirmed": bool(item.get("confirmed", False)),
-                "version": int(item.get("version", 1)),
-                "seed": int(item.get("seed", 42 + i)),
-                "visual_notes": item.get("visual_notes", ""),
+                "shot_id": item.shot_id or f"{project_id}_shot_{index + 1:04d}",
+                "scene_number": scene_number,
+                "shot_type": item.shot_type,
+                "scene_description": item.scene_description or "角色推进剧情",
+                "characters_in_scene": item.characters_in_scene or [default_character],
+                "character_action": item.character_action,
+                "dialogue": item.dialogue,
+                "camera_angle": item.camera_angle,
+                "camera_movement": item.camera_movement,
+                "emotion": item.emotion,
+                "duration": item.duration,
+                "transition": item.transition,
+                "image_path": item.image_path,
+                "audio_path": item.audio_path,
+                "status": item.status,
+                "confirmed": item.confirmed,
+                "version": item.version,
+                "seed": item.seed if item.seed is not None else 42 + index,
+                "visual_notes": item.visual_notes,
             }
         )
     return shots
-
-
-def _fallback_shots(scenes: list[dict], default_character: str) -> list[dict]:
-    if not scenes:
-        scenes = [{"actions": "主角站在窗边，故事开始", "emotion": "neutral", "dialogue": []}]
-
-    shots: list[dict] = []
-    shot_types = ["wide", "medium", "close-up"]
-    for index, scene in enumerate(scenes[:5]):
-        dialogue = scene.get("dialogue") or []
-        line = dialogue[0].get("line", "") if isinstance(dialogue, list) and dialogue else ""
-        shots.append(
-            {
-                "scene_number": int(scene.get("scene_number") or index + 1),
-                "shot_type": shot_types[index % len(shot_types)],
-                "scene_description": scene.get("actions") or scene.get("description") or "故事场景中的关键瞬间",
-                "characters_in_scene": scene.get("characters_in_scene") or [default_character],
-                "character_action": scene.get("actions", ""),
-                "dialogue": line,
-                "camera_angle": "正面",
-                "camera_movement": "缓慢推进" if index % 2 else "静止",
-                "emotion": scene.get("emotion", "neutral"),
-                "duration": 3.0 + (index % 2),
-                "transition": "cut",
-                "visual_notes": "本地降级生成，可在右侧继续细化",
-            }
-        )
-    return shots
-
-
-def _normalize_camera_angle(value: str) -> str:
-    aliases = {
-        "front": "正面",
-        "side": "侧面",
-        "overhead": "俯视",
-        "high": "俯视",
-        "low": "仰视",
-        "正面": "正面",
-        "侧面": "侧面",
-        "俯视": "俯视",
-        "仰视": "仰视",
-    }
-    return aliases.get(value, "正面")
 
 
 def _load_system_prompt() -> str:

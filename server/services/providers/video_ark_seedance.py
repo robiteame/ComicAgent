@@ -14,6 +14,7 @@ import httpx
 
 from config import settings
 from services.providers.base import BaseAdapter, VideoCapabilities, VideoRequest, VideoResult
+from services.providers.usage import CAPABILITY_VIDEO, UsageMetadata
 from services.security import (
     UploadLimitExceeded,
     atomic_write_bytes,
@@ -35,6 +36,27 @@ class ArkSeedanceVideoAdapter(BaseAdapter):
     def __init__(self, endpoint):
         super().__init__(endpoint)
         self.storage = StorageService()
+
+    def usage_for_request(
+        self,
+        capability: str,
+        request: VideoRequest | None = None,
+        *,
+        model: str = "",
+    ) -> UsageMetadata:
+        """Seedance 按秒计费：时长取请求里的有效时长（已按协议固定时长归一化）。"""
+
+        return UsageMetadata(
+            capability=CAPABILITY_VIDEO,
+            provider=self.endpoint.protocol,
+            model=model or self.endpoint.model,
+            seconds=float(getattr(request, "duration", 0) or 0),
+            resolution=str(getattr(request, "resolution", "") or ""),
+            known=True,
+            billable=True,
+            source="request",
+            extra={"ratio": str(getattr(request, "ratio", "") or "")},
+        )
 
     async def generate(self, request: VideoRequest) -> VideoResult:
         content: list[dict] = [{"type": "text", "text": request.prompt}]
