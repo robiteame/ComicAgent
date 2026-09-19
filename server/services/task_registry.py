@@ -76,6 +76,19 @@ _task_tokens: dict[asyncio.Task, str] = {}
 _claim_scopes: dict[str, usage_service.UsageScope] = {}
 
 
+def unique_archived_key(db, key: str, attempt: int, *, exclude_id: str | None = None) -> str:
+    """Return an unused historical key, preserving the normal attempt suffix."""
+    candidate_attempt = max(1, int(attempt or 1))
+    while True:
+        candidate = archived_key(key, candidate_attempt)
+        query = db.query(BackgroundJob.id).filter(BackgroundJob.idempotency_key == candidate)
+        if exclude_id is not None:
+            query = query.filter(BackgroundJob.id != exclude_id)
+        if query.first() is None:
+            return candidate
+        candidate_attempt += 1
+
+
 @dataclass(frozen=True)
 class ScopeCancellation:
     cancelled_jobs: int
@@ -271,7 +284,9 @@ def _claim_row(
             # 记录看起来刚刚发生过（并顶到按 updated_at 排序的列表最前面）。
             db.query(BackgroundJob).filter(BackgroundJob.id == existing.id).update(
                 {
-                    BackgroundJob.idempotency_key: archived_key(existing.idempotency_key, int(existing.attempt or 1)),
+                    BackgroundJob.idempotency_key: unique_archived_key(
+                        db, existing.idempotency_key, int(existing.attempt or 1), exclude_id=existing.id
+                    ),
                     BackgroundJob.updated_at: existing.updated_at,
                 },
                 synchronize_session=False,

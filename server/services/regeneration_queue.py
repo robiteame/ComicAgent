@@ -30,7 +30,7 @@ from services.job_types import (
     parse_job_key,
 )
 from services.security import existing_file
-from services.task_registry import cancel as cancel_task
+from services.task_registry import cancel as cancel_task, unique_archived_key
 
 STAGE_STORYBOARD = "storyboard"
 STAGE_AUDIO = "audio"
@@ -84,14 +84,12 @@ def _active_or_queued(db: Session, key: str) -> BackgroundJob | None:
 
 def _archive_terminal_key(db: Session, key: str) -> None:
     """释放规范幂等键，同时保留旧尝试记录。"""
-    from services.job_types import archived_key
-
     old = db.query(BackgroundJob).filter(BackgroundJob.idempotency_key == key).first()
     if old is None:
         return
     if old.status in ACTIVE_STATUSES:
         return
-    old.idempotency_key = archived_key(key, int(old.attempt or 1))
+    old.idempotency_key = unique_archived_key(db, key, int(old.attempt or 1), exclude_id=old.id)
     db.flush()
 
 

@@ -371,7 +371,6 @@ def _mapping(limit: int, value_limit: int, *, fallback_key: str = "summary"):
     """对象字段：只保留标量键值，限制键数量与单值长度。"""
 
     def validate(value: Any, info: ValidationInfo) -> dict[str, str]:
-        del info
         if value in (None, ""):
             return {}
         if isinstance(value, str):
@@ -490,6 +489,7 @@ def parse_script_output(payload: Any, *, fallback_style: str = "anime") -> Scrip
 
     if not isinstance(payload, dict):
         raise LLMOutputError("剧本解析结果必须是 JSON 对象")
+    payload = _normalize_script_aliases(payload)
     scenes = payload.get("script_scenes")
     if scenes in (None, ""):
         scenes = payload.get("scenes")
@@ -507,6 +507,46 @@ def parse_script_output(payload: Any, *, fallback_style: str = "anime") -> Scrip
         raise LLMOutputError("剧本解析结果结构无法解析", issues=[describe_error(exc)]) from exc
     output.style_suggestion = normalize_style_suggestion(output.style_suggestion, fallback_style)
     return output
+
+
+_CHARACTER_NAME_KEYS = ("name", "character_name", "character", "角色名", "姓名", "人物", "角色")
+
+
+def _normalize_script_aliases(payload: dict[str, Any]) -> dict[str, Any]:
+    """接受 Mimo 偶尔返回的中文字段和「姓名 -> 描述」映射。"""
+
+    normalized = dict(payload)
+    raw_characters = next(
+        (payload.get(key) for key in ("characters", "character_list", "人物", "角色") if payload.get(key) not in (None, "")),
+        None,
+    )
+    if isinstance(raw_characters, dict):
+        # 兼容 {"林夏": {"personality": ...}} 或单个角色对象。
+        if any(key in raw_characters for key in _CHARACTER_NAME_KEYS):
+            raw_characters = [raw_characters]
+        else:
+            mapped = []
+            for name, details in list(raw_characters.items())[: settings.LLM_MAX_CHARACTERS]:
+                if isinstance(details, dict):
+                    item = dict(details)
+                    item["name"] = str(name)
+                else:
+                    item = {"name": str(name), "appearance": str(details)}
+                mapped.append(item)
+            raw_characters = mapped
+    if isinstance(raw_characters, (list, tuple)):
+        converted = []
+        for item in raw_characters:
+            if isinstance(item, dict):
+                item = dict(item)
+                if not str(item.get("name") or "").strip():
+                    for key in _CHARACTER_NAME_KEYS[1:]:
+                        if str(item.get(key) or "").strip():
+                            item["name"] = item[key]
+                            break
+                converted.append(item)
+        normalized["characters"] = converted
+    return normalized
 
 
 def parse_storyboard_output(payload: Any) -> StoryboardOutput:

@@ -73,6 +73,24 @@ class TopLevelStructureTests(unittest.TestCase):
         parsed = parse_script_output(payload)
         self.assertEqual(len(parsed.script_scenes), 1)
 
+    def test_mimo_character_aliases_are_normalized(self) -> None:
+        payload = _script_payload(
+            characters=[{"角色名": "林夏", "appearance": {"hair": "black"}}, {"character": "顾言"}]
+        )
+        parsed = parse_script_output(payload)
+        self.assertEqual([item.name for item in parsed.characters], ["林夏", "顾言"])
+
+    def test_mimo_character_name_mapping_is_normalized(self) -> None:
+        payload = _script_payload(
+            characters={"林夏": {"personality": "勇敢"}, "顾言": "戴眼镜"}
+        )
+        parsed = parse_script_output(payload)
+        self.assertEqual([item.name for item in parsed.characters], ["林夏", "顾言"])
+
+    def test_invalid_appearance_type_is_dropped_without_crashing(self) -> None:
+        parsed = parse_script_output(_script_payload(characters=[{"name": "林夏", "appearance": []}]))
+        self.assertEqual(parsed.characters[0].appearance, {})
+
     def test_storyboard_accepts_object_or_array(self) -> None:
         shot = {"scene_number": 1, "scene_description": "画面", "duration": 3.5}
         self.assertEqual(len(parse_storyboard_output({"shots": [shot]}).shots), 1)

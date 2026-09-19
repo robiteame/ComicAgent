@@ -1516,7 +1516,15 @@ def _shot_scene_keys(shot: Shot, db: Session | None = None) -> set[str]:
 
 def _materialize_control_references(project_id: str, shot_data: dict, skill_config: dict | None = None) -> None:
     profile = shot_data.get("continuity_profile") or {}
-    source_path = profile.get("previous_reference_path") or shot_data.get("continuity_reference_path", "")
+    # 源图回退链：前镜末帧 → 续帧参考 → 已审核分镜首帧。complex_motion 镜头在前镜
+    # 尚无视频（如重生成队列、首镜）时靠分镜首帧兜底，与画像 control_source 声明的
+    # current_scene_baseline 语义一致；视频生成预检要求分镜图必在，此链必能命中。
+    source_path = (
+        profile.get("previous_reference_path")
+        or shot_data.get("continuity_reference_path", "")
+        or shot_data.get("storyboard_path", "")
+        or shot_data.get("image_path", "")
+    )
     controls = reference_asset_service.materialize_continuity_controls(
         project_id=project_id,
         shot_id=shot_data.get("shot_id", "shot"),
@@ -1524,6 +1532,13 @@ def _materialize_control_references(project_id: str, shot_data: dict, skill_conf
         enabled=bool(profile.get("complex_motion")) and should_materialize_openpose(skill_config),
     )
     if not controls:
+        # 未物化（无可用源图或技能配置关闭）：不允许画像声称 enabled 而参考图为空，
+        # 否则视频生成预检会以「缺少必需一致性参考素材」直接失败。
+        if not shot_data.get("pose_reference_path"):
+            profile["openpose_lock"] = "not_required"
+        if not shot_data.get("depth_reference_path"):
+            profile["depth_lock"] = "not_required"
+        shot_data["continuity_profile"] = profile
         return
 
     profile.update(controls)
